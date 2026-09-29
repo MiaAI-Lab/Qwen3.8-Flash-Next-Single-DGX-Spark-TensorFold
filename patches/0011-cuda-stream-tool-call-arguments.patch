@@ -1,0 +1,66 @@
+--- tensorfold/cuda/server.py
++++ tensorfold/cuda/server.py
+@@ -24,6 +24,7 @@
+ from tensorfold.server.stopping import stop_options
+ from tensorfold.server.tool_policy import ToolCallPolicy
+ from tensorfold.engine.call_gate import CallGate, call_format, generate_gated
++from tensorfold.engine.tool_draft import ToolCallStreamer
+ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
+ 
+ from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, hide_tool_calls, parse_tool_calls
+@@ -339,6 +340,11 @@
+         stopped = {"client": False, "stop": False}
+         failed: list[Exception] = []
+         stream = StreamDecoder(self.tok, ends)
++        # tool calls stream as JSON argument deltas while they are written (as server/app.py does), so a long
++        # call (a whole file) does not leave the stream silent until the reply ends; one-call requests keep the
++        # end parser, which picks their single call
++        calls_stream = ToolCallStreamer(tools) if tools and not policy.single else None
++        answer_raw = [""]
+ 
+         def visible(finished: bool) -> tuple[str, str]:
+             raw = stream.final() if finished else stream.text
+@@ -348,6 +354,7 @@
+                 reasoning, answer = split_thinking(raw, finished=finished)
+             else:
+                 reasoning, answer = "", raw
++            answer_raw[0] = answer
+             if tools:
+                 answer = (policy.content(answer, finished=finished) if policy.single
+                           else hide_tool_calls(answer, finished=finished))
+@@ -387,7 +394,12 @@
+                     sent["content"] = len(answer)
+                 if delta and not emit(delta):
+                     stopped["client"] = True
+-                elif cancelled is not None and cancelled():     # every round, with or without new text
++                if calls_stream is not None and not stopped["client"]:
++                    for call_delta in calls_stream.feed(answer_raw[0]):   # never the reasoning
++                        if not emit(call_delta):
++                            stopped["client"] = True
++                            break
++                if not stopped["client"] and cancelled is not None and cancelled():   # every round, text or not
+                     stopped["client"] = True
+             except Exception as exc:        # noqa: BLE001  raised after generate returns, never into the engine
+                 failed.append(exc)
+@@ -440,8 +452,11 @@
+         finish = "tool_calls" if calls else ("stop" if stopped["stop"] or (out and out[-1] in ends) else "length")
+         if body.get("return_token_ids"):              # the reply's ids in the "tensorfold" block, for exactness checks
+             stats = {**(stats or {}), "token_ids": [int(t) for t in out]}
++        # the calls already sent as deltas; the handler sends the rest (a call the streamer could not follow)
++        streamed = calls_stream.index + 1 if calls_stream is not None and calls_stream.streamed else 0
+         return {"final": final, "calls": calls, "finish": finish, "content": content, "reasoning": reasoning,
+-                "prompt_tokens": len(prompt), "completion_tokens": len(out), "stats": stats}
++                "prompt_tokens": len(prompt), "completion_tokens": len(out), "stats": stats,
++                "calls_streamed": streamed}
+ 
+     def _call_gate(self, prompt: list[int], tools: list[dict[str, Any]]) -> CallGate:
+         """The gate a required tool call needs, from this template's call markup and the rendered prompt."""
+@@ -591,6 +606,8 @@
+                     emit(result["final"])
+                 if result["calls"]:
+                     for i, call in enumerate(result["calls"]):
++                        if i < result.get("calls_streamed", 0):
++                            continue
+                         emit({"tool_calls": [{"index": i, "id": call["id"], "type": "function",
+                                               "function": {"name": call["function"]["name"],
+                                                            "arguments": call["function"]["arguments"]}}]})

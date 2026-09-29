@@ -320,6 +320,7 @@ applied with `patch -p0`), and `start.sh` rebuilds or re-pulls the image by itse
 | `0007-flash-next-copy-drafts` | drafts copied from earlier text when the reply repeats the prompt | +6% on quoting and editing replies |
 | `0008-flash-next-vision` | image and video input for Flash Next on CUDA: the Qwen3.5 vision tower, interleaved 3-D rotary positions in the attention and sparse-attention kernels, video frames in timestamped blocks | `--vision` (TensorFold's own `--vision` covers only the dense 27B) |
 | `0009-flash-next-many-images` | up to 50 images a request sharing 16,384 tokens (4,096 at most an image), encoded by the vision tower in bounded runs; request bodies up to 96 MiB | many-image chats; one image is encoded exactly as before |
+| `0011-cuda-stream-tool-call-arguments` | the CUDA server streams tool calls as argument deltas while they are written (TensorFold's `ToolCallStreamer`, as `server/app.py` already does), instead of sending them after the reply ends | a long call (a whole file) no longer leaves the stream silent for minutes, which clients and proxies cut off (~300 s idle) |
 | `languages/0010-flash-next-draft-languages` | only in the opt-in language image (`DRAFT_LANGUAGE`): Chinese and Japanese (also Russian, German, French, Portuguese) tokens added to the list MTP drafts from | Chinese +29-32%, Japanese +7-19% decode ([Other languages](#other-languages)) |
 
 Typed tool-call parameters (this recipe's former patch 0001, [#75](https://github.com/ashhart/TensorFold/pull/75))

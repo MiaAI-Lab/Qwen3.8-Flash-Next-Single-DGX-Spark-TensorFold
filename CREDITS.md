@@ -43,6 +43,8 @@ This repository is a thin layer of scripts and patches. Almost everything that m
   ([MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark#84](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark/pull/84)),
   built from each language's Wikipedia by token frequency; the patch keeps the ids TensorFold's default list lacks.
 - `0002`-`0005`, `0007`-`0009`: by MiaAI-Lab, developed with [Claude Code](https://claude.com/claude-code).
+- `0011-cuda-stream-tool-call-arguments`: by Oleksandr Leushchenko ([olexale](https://github.com/olexale)), developed
+  with [Claude Code](https://claude.com/claude-code); wires TensorFold's own `ToolCallStreamer` into the CUDA server.
 
 ## Runtime stack
 
