@@ -1,0 +1,35 @@
+{
+  "scope": "One paired archived single-GPU TensorFold 0.3.6.3 + recipe patches 0001-0009 observation; not current-main GPU results.",
+  "base_commit": "191188075bca56a7c71074a79375eb4c1cb22e1c",
+  "reviewed_patch_sha256": "fe8ea1e380ccb71d729f92467fbee2f0f043f580945f5e12e3a625c3385836ee",
+  "observations": [
+    {
+      "variant": "tf-control",
+      "source_record_sha256": "6835c8ab7b20cb8c92cd8ed2406629154b1de92d1e7239f2f4a69de7e4f04602",
+      "active_completion_tokens": 48,
+      "long_prompt_tokens": 154063,
+      "long_cached_tokens": 0,
+      "active_completion_after_injection_s": 77.71983259299304,
+      "active_max_content_event_gap_s": 76.85291059300653,
+      "long_ttft_s": 76.81426621798892,
+      "long_wall_s": 77.12409863100038,
+      "active_finished_before_long_first": false,
+      "active_text_sha256": "d7a8e41983d0551f78f03bd12b7f1ab2be7f18fab31a5342a0684cce3b9216dd",
+      "long_text_sha256": "04bb4a20fe7044bbc09b68d625de8a79474be89a7cb616358dd4de6da64e3883"
+    },
+    {
+      "variant": "tf-patched",
+      "source_record_sha256": "d93a8fe34b7fead3ea1a5711500b0c1f85ff136402b557a0ce919984f24aaf42",
+      "active_completion_tokens": 48,
+      "long_prompt_tokens": 154063,
+      "long_cached_tokens": 0,
+      "active_completion_after_injection_s": 14.725993504020153,
+      "active_max_content_event_gap_s": 0.9387604529911187,
+      "long_ttft_s": 77.75111989700235,
+      "long_wall_s": 78.00485967498389,
+      "active_finished_before_long_first": true,
+      "active_text_sha256": "d7a8e41983d0551f78f03bd12b7f1ab2be7f18fab31a5342a0684cce3b9216dd",
+      "long_text_sha256": "04bb4a20fe7044bbc09b68d625de8a79474be89a7cb616358dd4de6da64e3883"
+    }
+  ]
+}

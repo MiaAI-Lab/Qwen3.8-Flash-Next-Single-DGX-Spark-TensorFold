@@ -320,10 +320,17 @@ applied with `patch -p0`), and `start.sh` rebuilds or re-pulls the image by itse
 | `0007-flash-next-copy-drafts` | drafts copied from earlier text when the reply repeats the prompt | +6% on quoting and editing replies |
 | `0008-flash-next-vision` | image and video input for Flash Next on CUDA: the Qwen3.5 vision tower, interleaved 3-D rotary positions in the attention and sparse-attention kernels, video frames in timestamped blocks | `--vision` (TensorFold's own `--vision` covers only the dense 27B) |
 | `0009-flash-next-many-images` | up to 50 images a request sharing 16,384 tokens (4,096 at most an image), encoded by the vision tower in bounded runs; request bodies up to 96 MiB | many-image chats; one image is encoded exactly as before |
+| `0010-flash-next-cooperative-prefill` | one existing-decode round after each committed nonfinal prompt chunk | reduces decode stalls during long prefill; [offline checks, measured scope and reproduction](docs/cooperative-prefill.md) |
 | `languages/0010-flash-next-draft-languages` | only in the opt-in language image (`DRAFT_LANGUAGE`): Chinese and Japanese (also Russian, German, French, Portuguese) tokens added to the list MTP drafts from | Chinese +29-32%, Japanese +7-19% decode ([Other languages](#other-languages)) |
 
 Typed tool-call parameters (this recipe's former patch 0001, [#75](https://github.com/ashhart/TensorFold/pull/75))
 are part of TensorFold v0.3.6.3.
+
+Patch 0010's separate validation and limitations are documented in
+[Cooperative Flash Next prefill](docs/cooperative-prefill.md): the archived paired lifecycle
+run had byte-identical active output and long markers, but is not an all-prompt or all-format
+guarantee. It does not bound queues or cancel an in-progress long prompt early. The original
+0001–0009 recipe's output checks are described below.
 
 **Outputs are unchanged.** Every speed patch changes speed only: drafts are verified against the model's own keyed
 samples, and the prefill changes read the same bytes and select the same attention blocks. This was checked by

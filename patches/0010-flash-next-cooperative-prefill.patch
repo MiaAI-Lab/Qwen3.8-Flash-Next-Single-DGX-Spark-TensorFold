@@ -1,0 +1,65 @@
+--- tensorfold/cuda/scheduler.py
++++ tensorfold/cuda/scheduler.py
+@@ -15,6 +15,8 @@
+         self.max_streams = max_streams
+         self.waiting: queue.Queue = queue.Queue()
+         self.boxes: dict[int, queue.Queue] = {}
++        if hasattr(decoder, "prefill_yield"):
++            decoder.prefill_yield = self._prefill_round
+         self.thread = threading.Thread(target=self._loop, daemon=True)
+         self.thread.start()
+ 
+@@ -62,6 +64,19 @@
+         if box is not None:
+             box.put((kind, value))
+ 
++    def _prefill_round(self) -> None:
++        """Run existing decodes only; never recursively admit into shared prefill scratch."""
++        try:
++            done = self.decoder.round()
++        except Exception as exc:
++            for s in self.decoder.drop():
++                self._reply(s, "error", exc)
++            # Do not continue the in-progress prefill after a device/round error.
++            raise
++        self.decoder.finish(done)
++        for s in done:
++            self._reply(s, *(("error", s.error) if s.error is not None else ("done", s.stats())))
++
+     def _loop(self) -> None:
+         while True:
+             done = self._admit(None if self.decoder.live() else self.waiting.get())   # idle: wait for a request
+--- tensorfold/families/qwen4_exp/cuda/multi.py
++++ tensorfold/families/qwen4_exp/cuda/multi.py
+@@ -53,6 +53,8 @@
+         self.draft_host = w.draft_ids.cpu().numpy() if w.draft_ids is not None else None
+         self.kept: list[tuple[list[int], State, dict, torch.Tensor | None]] = []   # (ids, slot, snapshot, tail)
+         self.keep = keep
++        # Scheduler-owned cooperative callback, same worker and CUDA stream.
++        self.prefill_yield = None
+ 
+     def _busy(self) -> set[int]:
+         return {id(s.st) for s in self.streams.values()}
+@@ -126,6 +128,7 @@
+         # image placeholders look alike whatever the image: an image prompt never resumes or is kept
+         st, resume, s.cached = self._slot_for(list(s.prompt), s.draft and not image)
+         e = _slot(self.w, st, self.buf, self.mbuf, self.pbuf, self.capacity)
++        e.prefill_yield = self.prefill_yield
+         mtp = s.draft and self.depth > 0 and self.mbuf is not None
+         try:
+             first = prefill(e, s.prompt, s.sampling, mtp=mtp, resume=resume, vision=encoded)
+--- tensorfold/families/qwen4_exp/cuda/decode.py
++++ tensorfold/families/qwen4_exp/cuda/decode.py
+@@ -310,6 +310,12 @@
+                 mtp_forward(w, st, pb, nxt, pb.streams[:len(nxt)])
+                 st.set_mtp_len(st.mtp_len + len(nxt))
+         commit(w, st, pb, R, R)
++        # Full chunk commit is the safe boundary: recurrent state, KV lengths,
++        # MTP absorption and PLE history now belong to this request's slot.
++        # Decode uses buf/mbuf, not pb. No new admission may reuse pb here.
++        # Skip the final chunk so its sampled token/draft setup stays atomic.
++        if not final and getattr(e, "prefill_yield", None) is not None:
++            e.prefill_yield()
+     if vision is not None:                           # decode continues at the image prompt's rotary offset
+         st.set_rope_delta(vision.rope_delta)
+     first = e.sample(last, [len(prompt)], sampling)[0]
