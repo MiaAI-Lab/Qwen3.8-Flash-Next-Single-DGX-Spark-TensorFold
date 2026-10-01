@@ -374,5 +374,5 @@ libraries (LGPL). The MIT license above covers this repository's scripts and pat
 
 Built on [TensorFold](https://github.com/ashhart/TensorFold) by Ash Hart ([ashhart](https://github.com/ashhart)), [Qwen3.8 Flash Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)
 by Qwen, and [Vontra's MLX 4-bit checkpoint](https://huggingface.co/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP), with a
-prompt-chunk change by [MovieMaker93](https://github.com/MovieMaker93), ([TensorFold #40](https://github.com/ashhart/TensorFold/pull/40)). The full list,
+prompt-chunk change by [MovieMaker93](https://github.com/MovieMaker93) ([TensorFold #40](https://github.com/ashhart/TensorFold/pull/40)). The full list,
 including the runtime stack and licenses, is in [`CREDITS.md`](CREDITS.md).

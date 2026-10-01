@@ -34,7 +34,7 @@ This repository is a thin layer of scripts and patches. Almost everything that m
   [TensorFold #79](https://github.com/ashhart/TensorFold/pull/79). The recipe's earlier typed-tool-parameters patch
   ([#75](https://github.com/ashhart/TensorFold/pull/75)) is part of TensorFold v0.3.6.3.
 - `0006-flash-next-prefill-rows`: a port of [TensorFold #40](https://github.com/ashhart/TensorFold/pull/40) by
-  **MovieMaker93**, rebased onto v0.3.6.3.
+  **[MovieMaker93](https://github.com/MovieMaker93)**, rebased onto v0.3.6.3.
 - `0007-flash-next-copy-drafts`: uses TensorFold's own `CopyIndex` prompt-lookup index from its Qwen3.5 27B engine.
 - `0008-flash-next-vision`: builds on TensorFold's Qwen3.5/3.8 dense vision support, runs the vision tower from
   Hugging Face transformers, and follows transformers' Qwen3.5 rotary index and Qwen3-VL's video processing.
