@@ -321,6 +321,7 @@ applied with `patch -p0`), and `start.sh` rebuilds or re-pulls the image by itse
 | `0008-flash-next-vision` | image and video input for Flash Next on CUDA: the Qwen3.5 vision tower, interleaved 3-D rotary positions in the attention and sparse-attention kernels, video frames in timestamped blocks | `--vision` (TensorFold's own `--vision` covers only the dense 27B) |
 | `0009-flash-next-many-images` | up to 50 images a request sharing 16,384 tokens (4,096 at most an image), encoded by the vision tower in bounded runs; request bodies up to 96 MiB | many-image chats; one image is encoded exactly as before |
 | `languages/0010-flash-next-draft-languages` | only in the opt-in language image (`DRAFT_LANGUAGE`): Chinese and Japanese (also Russian, German, French, Portuguese) tokens added to the list MTP drafts from | Chinese +29-32%, Japanese +7-19% decode ([Other languages](#other-languages)) |
+| `0011-tool-args-python-spelling` | typed tool-call values the model writes in Python's spelling (`True`, `None`, `['a']`) decode to their schema type, and an array or object value one closing bracket short is closed: TensorFold v0.6.0's `tool_parameters.py` ([4d9f241](https://github.com/ashhart/TensorFold/commit/4d9f241), [#87](https://github.com/ashhart/TensorFold/issues/87)) | a boolean parameter no longer reaches the client as the string `"False"` |
 
 Typed tool-call parameters (this recipe's former patch 0001, [#75](https://github.com/ashhart/TensorFold/pull/75))
 are part of TensorFold v0.3.6.3.
@@ -330,7 +331,8 @@ samples, and the prefill changes read the same bytes and select the same attenti
 comparing reply hashes (sampled and greedy, prompts up to 149k tokens) against unpatched TensorFold, with vision on
 and off, and with a ~195k-token needle-in-a-haystack test. Text rows take exactly the rotary path they always did;
 on image and video prompts, drafted replies equal the serial reference too. Any request can also be sent with
-`"draft": false` to get TensorFold's serial, one-token-at-a-time reference.
+`"draft": false` to get TensorFold's serial, one-token-at-a-time reference. Patch 0011 changes no tokens either: it
+only types the arguments the server parses out of the model's tool calls.
 
 ## Checks
 
