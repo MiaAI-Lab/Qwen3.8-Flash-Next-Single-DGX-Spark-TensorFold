@@ -16,8 +16,8 @@
 #   echo DRAFT_LANGUAGE=zh >> .env; ./start.sh restart   # replies mostly in Chinese (or ja): the language image
 # Extra arguments come after the defaults, so they win (the last value of a flag counts).
 # Settings, from the environment or ./.env (KEY=value lines): PARALLEL, CONTEXT, KV_DTYPE, DRAFT_LANGUAGE, PLE_ON_SSD,
-#      VISION, VISION_URLS, MTP_DRAFTS, MTP_CONFIDENCE, TEMPERATURE, TOP_P, TOP_K, THINKING, SERVED_NAME, PORT, HOST,
-#      CONTAINER_NAME, IMAGE (see scripts/config.sh); TENSORFOLD_* (passed to the server);
+#      VISION, VISION_URLS, MTP_DRAFTS, MTP_CONFIDENCE, TEMPERATURE, TOP_P, TOP_K, THINKING, MAX_TOKENS, SERVED_NAME,
+#      PORT, HOST, CONTAINER_NAME, IMAGE (see scripts/config.sh); TENSORFOLD_* (passed to the server);
 #      PREPARE (auto | 1 | 0); FOREGROUND=1 (stay attached, exit with the server's code); WAIT_TIMEOUT (seconds,
 #      default 1800); HF_HUB_OFFLINE=0 (let TensorFold reach the Hub; default serves from the local cache only)
 set -euo pipefail
@@ -37,7 +37,7 @@ for arg in "$@"; do [[ "$arg" == -h || "$arg" == --help ]] && { usage; exit 0; }
 # The serve arguments: scripts/config.sh's defaults first, then the command line's (argparse keeps the last value).
 SERVE_ARGS=(--name "$SERVED_NAME" --parallel "$PARALLEL" --context "$CONTEXT" --kv-dtype "$KV_DTYPE"
             --mtp-drafts "$MTP_DRAFTS" --mtp-confidence "$MTP_CONFIDENCE"
-            --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K")
+            --temperature "$TEMPERATURE" --top-p "$TOP_P" --top-k "$TOP_K" --max-tokens "$MAX_TOKENS")
 [[ "$PLE_ON_SSD" == 1 ]] && SERVE_ARGS+=(--ple-on-ssd)
 [[ "$VISION" == 1 ]] && SERVE_ARGS+=(--vision)
 [[ "$VISION" == 1 && "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)

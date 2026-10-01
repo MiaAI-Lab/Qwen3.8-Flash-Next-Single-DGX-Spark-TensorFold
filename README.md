@@ -87,7 +87,8 @@ curl -s http://<spark-address>:8888/v1/chat/completions -H 'Content-Type: applic
 
 Any OpenAI client works with `base_url = "http://<spark-address>:8888/v1"` and the model `Qwen3.8-Flash-Next`.
 Streaming, tool calls (typed parameters, e.g. arrays come back as JSON arrays), reasoning content, images and
-videos are supported. The model thinks before it answers (`reasoning_content`), so give replies enough `max_tokens`.
+videos are supported. The model thinks before it answers (`reasoning_content`), so give replies enough `max_tokens`;
+a request without one gets `MAX_TOKENS` (32,768).
 
 ```bash
 ./start.sh restart                            # restart it, e.g. after changing a setting
@@ -272,6 +273,7 @@ wins over it), or with `tensorfold serve` flags (`./start.sh --context 131072`).
 | `MTP_DRAFTS` / `MTP_CONFIDENCE` | `6` / `0.60` | at most 6 MTP drafts a round; a chain stops before a draft under 60% |
 | `TEMPERATURE` / `TOP_P` / `TOP_K` | `1.0` / `0.95` / `20` | default sampling (Qwen's thinking-mode values); a request's own values win |
 | `THINKING` | `1` | open a think block by default; `0` answers directly unless a request asks to think |
+| `MAX_TOKENS` | `32768` | reply length for a request without `max_tokens` (TensorFold's own default, 4,096, can end a thinking reply before it answers); clamped to the stream's window |
 | `SERVED_NAME` | `Qwen3.8-Flash-Next` | the model id in `/v1/models` and in replies |
 | `PORT` / `HOST` | `8888` / `0.0.0.0` | where the API listens |
 | `TENSORFOLD_PREFILL_ROWS` | `2048` (`4096` with `VISION=0`) | rows per prompt chunk (patch 0006); 4,096 is 2-5% faster from 3k tokens and takes 0.94 GiB more |
