@@ -88,7 +88,8 @@ curl -s http://<spark-address>:8888/v1/chat/completions -H 'Content-Type: applic
 
 Any OpenAI client works with `base_url = "http://<spark-address>:8888/v1"` and the model `Qwen3.8-Flash-Next`.
 Streaming, tool calls (typed parameters, e.g. arrays come back as JSON arrays), reasoning content, images and
-videos are supported. The model thinks before it answers (`reasoning_content`), so give replies enough `max_tokens`.
+videos are supported. The model thinks before it answers (`reasoning_content`), so give replies enough `max_tokens`;
+a request without one gets `MAX_TOKENS` (32,768).
 
 ```bash
 ./start.sh restart                            # restart it, e.g. after changing a setting
@@ -280,6 +281,7 @@ wins over it), or with `tensorfold serve` flags (`./start.sh --context 131072`).
 | `VISION_MAX_IMAGES` | `50` | images a request may carry, all of a chat's turns counted (`--vision-max-images`) |
 | `TENSORFOLD_PREFILL_ROWS` | `2048` with `PLE_ON_SSD=1` | prompt piece rows, admitted at startup (256 to 16,384). Empty lets TensorFold choose (4,096 while idle without vision), which measured 10-30% slower from 5k to 16k tokens with the n-gram tables on SSD |
 | `TENSORFOLD_MTP_COPY` | `1` | prompt-lookup drafts for text that repeats the prompt (needs `PARALLEL` >= 2); `0` turns them off |
+| `MAX_TOKENS` | `32768` | reply length for a request without `max_tokens` (TensorFold's own default, 4,096, can end a thinking reply before it answers); clamped to the stream's window |
 | `TENSORFOLD_IMAGE_TOKENS` | `16384` | the tokens a request's images share, each at most 4,096 |
 | `TENSORFOLD_VIDEO_TOKENS` | `16384` | a request's video token budget |
 | `TENSORFOLD_VISION_WORKSPACE_MIB` | `0` | what startup reserves for the vision tower's scratch |
