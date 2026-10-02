@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Image input (patch 0008, VISION=1): draws a red circle and a blue square into a PNG, sends it as a data URL and
+"""Image input (VISION=1): draws a red circle and a blue square into a PNG, sends it as a data URL and
 checks the model names both.
 
 Usage: tools/visioncheck.py      (API_URL / PORT as in bench.py). Exit code 1 on failure.

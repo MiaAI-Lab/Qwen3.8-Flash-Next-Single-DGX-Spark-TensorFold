@@ -1,24 +1,20 @@
-diff --git tensorfold/families/qwen4_exp/__init__.py tensorfold/families/qwen4_exp/__init__.py
-index f0992b5..9be587b 100644
+Optional MTP draft-vocabulary additions for selected languages.
 --- tensorfold/families/qwen4_exp/__init__.py
 +++ tensorfold/families/qwen4_exp/__init__.py
-@@ -151,6 +151,7 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank:
-         raise ValueError(f"{TITLE} drafts with its own MTP head on CUDA: a separate draft model does not apply")
-     from .cuda import CONFIDENCE, DEPTH
-     from .cuda.engine import FlashNextEngine
-+    from .cuda.weights import draft_vocab_setting
- 
-     if kv_dtype not in CUDA_KV_DTYPES:       # refuse an unknown cache before any weight is read (no torch import)
-         raise ValueError(f"kv-dtype {kv_dtype!r}: this engine serves {' or '.join(CUDA_KV_DTYPES)}")
-@@ -164,4 +165,4 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank:
+@@ -187,10 +187,12 @@
+                          "has one): without it every round would decode one token. Serve a checkpoint with the "
+                          "head, or pass --no-drafts for the serial reference")
+     confidence = CONFIDENCE if mtp_confidence is None else float(mtp_confidence)
++    from .cuda.weight_types import draft_vocab_setting      # after the checks: it imports torch
++
+     return FlashNextEngine(Path(model_dir), depth=depth, confidence=confidence, max_len=context,
                             context_explicit=options.get("context_explicit"), tp=int(tp), rank=int(rank),
                             master=master, port=int(master_port), streams=max(1, int(options.get("parallel") or 1)),
-                            ple_on_ssd=ple_on_ssd, kv_dtype=kv_dtype, vision=bool(options.get("vision", False)),
+                            ple_on_ssd=ple_on_ssd, kv_dtype=kv_dtype,
+                            share=0.0 if decode_share is None else float(decode_share),
+                            vision=bool(options.get("vision", False)),
 -                           vision_urls=bool(options.get("vision_urls", False)))
 +                           vision_urls=bool(options.get("vision_urls", False)), draft_vocab=draft_vocab_setting())
-diff --git tensorfold/families/qwen4_exp/cuda/draft_vocab_de.txt tensorfold/families/qwen4_exp/cuda/draft_vocab_de.txt
-new file mode 100644
-index 0000000..b09b79a
 --- /dev/null
 +++ tensorfold/families/qwen4_exp/cuda/draft_vocab_de.txt
 @@ -0,0 +1,14211 @@
@@ -14233,9 +14229,6 @@ index 0000000..b09b79a
 +246782
 +246793
 +247044
-diff --git tensorfold/families/qwen4_exp/cuda/draft_vocab_fr.txt tensorfold/families/qwen4_exp/cuda/draft_vocab_fr.txt
-new file mode 100644
-index 0000000..52d18bf
 --- /dev/null
 +++ tensorfold/families/qwen4_exp/cuda/draft_vocab_fr.txt
 @@ -0,0 +1,13067 @@
@@ -27306,9 +27299,6 @@ index 0000000..52d18bf
 +246794
 +246800
 +247044
-diff --git tensorfold/families/qwen4_exp/cuda/draft_vocab_ja.txt tensorfold/families/qwen4_exp/cuda/draft_vocab_ja.txt
-new file mode 100644
-index 0000000..dc7b837
 --- /dev/null
 +++ tensorfold/families/qwen4_exp/cuda/draft_vocab_ja.txt
 @@ -0,0 +1,19846 @@
@@ -47158,9 +47148,6 @@ index 0000000..dc7b837
 +248039
 +248041
 +248042
-diff --git tensorfold/families/qwen4_exp/cuda/draft_vocab_pt.txt tensorfold/families/qwen4_exp/cuda/draft_vocab_pt.txt
-new file mode 100644
-index 0000000..1c60014
 --- /dev/null
 +++ tensorfold/families/qwen4_exp/cuda/draft_vocab_pt.txt
 @@ -0,0 +1,14068 @@
@@ -61232,9 +61219,6 @@ index 0000000..1c60014
 +246764
 +246782
 +247044
-diff --git tensorfold/families/qwen4_exp/cuda/draft_vocab_ru.txt tensorfold/families/qwen4_exp/cuda/draft_vocab_ru.txt
-new file mode 100644
-index 0000000..476beaf
 --- /dev/null
 +++ tensorfold/families/qwen4_exp/cuda/draft_vocab_ru.txt
 @@ -0,0 +1,19912 @@
@@ -81150,9 +81134,6 @@ index 0000000..476beaf
 +246783
 +246795
 +247044
-diff --git tensorfold/families/qwen4_exp/cuda/draft_vocab_zh.txt tensorfold/families/qwen4_exp/cuda/draft_vocab_zh.txt
-new file mode 100644
-index 0000000..d12b563
 --- /dev/null
 +++ tensorfold/families/qwen4_exp/cuda/draft_vocab_zh.txt
 @@ -0,0 +1,22088 @@
@@ -103244,11 +103225,9 @@ index 0000000..d12b563
 +247975
 +248000
 +248002
-diff --git tensorfold/families/qwen4_exp/cuda/engine.py tensorfold/families/qwen4_exp/cuda/engine.py
-index 422e8c7..412b8cd 100644
 --- tensorfold/families/qwen4_exp/cuda/engine.py
 +++ tensorfold/families/qwen4_exp/cuda/engine.py
-@@ -76,6 +76,7 @@ class FlashNextEngine:
+@@ -78,6 +78,7 @@
          self.comm = None
          self.vision = None                   # the image tower (``QwenCudaVision``) with --vision
          ids = draft_token_ids(draft_vocab) if self.depth > 0 else None
@@ -103256,20 +103235,18 @@ index 422e8c7..412b8cd 100644
          if tp == 2:
              from tensorfold.cuda.comm import NCCL
  
-@@ -167,7 +168,8 @@ class FlashNextEngine:
+@@ -196,7 +197,8 @@
          self.cache: list[tuple[list[int], dict]] = []    # (committed ids, what resuming from them needs)
          self.serial = None                                # the serial requests' engine, made on first use
          rule = (f"1 to {self.depth} MTP drafts a round, a chain stops before a later draft under "
 -                f"{self.confidence:.0%}" if self.depth else "no drafts: the serial reference, one token a round")
 +                f"{self.confidence:.0%}, drafts over {self.draft_vocab}"
 +                if self.depth else "no drafts: the serial reference, one token a round")
-         where = (f"{streams} streams of {self.context_window} prompt/reply tokens "
-                  f"({self.multi.slot_bytes / 2**20:.0f} MiB a stream), eager" if self.concurrent else
-                  f"{self.context_window}-token prompt/reply window; {self.max_len}-token cache")
-diff --git tensorfold/families/qwen4_exp/cuda/weights.py tensorfold/families/qwen4_exp/cuda/weights.py
-index 408f4d3..ca391b0 100644
---- tensorfold/families/qwen4_exp/cuda/weights.py
-+++ tensorfold/families/qwen4_exp/cuda/weights.py
+         where = (f"up to {streams} streams, each growing to {self.context_window} prompt/reply tokens while memory "
+                  f"lasts ({self.multi.memory_gate.room / 2**30:.1f} GiB free for their caches, "
+                  f"{self.multi.window_bytes / 2**30:.2f} GiB for one at the full window), eager" if self.concurrent else
+--- tensorfold/families/qwen4_exp/cuda/weight_types.py
++++ tensorfold/families/qwen4_exp/cuda/weight_types.py
 @@ -3,6 +3,7 @@
  from __future__ import annotations
  
@@ -103278,7 +103255,7 @@ index 408f4d3..ca391b0 100644
  from dataclasses import dataclass, field
  from pathlib import Path
  from typing import Any
-@@ -255,15 +256,34 @@ class Weights:
+@@ -261,12 +262,32 @@
          return sum(seen.values()) + (self.x3.nbytes() if self.x3 is not None else 0)
  
  
@@ -103293,8 +103270,9 @@ index 408f4d3..ca391b0 100644
 +
 +
  def draft_token_ids(draft_vocab: int | str | None) -> np.ndarray | None:
--    """The token ids the MTP drafts' head scores, sorted: "default" (``draft_vocab.txt`` beside this module), a file of ids, an int N (ids below N), or None (the full vocabulary)."""
-+    """The token ids the MTP drafts' head scores, sorted: "default" (``draft_vocab.txt`` beside this module), language codes (the default plus each ``draft_vocab_<code>.txt``), a file of ids, an int N (ids below N), or None/"full" (the full vocabulary)."""
+-    """The MTP drafts' scored ids, sorted: "default" (draft_vocab.txt), a file of ids, N (ids below N) or None (all)."""
++    """The MTP drafts' scored ids, sorted: "default" (draft_vocab.txt), language codes (the default plus each
++    draft_vocab_<code>.txt), a file of ids, N (ids below N) or None/"full" (all)."""
  
 -    if not draft_vocab:
 +    if not draft_vocab or draft_vocab == "full":
@@ -103314,6 +103292,3 @@ index 408f4d3..ca391b0 100644
 +        raise ValueError(f"draft vocabulary {draft_vocab!r}: 'default', 'full', language codes from "
 +                         f"{', '.join(DRAFT_LANGUAGES)} (comma-separated), or a file of token ids")
 +    return np.unique(np.concatenate([np.loadtxt(source, dtype=np.int64).reshape(-1) for source in sources]))
- 
- 
- def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: tuple[int, int] | None = None,

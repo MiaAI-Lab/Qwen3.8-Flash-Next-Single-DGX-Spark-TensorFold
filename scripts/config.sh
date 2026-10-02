@@ -15,10 +15,9 @@ if [[ -f .env ]]; then
 fi
 
 MODEL_ID="${MODEL_ID:-Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP}"   # MLX 4-bit, group size 32, with the MTP head
-# The patches and start.sh's flags are made for TensorFold v0.3.6.3 exactly (earlier releases lack --vision for
-# this model and the patches do not apply). After changing TF_VERSION, TF_REPO or BASE_IMAGE, run
-# `scripts/prepare.sh --rebuild`.
-TF_VERSION="${TF_VERSION:-v0.3.6.3}"
+# The patches and start.sh's flags are made for TensorFold v0.6.1 exactly (17c73e1). After changing
+# TF_VERSION, TF_REPO or BASE_IMAGE, run `scripts/prepare.sh --rebuild`.
+TF_VERSION="${TF_VERSION:-v0.6.1}"
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
 # Replies mostly in Chinese or Japanese: DRAFT_LANGUAGE=zh or ja (in .env) serves the second image, which adds that
@@ -43,12 +42,14 @@ PARALLEL="${PARALLEL:-5}"          # requests decoded together (streams)
 CONTEXT="${CONTEXT:-262144}"       # prompt + reply window per stream (the model's native maximum)
 KV_DTYPE="${KV_DTYPE:-int8}"       # bf16 | int8 | int4
 PLE_ON_SSD="${PLE_ON_SSD:-1}"      # 1: read the 29.8 GiB n-gram tables from SSD, leaving that RAM to the KV cache
-# Image and video input (patch 0008): the model's own vision tower, 0.84 GiB. Its ~0.8 GiB of scratch is taken only
-# while an image or video encodes and handed back right after, so startup reserves none for it; 2,048-row prompt
-# chunks (instead of 4,096) make room for the tower, keeping the full 5 x 262,144 KV pool. VISION=0: text only
-# (and 4,096-row chunks, ~2-5% faster prefill from 3k tokens).
+# Image input (TensorFold's Flash Next vision; video and many images from patch 0002): the model's own vision tower,
+# 0.84 GiB. Its ~0.8 GiB of scratch is taken only while an image or video encodes and handed back right after, so
+# startup reserves none for it. VISION=0: text only.
 VISION="${VISION:-1}"
 VISION_URLS="${VISION_URLS:-0}"    # 1: also accept public https:// image and video URLs (default: data URLs only)
+# Images a request may carry (--vision-max-images; a chat's turns all count). They share TENSORFOLD_IMAGE_TOKENS.
+# Empty: TensorFold's own limit (4).
+VISION_MAX_IMAGES="${VISION_MAX_IMAGES-${TENSORFOLD_MAX_IMAGES:-50}}"
 # MTP drafting: at most MTP_DRAFTS drafts a round, a chain stopping before a draft under MTP_CONFIDENCE.
 # Swept 2026-09-29 (identical output in every arm): 6/0.60 beat the stock 6/0.30 by ~3% on
 # prose and ~4% on code, the best balance of both; 4/0.50, 3/0.30 and 7/0.75 matched it on prose but not on code.
@@ -63,24 +64,27 @@ TOP_P="${TOP_P:-0.95}"
 TOP_K="${TOP_K:-20}"
 THINKING="${THINKING:-1}"
 # TensorFold switches (start.sh passes every TENSORFOLD_* variable into the container).
-# Prompt chunk rows (patch 0006): 4,096 is +2-5% prefill from 3k tokens over 2,048, and +0.94 GiB at startup, the
-# room the vision tower takes: 2,048 with VISION=1, 4,096 without.
-if [[ "$VISION" == 1 ]]; then _rows=2048; else _rows=4096; fi
-export TENSORFOLD_PREFILL_ROWS="${TENSORFOLD_PREFILL_ROWS:-$_rows}"
+# Prompt piece rows. Unset, TensorFold v0.6.1 picks 2,048 with vision and 4,096 without (while nothing decodes,
+# if memory allows). With the n-gram tables on SSD (PLE_ON_SSD=1) 4,096 measured 10-30% slower from 5k to 16k
+# tokens and ~3% slower at 31k (2026-10-02), so this recipe keeps 2,048 there. TENSORFOLD_PREFILL_ROWS=N (256 to
+# 16,384, patch 0002) forces N-row pieces, admitted with the window; empty: TensorFold's choice.
+if [[ "$PLE_ON_SSD" == 1 ]]; then export TENSORFOLD_PREFILL_ROWS="${TENSORFOLD_PREFILL_ROWS-2048}"; fi
 # What startup reserves for the vision tower's scratch (MiB); 0: it comes from the system reserve while it encodes.
 export TENSORFOLD_VISION_WORKSPACE_MIB="${TENSORFOLD_VISION_WORKSPACE_MIB:-0}"
-# Images a request may carry (patch 0009; a chat's turns all count) and the tokens they share, each image at most
-# 4,096 (one image is sized as before). The tower encodes them 16,384 patches at a time, the scratch one image needs.
-export TENSORFOLD_MAX_IMAGES="${TENSORFOLD_MAX_IMAGES:-50}"
+# The tokens a request's images share (VISION_MAX_IMAGES above), each image at most 4,096 (one image is sized as
+# before). The tower encodes them 16,384 patches at a time, the scratch one image needs.
 export TENSORFOLD_IMAGE_TOKENS="${TENSORFOLD_IMAGE_TOKENS:-16384}"
 # The whole video's token budget (Qwen3-VL's per-frame sizing; 2 frames a second, at most 256 frames).
 export TENSORFOLD_VIDEO_TOKENS="${TENSORFOLD_VIDEO_TOKENS:-16384}"
+# Startup reserve (since v0.6.0): GiB left out of MemAvailable. Unset, TensorFold takes max(4 GiB, a tenth of RAM)
+# and refuses 5 x 262,144. The knob's floor is 2 GiB; that still fits the measured ~102.5 GiB admission.
+export TENSORFOLD_MEMORY_RESERVE_GIB="${TENSORFOLD_MEMORY_RESERVE_GIB:-2}"
 # Prompt-lookup drafts ahead of MTP (patch 0007; with PARALLEL >= 2): +6% on replies that repeat the prompt, prose and
 # code unchanged. 0: off.
 export TENSORFOLD_MTP_COPY="${TENSORFOLD_MTP_COPY:-1}"
 # The draft list the language image serves (DRAFT_LANGUAGE above).
 [[ -z "$DRAFT_LANGUAGE" ]] || export TENSORFOLD_DRAFT_VOCAB="$DRAFT_LANGUAGE"
-# No "is there a newer TensorFold" call to GitHub at each start: the patches are for v0.3.6.3 anyway. 0: check.
+# No "is there a newer TensorFold" call to GitHub at each start: the patches are for v0.6.1 anyway. 0: check.
 export TENSORFOLD_NO_UPDATE_CHECK="${TENSORFOLD_NO_UPDATE_CHECK:-1}"
 
 HF_CACHE="${HF_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}}"
