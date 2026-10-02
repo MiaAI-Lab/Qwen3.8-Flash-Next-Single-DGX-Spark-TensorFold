@@ -9,9 +9,10 @@
 
 Serve **Qwen3.8 Flash Next** from a single NVIDIA DGX Spark (GB10, 128 GB) through an OpenAI-compatible API, with
 **5 concurrent requests at the full 262,144-token context** and **image and video input**. It runs
-[TensorFold](https://github.com/ashhart/TensorFold) v0.3.6.3 in NVIDIA's PyTorch container, plus a small set of
-patches that make prompt processing about **1.7x faster** without changing a single output token, and that give the
-model its own vision tower on CUDA.
+[TensorFold](https://github.com/ashhart/TensorFold) v0.6.1 (`17c73e1`) in NVIDIA's PyTorch container, plus
+`patches/0002-flash-next-v061.patch` (video input and many images on TensorFold's Flash Next vision, copy drafts,
+SSD read-ahead, first token before the next draft). The decode and prefill tables below were measured on the
+v0.3.6.3 recipe; they have not been re-run on v0.6.1.
 
 - Checkpoint: [`Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP`](https://huggingface.co/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP)
   (MLX 4-bit, group size 32, with the MTP draft head)
@@ -55,7 +56,7 @@ unchanged.
 ## Requirements
 
 - A DGX Spark (or another GB10 system with 128 GB unified memory) with nothing else large on the GPU: the default
-  setting needs ~115 GiB free when the server starts (see [KV pool and memory](#kv-pool-and-memory)).
+  setting needs ~103 GiB free when the server starts (see [KV pool and memory](#kv-pool-and-memory)).
 - Docker with the NVIDIA container runtime, and your user in the `docker` group.
 - ~160 GB free disk on a fresh machine: ~125 GB for the checkpoint download under `~/.cache/huggingface`
   (~114 GB) and ~35 GB for the image under Docker's root (~24 GB); `scripts/prepare.sh` checks both.
@@ -180,11 +181,12 @@ attached to the server's log and exits with its exit code (for a systemd unit).
 **`scripts/prepare.sh`** does the one-time setup, and is safe to re-run (each step skips work already done):
 
 1. Preflight: Docker, the NVIDIA runtime, disk space.
-2. The image `tensorfold-qwen38:v0.3.6.3`: TensorFold v0.3.6.3 with every `patches/*.patch` applied, plus
+2. The image `tensorfold-qwen38:v0.6.1`: TensorFold v0.6.1 with every `patches/*.patch` applied, plus
    `transformers` (the vision tower) and PyAV (video decoding), on NVIDIA's PyTorch container
-   (`nvcr.io/nvidia/pytorch:26.07-py3`). With `DRAFT_LANGUAGE` set it is `tensorfold-qwen38:v0.3.6.3-languages`
-   instead, which also applies `patches/languages/*.patch`. It first tries the matching prebuilt image from GitHub
-   Container Registry (`ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold:v0.3.6.3-<patches hash>`,
+   (`nvcr.io/nvidia/pytorch:26.07-py3`). With `DRAFT_LANGUAGE` set it is `tensorfold-qwen38:v0.6.1-languages`
+   instead, which also applies `patches/languages/*.patch`.
+   It first tries the matching prebuilt image from GitHub
+   Container Registry (`ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold:v0.6.1-<patches hash>`,
    ~11 GB; `:latest` is the default image, `:languages` the language image); if that tag is not there (e.g. after
    you change `patches/`), or with `PULL=0`, it builds the image locally instead (a few minutes).
 3. Downloads the checkpoint into `~/.cache/huggingface` (resumable).
@@ -199,8 +201,8 @@ PREPARE=1 ./start.sh restart   # force prepare.sh, then restart; PREPARE=0 skips
 ```
 
 After changing `patches/`, `scripts/publish-image.sh` pushes the new image to GitHub Container Registry
-(`latest` and `v0.3.6.3-<patches hash>`), and `DRAFT_LANGUAGE=zh scripts/publish-image.sh` the language image
-(`languages` and its own `v0.3.6.3-<patches hash>`).
+(`latest` and `v0.6.1-<patches hash>`), and `DRAFT_LANGUAGE=zh scripts/publish-image.sh` the language image
+(`languages` and its own `v0.6.1-<patches hash>`).
 
 ## KV pool and memory
 
@@ -230,15 +232,16 @@ Where the memory goes at the default setting (TensorFold's startup estimate):
 
 The vision tower's scratch (~0.8 GiB at most, measured on a 4,096-token image and a 256-frame video) is taken only
 while an image or video encodes and is handed back right after; startup reserves none for it
-(`TENSORFOLD_VISION_WORKSPACE_MIB`). With `VISION=0` the tower is not loaded and the chunk scratch is 4,096 rows
-(estimate 102.6 GiB).
+(`TENSORFOLD_VISION_WORKSPACE_MIB`). With `VISION=0` the tower is not loaded. The table is from an earlier pin; on
+v0.6.1 (2026-10-02) TensorFold's own estimate at the default settings is 85.39 GiB for the weights and fixed
+buffers (v0.6.0: 85.18), leaving 25.7-26.3 GiB for stream caches against 22.4 GiB for five full windows. Five
+concurrent ~236k-token prompts all completed, with at least 2.9 GiB of memory still available on the host.
 
-TensorFold's budget is the free memory at start (`MemAvailable`) minus a host reserve of a tenth of RAM (12.2 GiB),
-so ~103-104 GiB on an otherwise idle Spark. The reserve covers what the estimate leaves out (CUDA context, workspaces,
-the Python process) and the host itself: on the Spark's unified memory, running out tends to freeze the machine
-rather than fail an allocation. At the default setting (vision on) the host kept at least 8.3 GiB free through a
-195k-token prompt with image, video and text requests running alongside (9.7 GiB with `VISION=0` under a 195k-token
-prompt and 5 concurrent long requests).
+TensorFold's budget is the free memory at start (`MemAvailable`) minus its reserve. This recipe sets the reserve to
+its 2 GiB floor (`TENSORFOLD_MEMORY_RESERVE_GIB=2`); unset, TensorFold would hold back a tenth of RAM (12.2 GiB, at
+least 4 GiB) and refuse 5 x 262,144. On the Spark's unified memory, running out tends to freeze the machine rather
+than fail an allocation: raise the reserve (e.g. `TENSORFOLD_MEMORY_RESERVE_GIB=6`) if other workloads share the
+box. Streams grow their caches as their context grows, while memory lasts; a stream that cannot grow waits.
 
 Other settings that fit the same budget (TensorFold's own estimate):
 
@@ -274,18 +277,20 @@ wins over it), or with `tensorfold serve` flags (`./start.sh --context 131072`).
 | `THINKING` | `1` | open a think block by default; `0` answers directly unless a request asks to think |
 | `SERVED_NAME` | `Qwen3.8-Flash-Next` | the model id in `/v1/models` and in replies |
 | `PORT` / `HOST` | `8888` / `0.0.0.0` | where the API listens |
-| `TENSORFOLD_PREFILL_ROWS` | `2048` (`4096` with `VISION=0`) | rows per prompt chunk (patch 0006); 4,096 is 2-5% faster from 3k tokens and takes 0.94 GiB more |
-| `TENSORFOLD_MTP_COPY` | `1` | prompt-lookup drafts for text that repeats the prompt (patch 0007; needs `PARALLEL` >= 2); `0` turns them off |
-| `TENSORFOLD_MAX_IMAGES` / `TENSORFOLD_IMAGE_TOKENS` | `50` / `16384` | images a request may carry and the tokens they share, each at most 4,096 (patch 0009) |
+| `VISION_MAX_IMAGES` | `50` | images a request may carry, all of a chat's turns counted (`--vision-max-images`) |
+| `TENSORFOLD_PREFILL_ROWS` | `2048` with `PLE_ON_SSD=1` | prompt piece rows, admitted at startup (256 to 16,384). Empty lets TensorFold choose (4,096 while idle without vision), which measured 10-30% slower from 5k to 16k tokens with the n-gram tables on SSD |
+| `TENSORFOLD_MTP_COPY` | `1` | prompt-lookup drafts for text that repeats the prompt (needs `PARALLEL` >= 2); `0` turns them off |
+| `TENSORFOLD_IMAGE_TOKENS` | `16384` | the tokens a request's images share, each at most 4,096 |
 | `TENSORFOLD_VIDEO_TOKENS` | `16384` | a request's video token budget |
 | `TENSORFOLD_VISION_WORKSPACE_MIB` | `0` | what startup reserves for the vision tower's scratch |
+| `TENSORFOLD_MEMORY_RESERVE_GIB` | `2` | GiB left out of MemAvailable at admission (floor since v0.6.0; unset would take about a tenth of RAM) |
 | `PREPARE` | `auto` | `start.sh` runs `scripts/prepare.sh` when needed; `1` always, `0` never |
 | `PULL` | `1` | `prepare.sh` tries the prebuilt image first; `0` always builds locally |
 | `STOP_TIMEOUT` | `30` | seconds `stop.sh` gives the server to shut down before removing it |
 
 Any `TENSORFOLD_*` variable in the environment is passed into the container (`TENSORFOLD_NO_UPDATE_CHECK=1`, the
 default, stops TensorFold asking GitHub for a newer release at each start). Less common settings are described in
-`scripts/config.sh`: `MODEL_ID`, `TF_VERSION`, `TF_REPO`, `BASE_IMAGE` (the patches are made for TensorFold v0.3.6.3;
+`scripts/config.sh`: `MODEL_ID`, `TF_VERSION`, `TF_REPO`, `BASE_IMAGE` (the patches are made for TensorFold v0.6.1;
 after changing any of these run `scripts/prepare.sh --rebuild`), `IMAGE`, `CONTAINER_NAME`, `GHCR_IMAGE`, `HF_CACHE`
 (default `$HF_HOME` or `~/.cache/huggingface`), `KERNEL_CACHE`, `MIN_FREE_GB`, `IMAGE_FREE_GB`. `start.sh` also takes
 `FOREGROUND=1`, `WAIT_TIMEOUT` (seconds, default 1800) and `HF_HUB_OFFLINE=0` (let the server reach Hugging Face; by
@@ -294,14 +299,15 @@ default it serves from the local cache only).
 ### Thinking and sampling
 
 By default the model thinks before it answers, with Qwen's recommended thinking-mode sampling: temperature 1.0,
-top_p 0.95, top_k 20. TensorFold has no min_p, presence penalty or repetition penalty, which is the same as
-min_p 0.0, presence_penalty 0.0 and repetition_penalty 1.0; requests that send those fields are served as if they
-had not. Per request:
+top_p 0.95, top_k 20. TensorFold v0.6.1 honours `min_p` and a top-level `reasoning_effort` as well as the template
+kwargs; presence and repetition penalties are still unused (same as presence_penalty 0.0 and repetition_penalty 1.0).
+Per request:
 
-- `temperature`, `top_p`, `top_k` and `seed` override the defaults (`temperature: 0` decodes greedily).
+- `temperature`, `top_p`, `top_k`, `min_p` and `seed` override the defaults (`temperature: 0` decodes greedily).
 - `"chat_template_kwargs": {"enable_thinking": false}` answers without thinking, and
-  `"chat_template_kwargs": {"reasoning_effort": "low"}` (or `"xhigh"`) sets Qwen's reasoning effort; without it the
-  template's default (medium) applies. A top-level OpenAI-style `reasoning_effort` field is ignored.
+  `"chat_template_kwargs": {"reasoning_effort": "low"}` (or `"xhigh"`) sets Qwen's reasoning effort; a top-level
+  OpenAI-style `reasoning_effort` is honoured too. Without either, the template default applies (`None` on this
+  CUDA CLI, not a forced medium).
 - The reasoning comes back in `reasoning_content`, the answer in `content`.
 
 ## What the patches change
@@ -309,21 +315,12 @@ had not. Per request:
 `scripts/prepare.sh` bakes every `patches/*.patch` into the image (unified diffs against TensorFold's site-packages,
 applied with `patch -p0`), and `start.sh` rebuilds or re-pulls the image by itself when the patches change.
 
-| Patch | Change | Effect |
-| --- | --- | --- |
-| `0001-cuda-live-token-counters` | `/health` reports live token totals | monitoring ([upstream #79](https://github.com/ashhart/TensorFold/pull/79)) |
-| `0002-flash-next-ssd-read-ahead` | a prompt chunk's n-gram rows are read from SSD while the GPU processes the previous chunk | multi-chunk prefill +50% |
-| `0003-flash-next-ssd-native-reader` | those reads run on a C++ thread pool outside the Python GIL | short prompts' time to first token -35%, 3k-12k prefill +10-40% on top, decode +4% |
-| `0004-flash-next-qsa-tiled-select` | the sparse-attention block selection no longer spills registers past 128k tokens | 149k-token prompts 25% faster; decode at 149k context +19% |
-| `0005-cuda-stream-draft-stats` | `drafted` / `accepted` counts in concurrent requests' stats | observability |
-| `0006-flash-next-prefill-rows` | configurable prompt chunk size (port of [#40](https://github.com/ashhart/TensorFold/pull/40)) | +2-5% at 4,096 rows |
-| `0007-flash-next-copy-drafts` | drafts copied from earlier text when the reply repeats the prompt | +6% on quoting and editing replies |
-| `0008-flash-next-vision` | image and video input for Flash Next on CUDA: the Qwen3.5 vision tower, interleaved 3-D rotary positions in the attention and sparse-attention kernels, video frames in timestamped blocks | `--vision` (TensorFold's own `--vision` covers only the dense 27B) |
-| `0009-flash-next-many-images` | up to 50 images a request sharing 16,384 tokens (4,096 at most an image), encoded by the vision tower in bounded runs; request bodies up to 96 MiB | many-image chats; one image is encoded exactly as before |
-| `languages/0010-flash-next-draft-languages` | only in the opt-in language image (`DRAFT_LANGUAGE`): Chinese and Japanese (also Russian, German, French, Portuguese) tokens added to the list MTP drafts from | Chinese +29-32%, Japanese +7-19% decode ([Other languages](#other-languages)) |
+| Patch | Change |
+| --- | --- |
+| `0002-flash-next-v061` | Flash Next on v0.6.1: video input and up to 50 images sharing 16,384 tokens on top of TensorFold's own Flash Next image input (which came from this recipe's v0.6.0 vision patch), copy drafts with compact MTP rows, a `TENSORFOLD_PREFILL_ROWS` override, SSD read-ahead around the n-gram table, first token before the next draft, no unused MTP logits while prompts absorb, 96 MiB request bodies. Percentage effects in older notes were measured on v0.5.0, not on this pin. |
+| `languages/0010-flash-next-draft-languages` | Opt-in language image only (`DRAFT_LANGUAGE`): language draft vocabularies for the MTP head. |
 
-Typed tool-call parameters (this recipe's former patch 0001, [#75](https://github.com/ashhart/TensorFold/pull/75))
-are part of TensorFold v0.3.6.3.
+v0.6.1 brings, upstream: shared system prompts copied into a free stream instead of filled again (measured here: a 31k-token system prompt answered a new question in 0.18 s instead of 14 s), forks that resume from the shared prefix, short prompts admitted while a long one fills, `--vision-max-images`, vLLM-named `/metrics`, and the fix for a refused request breaking the next one on its connection. Its startup reserve is `TENSORFOLD_MEMORY_RESERVE_GIB` (this recipe sets 2). Live `/health` counters, stream draft stats, and tiled QSA selection landed in v0.5.0.
 
 **Outputs are unchanged.** Every speed patch changes speed only: drafts are verified against the model's own keyed
 samples, and the prefill changes read the same bytes and select the same attention blocks. This was checked by
@@ -335,11 +332,14 @@ on image and video prompts, drafted replies equal the serial reference too. Any 
 ## Checks
 
 The scripts in `tools/` talk to the running server (`API_URL`, default `http://127.0.0.1:8888`; or just `PORT`),
-from this machine or another one (`API_URL=http://<spark-address>:8888 tools/bench.py`):
+from this machine or another one (`API_URL=http://<spark-address>:8888 tools/bench.py`).
+`tools/test_copy_draft_rows.py` is the exception: it exercises patched TensorFold source on the CPU.
 
 | Script | What it does |
 | --- | --- |
-| `tools/bench.py [label]` | prefill at ~0.85k / 3.2k / 12.6k / 50k tokens (fresh random prompts) and a short decode check |
+| `tools/bench.py [label]` | smoke: prefill at ~0.85k / 3.2k / 12.6k / 50k tokens (fresh random prompts) and a short decode check. `--suite --seed 1 --jsonl run.jsonl --clients 1,2,4,5` is the concurrent, fixed-seed driver |
+| `tools/test_copy_draft_rows.py` | mixed copy/MTP proposal-row ownership (needs `TF_SRC` pointing at patched TensorFold `src`; no model) |
+| `tools/test_astra_patches.py` | first-token-before-draft, MTP absorb-without-head, PLE concat, native worker counts (`TF_SRC`) |
 | `tools/needle.py` | hides a passphrase in a ~195k-token prompt and checks the model returns it |
 | `tools/toolcheck.py` | makes a tool call with an array parameter and checks it comes back as a JSON array |
 | `tools/visioncheck.py` | sends a drawn image (a red circle and a blue square) and checks the model names both |

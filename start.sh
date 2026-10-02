@@ -12,12 +12,12 @@
 #                                      # changed settings or patches; the new arguments are checked before stopping
 #   ./start.sh restart --parallel 8 --context 172000
 #   PARALLEL=3 KV_DTYPE=bf16 ./start.sh restart   # 256k at full KV precision
-#   VISION=0 ./start.sh restart        # text only (4,096-row prompt chunks, ~2-5% faster prefill)
+#   VISION=0 ./start.sh restart        # text only
 #   echo DRAFT_LANGUAGE=zh >> .env; ./start.sh restart   # replies mostly in Chinese (or ja): the language image
 # Extra arguments come after the defaults, so they win (the last value of a flag counts).
 # Settings, from the environment or ./.env (KEY=value lines): PARALLEL, CONTEXT, KV_DTYPE, DRAFT_LANGUAGE, PLE_ON_SSD,
-#      VISION, VISION_URLS, MTP_DRAFTS, MTP_CONFIDENCE, TEMPERATURE, TOP_P, TOP_K, THINKING, SERVED_NAME, PORT, HOST,
-#      CONTAINER_NAME, IMAGE (see scripts/config.sh); TENSORFOLD_* (passed to the server);
+#      VISION, VISION_URLS, VISION_MAX_IMAGES, MTP_DRAFTS, MTP_CONFIDENCE, TEMPERATURE, TOP_P, TOP_K, THINKING,
+#      SERVED_NAME, PORT, HOST, CONTAINER_NAME, IMAGE (see scripts/config.sh); TENSORFOLD_* (passed to the server);
 #      PREPARE (auto | 1 | 0); FOREGROUND=1 (stay attached, exit with the server's code); WAIT_TIMEOUT (seconds,
 #      default 1800); HF_HUB_OFFLINE=0 (let TensorFold reach the Hub; default serves from the local cache only)
 set -euo pipefail
@@ -41,6 +41,7 @@ SERVE_ARGS=(--name "$SERVED_NAME" --parallel "$PARALLEL" --context "$CONTEXT" --
 [[ "$PLE_ON_SSD" == 1 ]] && SERVE_ARGS+=(--ple-on-ssd)
 [[ "$VISION" == 1 ]] && SERVE_ARGS+=(--vision)
 [[ "$VISION" == 1 && "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)
+[[ "$VISION" == 1 && -n "$VISION_MAX_IMAGES" ]] && SERVE_ARGS+=(--vision-max-images "$VISION_MAX_IMAGES")
 if [[ "$THINKING" == 1 ]]; then SERVE_ARGS+=(--thinking); else SERVE_ARGS+=(--no-thinking); fi
 SERVE_ARGS+=("$@")
 # The effective value of a flag (its last occurrence, as --flag value or --flag=value).
@@ -120,13 +121,14 @@ fi
 if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then
   die "port $PORT is already in use: $(ss -ltnp "sport = :$PORT" 2>/dev/null | tail -n +2)"
 fi
-# TensorFold budgets the free memory minus a tenth of RAM; the default 5 x 262k int8 needs ~102.6 GiB of that
-# (75 GiB of it weights), i.e. ~115 GiB free at start. With less it refuses the window and names one that fits.
+# TensorFold budgets MemAvailable minus TENSORFOLD_MEMORY_RESERVE_GIB (2 here). The default 5 x 262k int8 needs
+# ~85.4 GiB at startup and ~108 GiB with every stream at its full window; with less it refuses the window and names
+# one that fits.
 avail_gb=$(free -g | awk '/^Mem:/ {print $7}')
-if (( avail_gb >= 115 )); then
+if (( avail_gb >= 103 )); then
   log "Arguments OK, port $PORT free, ${avail_gb} GiB memory available"
 else
-  warn "only ${avail_gb} GiB memory available (the default needs ~115): stop other GPU workloads (docker ps), or lower PARALLEL / CONTEXT"
+  warn "only ${avail_gb} GiB memory available (the default needs ~103): stop other GPU workloads (docker ps), or lower PARALLEL / CONTEXT"
 fi
 
 # TensorFold's own switches from the environment (TENSORFOLD_*, e.g. TENSORFOLD_MTP_COPY) reach the server too.

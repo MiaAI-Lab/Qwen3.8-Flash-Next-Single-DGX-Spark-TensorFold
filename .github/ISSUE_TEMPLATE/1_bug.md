@@ -91,11 +91,11 @@ curl -s http://localhost:8888/v1/chat/completions \
       Common culprits worth checking before filing:
         * "startup memory budget cannot fit" -> another GPU workload is using memory, or
           PARALLEL x CONTEXT x KV_DTYPE does not fit (README "KV pool and memory").
-        * start.sh warns "only N GiB memory available (the default needs ~115)" -> stop other GPU
+        * start.sh warns "only N GiB memory available (the default needs ~103)" -> stop other GPU
           containers first, or lower PARALLEL / CONTEXT.
         * `start.sh` refuses port 8888 -> something else listens there; set PORT.
         * prepare.sh fails applying a patch -> TF_VERSION was changed; the patches are
-          made for v0.3.6.2.
+          made for v0.6.1.
         * First start takes several minutes -> the CUDA kernels compile once (cached in
           ~/.cache/tensorfold-qwen38); that is expected, not a hang.
 -->
