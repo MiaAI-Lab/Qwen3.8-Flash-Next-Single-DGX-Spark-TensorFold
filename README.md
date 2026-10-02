@@ -11,8 +11,7 @@ Serve **Qwen3.8 Flash Next** from a single NVIDIA DGX Spark (GB10, 128 GB) throu
 **5 concurrent requests at the full 262,144-token context** and **image and video input**. It runs
 [TensorFold](https://github.com/ashhart/TensorFold) v0.6.1 (`17c73e1`) in NVIDIA's PyTorch container, plus
 `patches/0002-flash-next-v061.patch` (video input and many images on TensorFold's Flash Next vision, copy drafts,
-SSD read-ahead, first token before the next draft). The decode and prefill tables below were measured on the
-v0.3.6.3 recipe; they have not been re-run on v0.6.1.
+SSD read-ahead, first token before the next draft).
 
 - Checkpoint: [`Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP`](https://huggingface.co/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP)
   (MLX 4-bit, group size 32, with the MTP draft head)
@@ -23,35 +22,41 @@ v0.3.6.3 recipe; they have not been re-run on v0.6.1.
 
 ## Performance
 
-One DGX Spark, int8 KV cache, n-gram tables read from SSD and MTP drafting, measured through the OpenAI API. The 5
-concurrent requests row is from the current default (5 streams x 262,144 tokens); the other rows and the prefill table
-were measured with 4 streams x 262,144 tokens.
+One DGX Spark, the recipe's defaults on TensorFold v0.6.1 (5 streams x 262,144, int8 KV cache, n-gram tables read
+from SSD, image input on, MTP drafting), measured through the OpenAI API.
 
 **Decode, prose**
 
 | Concurrent requests | Aggregate | Per request | Time to first token |
 | ---: | ---: | ---: | ---: |
-| 1 | 62.4 tok/s | 62.4 tok/s | 152 ms |
-| 2 | 90.5 tok/s | 46.3 tok/s | 257 ms |
-| 4 | 106.7 tok/s | 28.9 tok/s | 436 ms |
-| 5 | 119.3 tok/s | 27.0 tok/s | 528 ms |
+| 1 | 63.6 tok/s | 63.6 tok/s | 66 ms |
+| 2 | 85.6 tok/s | 43.8 tok/s | 226 ms |
+| 4 | 114.5 tok/s | 29.7 tok/s | 304 ms |
+
+**Decode, code**
+
+| Concurrent requests | Aggregate | Per request | Time to first token |
+| ---: | ---: | ---: | ---: |
+| 1 | 96.9 tok/s | 96.9 tok/s | 206 ms |
+| 2 | 133.9 tok/s | 67.0 tok/s | 210 ms |
+| 4 | 166.4 tok/s | 44.8 tok/s | 292 ms |
 
 **Prefill**
 
 | Prompt | Tokens | Prefill speed | Time to first token |
 | ---: | ---: | ---: | ---: |
-| 8k | 8,229 | 2,503 tok/s | 3.29 s |
-| 16k | 16,425 | 2,520 tok/s | 6.52 s |
-| 32k | 32,806 | 2,499 tok/s | 13.13 s |
-| 64k | 65,575 | 2,414 tok/s | 27.17 s |
-| 128k | 131,110 | 2,200 tok/s | 59.60 s |
+| 8k | 8,228 | 2,421 tok/s | 3.40 s |
+| 16k | 16,423 | 2,468 tok/s | 6.66 s |
+| 32k | 32,805 | 2,462 tok/s | 13.33 s |
+| 64k | 65,571 | 2,391 tok/s | 27.43 s |
+| 128k | 131,110 | 2,180 tok/s | 60.13 s |
 
-Against unpatched TensorFold v0.3.6.2 with the same settings, prefill went from ~1,350-1,490 tok/s to ~2,340-2,480
-tok/s (3k-50k-token prompts), a ~195k-token prompt from ~208 s to ~97 s, and single-request decode rose ~4%.
-Every reply stayed byte-identical. The prefill table used 4,096-row prompt chunks, which `VISION=0` keeps; with image
-input on (the default), chunks are 2,048 rows to make room for the vision tower: prompts of 12k-150k tokens took 4-5%
-longer in our runs (e.g. 149k tokens in 74.0 s instead of 70.5 s), and a ~195k-token prompt ~102 s. Decode is
-unchanged.
+Against the v0.3.6.3 recipe's tables (4 streams, 4,096-row prompt chunks), prose decode is within -5% to +7% and the
+first token comes 12-57% sooner; prefill is 1-3% slower, about what the default 2,048-row pieces cost (they leave
+room for the vision tower). Against unpatched TensorFold v0.3.6.2 with the same settings, the recipe's patches took
+prefill from ~1,350-1,490 tok/s to ~2,340-2,480 tok/s (3k-50k-token prompts) and single-request decode up ~4%, with
+every reply byte-identical. A new question on a long shared system prompt reuses it: a 31k-token one answered in
+0.18 s instead of 14 s. `docs/v061.md` has the v0.6.0-to-v0.6.1 comparison.
 
 ## Requirements
 
@@ -88,7 +93,8 @@ curl -s http://<spark-address>:8888/v1/chat/completions -H 'Content-Type: applic
 
 Any OpenAI client works with `base_url = "http://<spark-address>:8888/v1"` and the model `Qwen3.8-Flash-Next`.
 Streaming, tool calls (typed parameters, e.g. arrays come back as JSON arrays), reasoning content, images and
-videos are supported. The model thinks before it answers (`reasoning_content`), so give replies enough `max_tokens`.
+videos are supported. The model thinks before it answers (`reasoning_content`), so give replies enough `max_tokens`;
+a request without one gets `MAX_TOKENS` (32,768).
 
 ```bash
 ./start.sh restart                            # restart it, e.g. after changing a setting
@@ -275,6 +281,7 @@ wins over it), or with `tensorfold serve` flags (`./start.sh --context 131072`).
 | `MTP_DRAFTS` / `MTP_CONFIDENCE` | `6` / `0.60` | at most 6 MTP drafts a round; a chain stops before a draft under 60% |
 | `TEMPERATURE` / `TOP_P` / `TOP_K` | `1.0` / `0.95` / `20` | default sampling (Qwen's thinking-mode values); a request's own values win |
 | `THINKING` | `1` | open a think block by default; `0` answers directly unless a request asks to think |
+| `MAX_TOKENS` | `32768` | reply length for a request without `max_tokens` (TensorFold's own default, 4,096, can end a thinking reply before it answers); clamped to the stream's window |
 | `SERVED_NAME` | `Qwen3.8-Flash-Next` | the model id in `/v1/models` and in replies |
 | `PORT` / `HOST` | `8888` / `0.0.0.0` | where the API listens |
 | `VISION_MAX_IMAGES` | `50` | images a request may carry, all of a chat's turns counted (`--vision-max-images`) |

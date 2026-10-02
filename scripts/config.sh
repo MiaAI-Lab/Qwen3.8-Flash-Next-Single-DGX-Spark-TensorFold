@@ -63,6 +63,10 @@ TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-0.95}"
 TOP_K="${TOP_K:-20}"
 THINKING="${THINKING:-1}"
+# Reply length for a request that sets no max_tokens (or max_completion_tokens). TensorFold's own default, 4,096,
+# can end a thinking reply before it answers (finish_reason "length", no content or tool call). The value is clamped
+# to the room left in the stream's window and reserves no memory; a request's own max_tokens wins.
+MAX_TOKENS="${MAX_TOKENS:-32768}"
 # TensorFold switches (start.sh passes every TENSORFOLD_* variable into the container).
 # Prompt piece rows. Unset, TensorFold v0.6.1 picks 2,048 with vision and 4,096 without (while nothing decodes,
 # if memory allows). With the n-gram tables on SSD (PLE_ON_SSD=1) 4,096 measured 10-30% slower from 5k to 16k
