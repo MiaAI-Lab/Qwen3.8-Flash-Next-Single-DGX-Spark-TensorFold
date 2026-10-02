@@ -35,10 +35,10 @@ This repository is a thin layer of scripts and patches. Almost everything that m
   are in TensorFold v0.5.0 (`cuda/health.py`, tiled QSA, stream draft accounting). The recipe's earlier
   typed-tool-parameters patch ([#75](https://github.com/ashhart/TensorFold/pull/75)) was already in v0.3.6.3.
 - `0002-flash-next-v061.patch` folds the v0.5.0 series into one diff; image input itself is now TensorFold's own.
-  The prefill rows override is a port of
-  [TensorFold #40](https://github.com/ashhart/TensorFold/pull/40) by **MovieMaker93**. Copy drafts use TensorFold's
-  `CopyIndex` from the Qwen3.5 27B engine. Vision builds on the Qwen3.5/3.8 dense tower, Hugging Face transformers,
-  and Qwen3-VL video processing. The v0.5.0 series and the v0.6.0 and v0.6.1 rebases are by MiaAI-Lab, developed with
+  The prefill rows override is a port of [TensorFold #40](https://github.com/ashhart/TensorFold/pull/40) by
+  **[MovieMaker93](https://github.com/MovieMaker93)**. Copy drafts use TensorFold's `CopyIndex` from the Qwen3.5 27B
+  engine. Vision builds on the Qwen3.5/3.8 dense tower, Hugging Face transformers, and Qwen3-VL video processing.
+  The v0.5.0 series and the v0.6.0 and v0.6.1 rebases are by MiaAI-Lab, developed with
   [Claude Code](https://claude.com/claude-code) and Cursor.
 - `languages/0010-flash-next-draft-languages`: the language token lists come from
   **Javier ([jvr0x](https://github.com/jvr0x))**'s language draft vocabularies for this model's vLLM recipe
