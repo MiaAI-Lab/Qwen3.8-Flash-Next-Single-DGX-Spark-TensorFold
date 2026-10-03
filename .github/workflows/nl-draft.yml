@@ -1,0 +1,27 @@
+name: Dutch draft CPU validation
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install numpy
+      - name: Apply full patch stack to pinned engine, without fuzz
+        run: |
+          git clone https://github.com/ashhart/TensorFold.git /tmp/tensorfold
+          git -C /tmp/tensorfold checkout 17c73e189f5e6a5304cda7ea37f086f9c49b4788
+          cd /tmp/tensorfold/src
+          for p in "$GITHUB_WORKSPACE"/patches/*.patch "$GITHUB_WORKSPACE"/patches/languages/*.patch; do
+            patch --batch --fuzz=0 -p0 < "$p"
+          done
+      - name: Config syntax and real loader tests
+        env:
+          TF_SRC: /tmp/tensorfold/src
+        run: |
+          bash -n scripts/config.sh scripts/prepare.sh start.sh
+          python tools/test_nl_draft.py

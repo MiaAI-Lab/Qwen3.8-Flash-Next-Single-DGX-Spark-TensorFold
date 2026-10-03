@@ -23,7 +23,7 @@ BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
 # Replies mostly in Chinese or Japanese: DRAFT_LANGUAGE=zh or ja (in .env) serves the second image, which adds that
 # language's tokens to the ones MTP drafts may propose (patches/languages/): faster decoding there, the same
 # output. English and code get a little slower with it, so leave it unset otherwise. Also accepted, not measured to help:
-# de, fr, pt, ru; several: "zh,ja". See the README's "Other languages" section.
+# de, fr, pt, ru, nl (experimental); several: "nl,de". See docs/nl.md for Dutch validation and benchmarks.
 DRAFT_LANGUAGE="${DRAFT_LANGUAGE:-}"
 IMAGE="${IMAGE:-tensorfold-qwen38:${TF_VERSION}${DRAFT_LANGUAGE:+-languages}}"   # the local image prepare.sh builds or pulls
 CONTAINER_NAME="${CONTAINER_NAME:-qwen38-flash-next-tf}"          # the server's container
@@ -108,9 +108,9 @@ model_cache_dir() { echo "$HF_CACHE/hub/models--${MODEL_ID//\//--}"; }
 
 # start.sh and scripts/*.sh (not stop.sh, which must stop the server whatever the settings) check DRAFT_LANGUAGE.
 check_draft_language() {
-  local one='(de|fr|ja|pt|ru|zh)'
+  local one='(de|fr|ja|nl|pt|ru|zh)'
   [[ -z "$DRAFT_LANGUAGE" || "$DRAFT_LANGUAGE" =~ ^$one(,$one)*$ ]] || \
-    die "DRAFT_LANGUAGE=$DRAFT_LANGUAGE: zh or ja (recommended), de, fr, pt or ru, or several like zh,ja"
+    die "DRAFT_LANGUAGE=$DRAFT_LANGUAGE: zh or ja (recommended), de, fr, nl (experimental), pt or ru, or several like nl,de"
 }
 # The patches baked into $IMAGE, in order: patches/*.patch, plus patches/languages/*.patch for DRAFT_LANGUAGE.
 patch_files() { ls patches/*.patch; [[ -z "$DRAFT_LANGUAGE" ]] || ls patches/languages/*.patch; }

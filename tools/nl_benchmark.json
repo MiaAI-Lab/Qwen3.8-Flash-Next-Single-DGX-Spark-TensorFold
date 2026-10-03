@@ -1,0 +1,17 @@
+{
+  "description": "Authored held-out prompts, absent from vocabulary training. Eight Dutch tasks plus English/code controls; greedy, thinking off, 1024-token limit.",
+  "requests": [
+    {"id": "nl-weather", "group": "nl", "prompt": "Leg in helder Nederlands uit waarom weersverwachtingen onzekerder worden naarmate ze verder vooruit kijken. Gebruik voorbeelden en bespreek hoe een ensemble helpt."},
+    {"id": "nl-energy", "group": "nl", "prompt": "Schrijf een Nederlandstalige uitleg over de werking van een thuisbatterij met zonnepanelen en dynamische stroomprijzen. Bespreek omzettingsverlies, piekvermogen en de rol van een voorspelling zonder specifieke koopadviezen."},
+    {"id": "nl-story", "group": "nl", "prompt": "Schrijf een Nederlands verhaal over een fietsenmaker in Groningen die tijdens een regenachtige ochtend een mysterieuze brief vindt. Gebruik natuurlijke dialogen en werk toe naar een onverwachte ontknoping."},
+    {"id": "nl-technical", "group": "nl", "prompt": "Leg in het Nederlands uit hoe een wachtrij met één schrijver en één lezer kan werken zonder mutex. Beschrijf geheugenvolgorde, wraparound en de situaties waarin het ontwerp niet meer veilig is."},
+    {"id": "nl-memo", "group": "nl", "prompt": "Stel een uitgebreide Nederlandstalige werkinstructie op voor het overdragen van een onderhoudsdienst. Gebruik volledige zinnen, duidelijke stappen en voorbeelden van informatie die een collega nodig heeft."},
+    {"id": "nl-accents", "group": "nl", "prompt": "Schrijf een Nederlandstalig essay over samenwerking in een meertalig team. Gebruik de woorden ideeën, efficiëntie, coördinatie, patiënt, enquête en reünie op natuurlijke wijze. Geef concrete voorbeelden."},
+    {"id": "nl-reasoning", "group": "nl", "prompt": "Een bibliotheek krijgt twee karren met boeken die elk al alfabetisch zijn gesorteerd. Beschrijf in het Nederlands een praktisch samenvoegproces, de benodigde controles en de tijdscomplexiteit. Illustreer het met een klein voorbeeld."},
+    {"id": "nl-mixed", "group": "nl", "prompt": "Schrijf in het Nederlands een technische uitleg van het verschil tussen latency, throughput, cache hit rate en backpressure. Behoud die Engelse termen en geef bij elk begrip een voorbeeld uit een webdienst."},
+    {"id": "en-weather", "group": "en", "prompt": "Explain in English why weather forecasts become less certain at longer horizons. Use examples and describe how ensembles help."},
+    {"id": "en-queue", "group": "en", "prompt": "Explain in English how a single-producer single-consumer ring buffer works. Discuss memory ordering, wraparound and the limitations of the design."},
+    {"id": "code-python", "group": "code", "prompt": "Write a Python implementation of a bounded LRU cache, with type hints, docstrings and tests. Explain edge cases."},
+    {"id": "code-typescript", "group": "code", "prompt": "Write a TypeScript asynchronous task queue with a configurable concurrency limit, cancellation and unit tests. Explain how errors propagate."}
+  ]
+}

@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "provenance": {
+    "model": "Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP",
+    "model_revision": "2b170fa6309d5d1ee380b35636075fac7945f286",
+    "dataset": "wikimedia/wikipedia",
+    "dataset_revision": "b04c8d1ceb2f5cd4588862100d08de323dccfbaa",
+    "shard": "20231101.nl/train-00000-of-00006.parquet",
+    "shard_sha256": "83d8a4c39a03e025071aeb64cf5b395870b74abcb4bb14c1c5d7ce44fd05c5d7",
+    "requested_documents": 20000,
+    "documents": {
+      "train": 17994,
+      "holdout": 2006
+    },
+    "split": "first N unique nonempty articles; sha256(article_id) % 10 == 0 is holdout",
+    "source_url": "https://huggingface.co/datasets/wikimedia/wikipedia",
+    "license": "Wikipedia CC BY-SA 4.0 / GFDL; article URLs retained in local corpus",
+    "scope": "one shard, encyclopedic seed data; not representative model replies"
+  },
+  "sha256": {
+    "tokenizer": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+    "base_ids_lf": "88d5b483a849ae9245b78b69f41f11cdfc8b5c024f0786c1c8196263857cc93e",
+    "train": "d97f456a15595915692160e7b5c21c76c9c2ec4786ae282b0298242169f35d43",
+    "holdout": "ab24b61ea67db36cbd0075c1cc271e593c5d44b38f742371f15715e2a46b426b",
+    "extension": "098fab3f73098ed48b3486e9e586f560be46368a718f96103e5bec32e9600498",
+    "patch": "2fd46f779c42f8071a2ba29f89bf6c47d96169b9efa6fb74a2782c7e4d846127"
+  },
+  "tokenizer_vocab_size": 248077,
+  "base_size": 79591,
+  "extension_size": 5176,
+  "union_size": 84767,
+  "max_size": 100000,
+  "selection_target": 0.995,
+  "training_target_reached": true,
+  "train": {
+    "documents": 17994,
+    "tokens": 37575880,
+    "base_coverage": 0.8689444398906958,
+    "nl_coverage": 0.9950002235476587
+  },
+  "holdout": {
+    "documents": 2006,
+    "tokens": 4141468,
+    "base_coverage": 0.8689677186929852,
+    "nl_coverage": 0.9947586218220206
+  },
+  "split_overlap": 0,
+  "status": "Wikipedia seed vocabulary; model-output coverage and DGX Spark speed unmeasured"
+}
