@@ -1,0 +1,25 @@
+TensorFold: accept Qwen's edit_file spelling when the client exposes edit.
+--- tensorfold/engine/tool_draft.py
++++ tensorfold/engine/tool_draft.py
+@@ -252,7 +252,9 @@
+         self.current_schema = {}
+         self.typed = False
+         self.value_buffer = ""
+         self.known = {name.lower(): name for name in tool_schema(tools)}
++        if "edit" in self.known and "edit_file" not in self.known:
++            self.known["edit_file"] = self.known["edit"]
+         self.pos = 0
+         self.state = "outside"
+         self.index = -1
+--- tensorfold/server/tools.py
++++ tensorfold/server/tools.py
+@@ -349,7 +349,9 @@
+ ) -> tuple[str, list[dict[str, Any]] | None]:
+     if not tools:
+         return text, None
+     known = {tool_spec_name(tool).lower(): tool_spec_name(tool) for tool in tools}
++    if "edit" in known and "edit_file" not in known:
++        known["edit_file"] = known["edit"]
+     schemas = parameter_schemas(tools)
+     envelopes = _envelopes(text)
+     if not envelopes:
