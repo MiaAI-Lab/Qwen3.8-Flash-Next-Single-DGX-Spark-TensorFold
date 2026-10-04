@@ -103260,7 +103260,7 @@ Optional MTP draft-vocabulary additions for selected languages.
  
  
 +# Languages with a draft vocabulary extension beside this module (``draft_vocab_<code>.txt``: ids the default lacks).
-+DRAFT_LANGUAGES = ("de", "fr", "ja", "pt", "ru", "zh")
++DRAFT_LANGUAGES = ("de", "fr", "ja", "nl", "pt", "ru", "zh")
 +
 +
 +def draft_vocab_setting() -> str:

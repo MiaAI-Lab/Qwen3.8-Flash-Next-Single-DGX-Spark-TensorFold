@@ -44,6 +44,9 @@ This repository is a thin layer of scripts and patches. Almost everything that m
   **Javier ([jvr0x](https://github.com/jvr0x))**'s language draft vocabularies for this model's vLLM recipe
   ([MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark#84](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark/pull/84)),
   built from each language's Wikipedia by token frequency.
+- Dutch support uses a new deterministic generator and the pinned `wikimedia/wikipedia`
+  `20231101.nl` dataset with the served Vontra tokenizer. Provenance and source attribution are in
+  `data/nl/report.json` and `docs/nl.md`; the corpus itself is not redistributed here.
 
 ## Runtime stack
 
