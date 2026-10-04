@@ -1,0 +1,116 @@
+Add CORS preflight (OPTIONS) support, permissive CORS headers, root/health endpoints, and support for image_url/video_url across tool and assistant message roles for VS Code and client integrations.
+--- tensorfold/cuda/http.py
++++ tensorfold/cuda/http.py
+@@ -44,11 +44,22 @@
+         def log_message(self, fmt, *args):  # quiet
+             pass
+ 
++        def do_OPTIONS(self):
++            self.send_response(204)
++            self.send_header("Access-Control-Allow-Origin", "*")
++            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE, PUT, HEAD")
++            self.send_header("Access-Control-Allow-Headers", "*")
++            self.send_header("Access-Control-Max-Age", "86400")
++            self.end_headers()
++
+         def _json(self, code: int, payload: dict[str, Any]) -> None:
+             data = json.dumps(payload).encode()
+             try:
+                 self.send_response(code)
+                 self.send_header("Content-Type", "application/json")
++                self.send_header("Access-Control-Allow-Origin", "*")
++                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE, PUT, HEAD")
++                self.send_header("Access-Control-Allow-Headers", "*")
+                 self.send_header("Content-Length", str(len(data)))
+                 if self.close_connection:                # so a pooling client does not reuse the socket
+                     self.send_header("Connection", "close")
+@@ -86,7 +97,7 @@
+             if self.path.rstrip("/") in ("/v1/models", "/models"):
+                 self._json(200, {"object": "list", "data": [{"id": model_id, "object": "model", "owned_by": "tensorfold"}
+                                                             for model_id in app.model_ids]})
+-            elif self.path.rstrip("/") in ("/health", "/v1/health"):
++            elif self.path.rstrip("/") in ("/health", "/v1/health", "", "/v1"):
+                 self._json(200, health.of(app).snapshot(app))
+             elif responses.route(self.path):
+                 responses.get(self, app, responses.route(self.path))
+@@ -142,6 +153,9 @@
+                 self.send_response(200)
+                 self.send_header("Content-Type", "text/event-stream")
+                 self.send_header("Cache-Control", "no-cache")
++                self.send_header("Access-Control-Allow-Origin", "*")
++                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE, PUT, HEAD")
++                self.send_header("Access-Control-Allow-Headers", "*")
+                 self.send_header("Connection", "close")
+                 self.end_headers()
+ 
+--- tensorfold/server/http.py
++++ tensorfold/server/http.py
+@@ -88,10 +88,21 @@
+         def log_message(self, format: str, *args: Any) -> None:
+             print(f"[tensorfold] {self.address_string()} {format % args}")
+ 
++        def do_OPTIONS(self) -> None:
++            self.send_response(204)
++            self.send_header("Access-Control-Allow-Origin", "*")
++            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE, PUT, HEAD")
++            self.send_header("Access-Control-Allow-Headers", "*")
++            self.send_header("Access-Control-Max-Age", "86400")
++            self.end_headers()
++
+         def _send_json(self, payload: dict[str, Any], status: int = 200) -> None:
+             body = json.dumps(payload).encode("utf-8")
+             self.send_response(status)
+             self.send_header("Content-Type", "application/json")
++            self.send_header("Access-Control-Allow-Origin", "*")
++            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE, PUT, HEAD")
++            self.send_header("Access-Control-Allow-Headers", "*")
+             self.send_header("Content-Length", str(len(body)))
+             if self.close_connection:                    # so a pooling client does not reuse the socket
+                 self.send_header("Connection", "close")
+@@ -322,6 +333,9 @@
+                     self.send_response(200)
+                     self.send_header("Content-Type", "text/event-stream")
+                     self.send_header("Cache-Control", "no-cache")
++                    self.send_header("Access-Control-Allow-Origin", "*")
++                    self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE, PUT, HEAD")
++                    self.send_header("Access-Control-Allow-Headers", "*")
+                     self.send_header("Connection", "close")
+                     self.end_headers()
+ 
+--- tensorfold/vision/images.py
++++ tensorfold/vision/images.py
+@@ -153,8 +153,8 @@
+             elif kind == "video_url" and allow_videos:
+                 from .videos import DEFAULT_VIDEO_LIMITS, video_source
+ 
+-                if role != "user":
+-                    raise ImageInputError("video_url parts are supported only in user messages")
++                if role not in {"user", "tool", "assistant", "system", "developer"}:
++                    raise ImageInputError("video_url parts are supported only in valid messages")
+                 if any(part.get(key) for key in _MEDIA - {"video_url"}):
+                     raise ImageInputError("video_url parts cannot contain other media")
+                 videos = sum(type(s).__name__ == "VideoSource" for s in sources)
+@@ -163,8 +163,8 @@
+                 sources.append(video_source(part.get("video_url"), DEFAULT_VIDEO_LIMITS, allow_urls))
+                 parts.append({"type": "video"})
+             elif kind == "image_url":
+-                if role != "user":
+-                    raise ImageInputError("image_url parts are supported only in user messages")
++                if role not in {"user", "tool", "assistant", "system", "developer"}:
++                    raise ImageInputError("image_url parts are supported only in valid messages")
+                 if any(part.get(key) for key in _MEDIA - {"image_url"}):
+                     raise ImageInputError("image_url parts cannot contain other media")
+                 if sum(isinstance(s, ImageSource) for s in sources) >= limits.max_images:
+--- tensorfold/server/messages.py
++++ tensorfold/server/messages.py
+@@ -49,8 +49,8 @@
+         content = message.get("content")
+         if isinstance(content, list) and allow_images and any(
+                 isinstance(p, dict) and p.get("type") in _VISUAL for p in content):
+-            if role != "user":
+-                raise RequestError("images and videos are supported only in user messages")
++            if role not in ("user", "tool", "assistant", "system", "developer"):
++                raise RequestError("images and videos are supported only in valid messages")
+             for part in content:
+                 if not isinstance(part, dict) or part.get("type") not in ("text", *_VISUAL):
+                     raise RequestError("image messages may contain text and image_url (or video_url) parts only")
