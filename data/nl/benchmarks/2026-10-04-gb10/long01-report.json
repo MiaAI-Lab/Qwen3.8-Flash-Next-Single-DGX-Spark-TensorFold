@@ -1,0 +1,29 @@
+{
+  "valid": true,
+  "pairs": 8,
+  "issues": [],
+  "groups": [
+    {
+      "group": "nl",
+      "clients": 1,
+      "pairs": 8,
+      "A_median_decode_tps": 50.67052108727738,
+      "B_median_decode_tps": 54.12513173273696,
+      "median_paired_speed_ratio": 1.0755821506574224,
+      "A_median_ttft": 0.4629524315096205,
+      "A_median_elapsed": 33.43892267400224,
+      "A_median_batch_wall_s": 33.43952734899358,
+      "A_acceptance": 0.5048423336174169,
+      "A_missing_draft_stats": 0,
+      "B_median_ttft": 0.4580425585008925,
+      "B_median_elapsed": 31.081240787010756,
+      "B_median_batch_wall_s": 31.08221833400603,
+      "B_acceptance": 0.5574457792469564,
+      "B_missing_draft_stats": 0
+    }
+  ],
+  "serial_checked": {
+    "A": true,
+    "B": true
+  }
+}

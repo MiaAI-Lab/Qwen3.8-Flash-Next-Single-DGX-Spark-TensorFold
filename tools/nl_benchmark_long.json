@@ -1,0 +1,53 @@
+{
+  "description": "Authored Dutch holdout prompts designed to elicit complete long-form answers; 8 Dutch tasks, temperature 0, seed 42, thinking disabled, 2048-token completion cap.",
+  "requests": [
+    {
+      "id": "nl-weather-long",
+      "group": "nl",
+      "max_tokens": 2048,
+      "prompt": "Schrijf een uitgebreide, zelfstandig leesbare uitleg in helder Nederlands van ongeveer 650 tot 800 woorden. Leg uit waarom weersverwachtingen onzekerder worden naarmate de voorspelling verder vooruit kijkt. Behandel achtereenvolgens meetfouten in de begincondities, de chaotische groei van kleine verschillen, modelonzekerheid en de invloed van nieuwe waarnemingen. Werk daarna een fictief voorbeeld uit met een verwachting voor vijf dagen: geef per dag een plausibel scenario en beschrijf hoe de spreiding tussen ensembleleden verandert. Leg uit wat een ensemble is, hoe een meteoroloog de spreiding, mediaan en uitschieters kan interpreteren, en waarom een ensemble geen garantie is dat een van de leden precies gelijk heeft. Sluit af met praktische voorbeelden van zorgvuldige formuleringen voor een weerbericht en met drie misverstanden die de lezer moet vermijden. Gebruik concrete voorbeelden, maar presenteer de fictieve cijfers duidelijk als illustratie."
+    },
+    {
+      "id": "nl-energy-long",
+      "group": "nl",
+      "max_tokens": 2048,
+      "prompt": "Maak een diepgaande uitleg in natuurlijk Nederlands van ongeveer 650 tot 800 woorden over een huishouden met zonnepanelen, een thuisbatterij en dynamische elektriciteitsprijzen. Gebruik uitsluitend een fictief rekenvoorbeeld en benoem alle aannames. Beschrijf hoe opgewekte stroom achtereenvolgens direct kan worden verbruikt, opgeslagen of teruggeleverd, en leg uit waar omzettingsverlies ontstaat. Werk een zonnige dag en een bewolkte winterdag uit. Bespreek laad- en ontlaadvermogen, bruikbare capaciteit, minimale reserve, de timing van goedkope en dure uren, terugleververgoedingen en de onzekerheid van prijs- en opwekvoorspellingen. Geef een klein tabelletje met fictieve waarden en leg de berekening stap voor stap uit zonder een rendementsclaim voor echte producten te doen. Bespreek vervolgens waarom een batterij soms niet handelt hoewel de prijs negatief is, welke beperkingen een regelstrategie heeft en welke metingen iemand nodig heeft om achteraf te beoordelen wat er gebeurde. Sluit af met een korte checklist en vermijd koopadvies."
+    },
+    {
+      "id": "nl-story-long",
+      "group": "nl",
+      "max_tokens": 2048,
+      "prompt": "Schrijf een afgerond literair verhaal in natuurlijk Nederlands van ongeveer 700 tot 850 woorden. De hoofdpersoon is een fietsenmaker in Groningen die op een regenachtige ochtend een natte, ongefrankeerde brief in een oude fiets vindt. Laat de brief eerst een alledaags probleem lijken, maar geef genoeg concrete details zodat de lezer aanwijzingen kan volgen. Gebruik geloofwaardige dialogen, een herkenbare plaatselijke sfeer zonder toeristische opsomming, en laat de hoofdpersoon een moeilijke maar kleine morele keuze maken. Verwerk ten minste drie terugkerende voorwerpen die later betekenis krijgen. Bouw de spanning geleidelijk op, vermijd bovennatuurlijke verklaringen en laat de ontknoping verrassend maar logisch uit de eerdere aanwijzingen volgen. Geef de personages eigen stemmen en laat de emotie blijken uit hun gedrag en woorden. Eindig met een korte scène die laat zien wat de keuze heeft veranderd, zonder de moraal expliciet uit te leggen."
+    },
+    {
+      "id": "nl-technical-long",
+      "group": "nl",
+      "max_tokens": 2048,
+      "prompt": "Leg in een technische maar toegankelijke Nederlandstalige verhandeling van ongeveer 650 tot 800 woorden uit hoe een wachtrij met één schrijver en één lezer zonder mutex kan werken. Beschrijf eerst de gegevensstructuur en geef daarna korte pseudocode voor toevoegen en uitlezen. Leg uit hoe de schrijver en lezer elk hun eigen index bijwerken, wat acquire- en release-geheugenvolgorde beschermen, waarom volatile op zichzelf onvoldoende is en hoe wraparound met een ringbuffer wordt afgehandeld. Gebruik een capaciteit die geen macht van twee is en benoem welke modulo-keuze dat oplevert. Werk een concreet voorbeeld door met enkele toevoegingen en uitlezingen. Bespreek vervolgens buffer vol, buffer leeg, geheugenhergebruik, cachelijnen, false sharing en wat er verandert bij meerdere schrijvers of lezers. Eindig met de aannames waaronder het ontwerp correct is, twee nuttige tests en situaties waarin een mutex of een bestaande bibliotheek verstandiger is. Maak onderscheid tussen conceptuele pseudocode en taalafhankelijke implementatiedetails."
+    },
+    {
+      "id": "nl-handover-long",
+      "group": "nl",
+      "max_tokens": 2048,
+      "prompt": "Stel een volledige werkinstructie op in helder Nederlands van ongeveer 650 tot 800 woorden voor de overdracht van een onderhoudsdienst aan de volgende ploeg. Gebruik als doorlopend fictief voorbeeld een industriële pomp waarvan trillingen zijn toegenomen maar die nog draait. Beschrijf hoe de vertrekkende ploeg eerst de actuele toestand, trendmetingen, uitgevoerde werkzaamheden, openstaande werkvergunningen, onderdelen en veiligheidsrisico's vastlegt. Geef daarna een logische overdracht in stappen: mondelinge briefing, controle samen op locatie, expliciete bevestiging van verantwoordelijkheden en registratie in het logboek. Voeg een compact ingevuld voorbeeld toe met tijdstippen, meetwaarden, onzekerheden en een duidelijke eigenaar per vervolgactie. Benoem welke formuleringen te vaag zijn en herschrijf ze concreet. Leg uit wanneer de ploeg de installatie moet stilzetten of een supervisor inschakelt, zonder zelf grenswaarden te verzinnen: verwijs naar de geldende lokale procedure en fabrikantlimieten. Eindig met een checklist die ook bevestigt dat de ontvangende ploeg de informatie begrepen heeft."
+    },
+    {
+      "id": "nl-team-long",
+      "group": "nl",
+      "max_tokens": 2048,
+      "prompt": "Schrijf een genuanceerd essay in natuurlijk Nederlands van ongeveer 650 tot 800 woorden over samenwerking in een meertalig technisch team. Gebruik een concrete fictieve casus waarin Nederlandse, Vlaamse en internationale collega's gezamenlijk een storing onderzoeken. Laat zien hoe taalkeuze, vakjargon, accent, hiërarchie en tijdsdruk misverstanden kunnen veroorzaken, maar ook hoe verschillende perspectieven de diagnose kunnen verbeteren. Verwerk de woorden ideeën, efficiëntie, coördinatie, patiënt, enquête en reünie elk op een natuurlijke manier en leg niet uit dat je ze hebt moeten opnemen. Geef een scène waarin iemand een aanname controleert door terug te vragen, een scène waarin een collega ruimte maakt voor een stillere deelnemer en een voorbeeld van een schriftelijke samenvatting die besluiten, onzekerheden en eigenaars vastlegt. Bespreek daarna welke teamafspraken helpen en waarom alleen een lijst met verboden woorden niet genoeg is. Sluit af met drie concrete gewoonten die het team de volgende werkdag kan invoeren, en geef per gewoonte het verwachte voordeel en een mogelijke keerzijde."
+    },
+    {
+      "id": "nl-merge-long",
+      "group": "nl",
+      "max_tokens": 2048,
+      "prompt": "Leg in een uitgebreide Nederlandstalige les van ongeveer 650 tot 800 woorden uit hoe je twee reeds alfabetisch gesorteerde karren met boeken efficiënt samenvoegt tot één gesorteerde lijst. Gebruik een klein voorbeeld met fictieve titels en auteurs, en doorloop meerdere vergelijkingen stap voor stap. Beschrijf hoe je gelijke titels behandelt, wat je doet met ontbrekende of onvolledige auteursnamen en waarom een stabiele keuze nuttig kan zijn. Geef pseudocode, analyseer de tijds- en extra ruimtecomplexiteit in termen van n en m, en vergelijk dit met alles opnieuw sorteren. Bespreek hoe je de aanpak aanpast wanneer de lijst te groot is voor het werkgeheugen of wanneer de gegevens uit bestanden komen. Voeg daarna testgevallen toe voor lege karren, één boek, gelijke sleutels, omgekeerd ongelijke lengtes en dubbele records. Benoem ten slotte welke sorteerafspraak vooraf met de bibliotheek moet worden vastgelegd, zodat twee medewerkers niet verschillende resultaten verwachten."
+    },
+    {
+      "id": "nl-service-long",
+      "group": "nl",
+      "max_tokens": 2048,
+      "prompt": "Schrijf een praktische technische gids in het Nederlands van ongeveer 650 tot 800 woorden over latency, throughput, cache hit rate en backpressure in een webdienst. Behoud deze vier Engelse termen en definieer ze nauwkeurig. Gebruik één fictieve API als doorlopend voorbeeld en geef consistente, duidelijk fictieve meetwaarden voor een rustige periode en een periode met piekbelasting. Leg uit waarom lage gemiddelde latency hoge p95-latency niet uitsluit, waarom throughput niet hetzelfde is als capaciteit en hoe een hoge cache hit rate zowel nuttig als misleidend kan zijn. Beschrijf hoe backpressure wachtrijen begrenst en waarom onbeperkt bufferen de storing kan verergeren. Geef een tabel met de vier metrics, eenheid, voorbeeldinterpretatie en een valkuil. Werk daarna een diagnosevolgorde uit met dashboards, traces en gecontroleerde belastingtests, en maak duidelijk welke interventies eerst hypothesen testen in plaats van direct symptomen maskeren. Sluit af met een klein incidentvoorbeeld waarin de vier metingen samen een plausibele oorzaak aanwijzen."
+    }
+  ]
+}

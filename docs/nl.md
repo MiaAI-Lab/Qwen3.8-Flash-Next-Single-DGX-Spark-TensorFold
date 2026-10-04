@@ -1,16 +1,15 @@
 # Dutch draft vocabulary (experimental)
 
-This fork adds `DRAFT_LANGUAGE=nl` and combinations such as `nl,de`. It changes only the MTP draft vocabulary,
-not the main model's scored vocabulary. The original repository is not modified. Speed and exact runtime output
-equality must still be qualified on a DGX Spark; the CPU checks below do not exercise CUDA or load model weights.
+`DRAFT_LANGUAGE=nl` and combinations such as `nl,de` extend the MTP draft vocabulary while preserving every
+default token ID. The main model's scored vocabulary is unchanged. Preliminary GB10 runtime results and exact
+output comparisons are in [nl-validation.md](nl-validation.md); broader qualification remains necessary.
 
 ## Enable on a DGX Spark
 
 ```bash
-git clone --branch feat/dutch-draft-language https://github.com/Timminater/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold.git
-cd Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold
+# Run from a checkout containing the Dutch patches.
 DRAFT_LANGUAGE=nl PULL=0 scripts/prepare.sh
-DRAFT_LANGUAGE=nl ./start.sh restart
+DRAFT_LANGUAGE=nl PULL=0 ./start.sh restart
 ```
 
 To persist it, set `DRAFT_LANGUAGE=nl` in `.env`. Process environment settings win over `.env`.
@@ -19,13 +18,14 @@ locally. Startup should report `drafts over 84,767 token ids (nl)`; verify this 
 produce a larger sorted union, with duplicate IDs removed. Restore the baseline with
 `DRAFT_LANGUAGE= ./start.sh restart` (the explicitly empty environment value overrides `.env`).
 
-No image was published and no live server was restarted as part of this implementation.
+Build locally with `PULL=0` until a published language image contains this patch stack. If `.env` sets `IMAGE`,
+select an explicit language image tag as well; an inherited image override can otherwise select the baseline.
 
 ## Generated artifact and limits
 
 TensorFold is pinned to v0.6.1, commit `17c73e189f5e6a5304cda7ea37f086f9c49b4788`.
-The recipe base was `4c0dea8`. Its default draft vocab contains **79,591 IDs**, rather than the 47k mentioned in
-the earlier discussion of the vLLM recipe. The full tokenizer has 248,077 named IDs (the model's padded output
+The recipe base was `4c0dea8`. Its default draft vocab contains **79,591 IDs**, rather than the 47k used by
+earlier versions of the vLLM recipe. The full tokenizer has 248,077 named IDs (the model's padded output
 dimension is separate). We preserve every default ID and pin added/byte tokens before ranking missing IDs.
 
 The seed uses the first 20,000 unique nonempty articles from one pinned Dutch Wikipedia shard. A deterministic
@@ -41,7 +41,7 @@ sample of all Dutch Wikipedia or the model's response distribution. Token covera
 
 There are **5,176 extension IDs**, making the union **84,767 IDs** (6.50% more rows than default).
 The generation budget is a maximum union of 100,000, stopping at 99.5% training coverage; holdout does not
-influence selection. The wider head can slow English/code. No Dutch speedup has been measured here.
+influence selection. The wider head can slow English/code. See the preliminary runtime measurements in [nl-validation.md](nl-validation.md).
 
 - `data/nl/draft_vocab_nl.txt`: sorted extension only, no default IDs repeated.
 - `data/nl/report.json`: exact revisions, input/output SHA-256 hashes, counts and coverage.
@@ -71,7 +71,7 @@ python tools/build_nl_draft_vocab.py \
 ```
 
 The downloader pins both Hugging Face commits and retains article URLs locally. It downloads one ~506 MB
-Parquet shard and tokenizer.json; texts and tokenizer are not committed to the fork. Wikipedia source texts are
+Parquet shard and tokenizer.json; texts and tokenizer are not committed to this repository. Wikipedia source texts are
 CC BY-SA 4.0 / GFDL; retain attribution if redistributing text. The generated token-ID frequency selection contains
 no article prose. The generator uses tokenizer.json directly without executing remote model code.
 
@@ -97,7 +97,7 @@ multilingual unions, unknown/missing vocab failures, config/.env precedence, ima
 and benchmark rejection of failures, cache hits, mismatched prompts or missing output-equality evidence.
 
 The inherited `test_copy_draft_rows.py` and `test_astra_patches.py` target older v0.5.0 internals. They fail
-against the original v0.6.1 recipe as well as this fork (`_mtp` mock missing, changed admission control,
+against the original v0.6.1 recipe as well as the Dutch patch stack (`_mtp` mock missing, changed admission control,
 removed `NATIVE_WORKERS`). They are not included in the Dutch CI job; updating those unrelated harnesses
 is outside this change. Passing the Dutch tests does not qualify those older engine behaviors.
 
@@ -107,6 +107,13 @@ Run A = default image/default draft vocab, B = the locally built language image 
 driver, CUDA base, TensorFold commit, KV precision, context, concurrency limit, SSD setting, vision setting,
 prefill rows, MTP depth/confidence, copy drafting and all sampling parameters. Build both images before timing.
 The image difference is the language patch stack; record both image hashes. Do not time preparation or startup.
+
+For an existing production deployment, record and retain its original container, image, command, environment,
+labels and serving supervisor before testing. Use `docker stop` to retain the original container, isolated test
+container names/ports/image tags and a separate kernel cache. Run only one model server at a time. Restore with
+`docker start` and the original supervisor if the container itself only runs `sleep infinity`; verify image and
+command identity, `/health`, `/v1/models` and a completion. This recipe's `stop.sh` removes its container, so do not
+use it to preserve an existing production container. The restart example below is for a dedicated test deployment.
 
 Use an otherwise idle Spark. Capture the recipe commit, tokenizer/model snapshot hashes, `.env` values (redact
 credentials), `nvidia-smi`, CPU/GPU clock/power/temperature, SSD state, container image IDs, health and startup logs.
@@ -156,4 +163,6 @@ missing IDs/digests are insufficient evidence. Equal visible prose alone does no
 A result is usable only when all requests succeeded, pairing/configuration/output checks pass, and Dutch gains
 repeat across restarts without unacceptable English/code or latency regressions. Report early EOS/length truncation
 counts and all failures. Do not claim improved quality, universal output equality or Dutch speed from Wikipedia
-coverage. No GPU benchmark results are included with this fork.
+coverage. The included GB10 results cover one short block and one long-output block at C=1. They do not satisfy the
+full alternating-block procedure above. For the long-output suite, pass `--manifest tools/nl_benchmark_long.json`
+to all four benchmark invocations and retain the same block identifier within a pair.

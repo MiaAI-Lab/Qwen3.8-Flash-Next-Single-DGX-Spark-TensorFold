@@ -159,10 +159,13 @@ one boot per arm, 2026-09-29):
 | Japanese, thinking off / on | 39.5 / 46.0 tok/s | 46.9 / 49.2 tok/s | **+19% / +7%** |
 
 The larger list makes every draft step a little slower, which is why it does not pay off for English or code.
-**Dutch (experimental in this fork):** `DRAFT_LANGUAGE=nl` adds 5,176 Dutch seed token IDs to the 79,591-token
+
+**Dutch (experimental):** `DRAFT_LANGUAGE=nl` adds 5,176 Dutch seed token IDs to the 79,591-token
 TensorFold v0.6.1 default. Held-out Dutch Wikipedia token coverage is 99.476% versus 86.897% with the default;
-this is corpus coverage, not measured decoding speed or MTP acceptance. `nl,de` also works. Generation,
-provenance, tests and a paired DGX Spark benchmark are in [docs/nl.md](docs/nl.md).
+this is corpus coverage. One preliminary GB10 block with eight complete Dutch answers measured +7.56%
+median paired decode speed with matching token IDs and output hashes against A/B and serial controls. This is
+not a general speed guarantee; see [runtime evidence and limits](docs/nl-validation.md). `nl,de` also works.
+Generation, provenance, tests and the A/B procedure are in [docs/nl.md](docs/nl.md).
 
 `DRAFT_LANGUAGE` also accepts `ru`, `de`, `fr` and `pt`, but those have not been measured to help, so they are not
 recommended. The language token lists come from the vLLM recipe's language draft vocabularies; see
@@ -282,7 +285,7 @@ wins over it), or with `tensorfold serve` flags (`./start.sh --context 131072`).
 | `PLE_ON_SSD` | `1` | read the 29.8 GiB n-gram tables from SSD instead of RAM, leaving that memory to the KV cache |
 | `VISION` | `1` | image and video input (`--vision`); `0` serves text only |
 | `VISION_URLS` | `0` | `1` also accepts public `https://` image and video URLs (default: data URLs only) |
-| `DRAFT_LANGUAGE` | empty | `zh` or `ja`; `nl` experimental in this fork, combinations such as `nl,de` supported ([Other languages](#other-languages)) |
+| `DRAFT_LANGUAGE` | empty | `zh` or `ja`; `nl` experimental, combinations such as `nl,de` supported ([Other languages](#other-languages)) |
 | `MTP_DRAFTS` / `MTP_CONFIDENCE` | `6` / `0.60` | at most 6 MTP drafts a round; a chain stops before a draft under 60% |
 | `TEMPERATURE` / `TOP_P` / `TOP_K` | `1.0` / `0.95` / `20` | default sampling (Qwen's thinking-mode values); a request's own values win |
 | `THINKING` | `1` | open a think block by default; `0` answers directly unless a request asks to think |

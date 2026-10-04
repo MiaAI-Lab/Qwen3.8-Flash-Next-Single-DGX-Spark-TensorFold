@@ -1,0 +1,65 @@
+{
+  "valid": true,
+  "pairs": 12,
+  "issues": [],
+  "groups": [
+    {
+      "group": "code",
+      "clients": 1,
+      "pairs": 2,
+      "A_median_decode_tps": 70.826381880191,
+      "B_median_decode_tps": 71.39170030419359,
+      "median_paired_speed_ratio": 1.0078491354964059,
+      "A_median_ttft": 0.19893447300273692,
+      "A_median_elapsed": 7.442701965504966,
+      "A_median_batch_wall_s": 7.443408021499636,
+      "A_acceptance": 0.6961538461538461,
+      "A_missing_draft_stats": 0,
+      "B_median_ttft": 0.1969328250052058,
+      "B_median_elapsed": 7.385047459501948,
+      "B_median_batch_wall_s": 7.385550923499977,
+      "B_acceptance": 0.6961538461538461,
+      "B_missing_draft_stats": 0
+    },
+    {
+      "group": "en",
+      "clients": 1,
+      "pairs": 2,
+      "A_median_decode_tps": 57.37248230197963,
+      "B_median_decode_tps": 57.92372450931397,
+      "median_paired_speed_ratio": 1.0096783993242167,
+      "A_median_ttft": 0.20720265449926956,
+      "A_median_elapsed": 9.153376731497701,
+      "A_median_batch_wall_s": 9.15399686749879,
+      "A_acceptance": 0.5758683729433273,
+      "A_missing_draft_stats": 0,
+      "B_median_ttft": 0.20756548499775818,
+      "B_median_elapsed": 9.067845765996026,
+      "B_median_batch_wall_s": 9.06844151000405,
+      "B_acceptance": 0.5758683729433273,
+      "B_missing_draft_stats": 0
+    },
+    {
+      "group": "nl",
+      "clients": 1,
+      "pairs": 8,
+      "A_median_decode_tps": 52.006129637170204,
+      "B_median_decode_tps": 56.87928901421831,
+      "median_paired_speed_ratio": 1.082923100025278,
+      "A_median_ttft": 0.22495106550923083,
+      "A_median_elapsed": 10.07177029250306,
+      "A_median_batch_wall_s": 10.072354852498393,
+      "A_acceptance": 0.4935672514619883,
+      "A_missing_draft_stats": 0,
+      "B_median_ttft": 0.2252919344973634,
+      "B_median_elapsed": 9.224910451499454,
+      "B_median_batch_wall_s": 9.225286427499668,
+      "B_acceptance": 0.5472940029254022,
+      "B_missing_draft_stats": 0
+    }
+  ],
+  "serial_checked": {
+    "A": true,
+    "B": true
+  }
+}
