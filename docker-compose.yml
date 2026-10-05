@@ -1,0 +1,55 @@
+services:
+  qwen-tensorfold:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: qwen38-flash-next-tensorfold:latest
+    container_name: qwen38-flash-next-tensorfold
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8888}:8888"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8888
+      - MODEL_ID=${MODEL_ID:-Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP}
+      - SERVED_NAME=${SERVED_NAME:-Qwen3.8-Flash-Next}
+      - PARALLEL=${PARALLEL:-2}
+      - CONTEXT=${CONTEXT:-262144}
+      - KV_DTYPE=${KV_DTYPE:-int8}
+      - PLE_ON_SSD=${PLE_ON_SSD:-1}
+      - VISION=${VISION:-1}
+      - VISION_URLS=${VISION_URLS:-1}
+      - VISION_MAX_IMAGES=${VISION_MAX_IMAGES:-50}
+      - MTP_DRAFTS=${MTP_DRAFTS:-6}
+      - MTP_CONFIDENCE=${MTP_CONFIDENCE:-0.60}
+      - TEMPERATURE=${TEMPERATURE:-1.0}
+      - TOP_P=${TOP_P:-0.95}
+      - TOP_K=${TOP_K:-20}
+      - THINKING=${THINKING:-1}
+      - MAX_TOKENS=${MAX_TOKENS:-32768}
+      - TENSORFOLD_PREFILL_ROWS=${TENSORFOLD_PREFILL_ROWS:-2048}
+      - TENSORFOLD_MEMORY_RESERVE_GIB=${TENSORFOLD_MEMORY_RESERVE_GIB:-2}
+      - TENSORFOLD_MTP_COPY=${TENSORFOLD_MTP_COPY:-1}
+      - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
+    volumes:
+      - ${HF_CACHE:-/home/admin/.cache/huggingface}:/root/.cache/huggingface
+      - ${KERNEL_CACHE:-/home/admin/.cache/tensorfold-qwen38}:/cache
+    tty: true
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - llm-network
+
+networks:
+  llm-network:
+    name: ${EXTERNAL_NETWORK:-llm-network}
+    external: true
