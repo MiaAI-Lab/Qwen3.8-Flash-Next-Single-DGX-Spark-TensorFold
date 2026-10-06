@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""CPU checks for astra items 3–4: first-token-before-draft, MTP absorb without a vocab projection,
-batched PLE gathers, and native worker counts.
+"""CPU checks for astra items 3-4: first-token-before-draft, MTP absorb without a vocab projection,
+and batched PLE gathers.
 
 Usage: TF_SRC=/path/to/patched/src python3 tools/test_astra_patches.py
 """
@@ -50,8 +50,9 @@ def _calls(fn: ast.FunctionDef) -> list[str]:
 
 
 def test_admit_emits_before_draft(src: Path) -> None:
-    tree = _parse(src, "tensorfold/families/qwen4_exp/cuda/multi.py")
-    names = _calls(_fn(tree, "admit", "MultiDecoder"))
+    # v0.6.6: the joined-prompt path lives in multi_fill.py's _joined (it moved out of multi.py's admit).
+    tree = _parse(src, "tensorfold/families/qwen4_exp/cuda/multi_fill.py")
+    names = _calls(_fn(tree, "_joined", "PromptPasses"))
     assert "take" in names and "draft" in names, names
     assert names.index("take") < names.index("draft"), names
 
@@ -72,7 +73,7 @@ def test_mtp_absorb_skips_head(src: Path) -> None:
 
 
 def test_ple_concat_matches_separate() -> None:
-    """Concatenating per-stream n-gram id matrices along rows is the compact gather 0013 uses."""
+    """Concatenating per-stream n-gram id matrices along rows is the compact gather the patch's PLE path uses."""
 
     a = np.arange(6, dtype=np.int64).reshape(3, 2)
     b = np.arange(10, 14, dtype=np.int64).reshape(2, 2)
@@ -84,24 +85,6 @@ def test_ple_concat_matches_separate() -> None:
     assert at0 + cat.size == (3 + 2) * heads
 
 
-def test_native_threads(src: Path) -> None:
-    sys.path.insert(0, str(src))
-    from tensorfold.families.qwen4_exp.ssd_table import NATIVE_WORKERS, native_threads
-
-    os.environ.pop("TENSORFOLD_SSD_THREADS", None)
-    assert native_threads(1) == 1
-    assert native_threads(4) == 1
-    assert native_threads(5) == 4
-    assert native_threads(16) == 4
-    assert native_threads(17) == 8
-    assert native_threads(256) == 16
-    assert native_threads(1024) == 32
-    assert native_threads(1025) == NATIVE_WORKERS
-    os.environ["TENSORFOLD_SSD_THREADS"] = "7"
-    assert native_threads(9999) == 7
-    os.environ["TENSORFOLD_SSD_THREADS"] = "0"
-    assert native_threads(1) == 1
-    os.environ.pop("TENSORFOLD_SSD_THREADS", None)
 
 
 def main() -> int:
@@ -111,7 +94,6 @@ def main() -> int:
         ("admit take-before-draft", lambda: test_admit_emits_before_draft(src)),
         ("mtp absorb skips vocab head", lambda: test_mtp_absorb_skips_head(src)),
         ("ple concat layout", test_ple_concat_matches_separate),
-        ("native_threads", lambda: test_native_threads(src)),
     ):
         try:
             fn()

@@ -5,7 +5,55 @@ runs is named in its entry. Versions before 0.6.0 were numbered afterwards, from
 release ends at is given, and the prebuilt images are
 `ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold:<tag>`.
 
-## [Unreleased]
+## [0.7.0] - 2026-10-06
+
+TensorFold **v0.6.6** (`cb2ebf0`). Checkpoint `local-inference-lab/Qwen3.8-Flash-Next-NVFP4` (`7c4f1bc1`).
+Images `v0.6.6-35a2e85de8ad` (`:latest`) and `v0.6.6-7c0f3be0bb7e` (`:languages`); the prebuilt tags are not pushed
+to GHCR yet, so `scripts/prepare.sh` builds the image locally on the first run.
+
+### Changed
+
+- The checkpoint is now **NVIDIA ModelOpt NVFP4**
+  ([`local-inference-lab/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/local-inference-lab/Qwen3.8-Flash-Next-NVFP4)):
+  FP4 routed experts and n-gram rows, MXFP8 elsewhere, the MTP head kept. About 106 GB on disk; the ~78 GiB of GPU
+  weights replace the MLX checkpoint's 75.2 GiB resident + 29.8 GiB SSD tables, whose memory goes to the KV pool
+  instead. NVIDIA's own [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
+  shows the format holds quality against FP8 (GPQA 91.5 against 92.0 and friends). The MLX 4-bit checkpoint stays
+  available as `MODEL_ID=TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP` — still the only format two ranks and
+  `--ple-on-ssd` read, and the reason `PLE_ON_SSD` now defaults to 0.
+
+  Why NVFP4 rather than staying on MLX: the "MLX 4-bit decodes slower" reports traced back to
+  [#317](https://github.com/ashhart/TensorFold/issues/317), whose author retracted the regression (it was a cold
+  n-gram page cache plus the lone-stream graph slot being recaptured on short replies, found by @Arminova and fixed
+  by @grearjake-star in [#337](https://github.com/ashhart/TensorFold/pull/337)). Upstream's answer at the end of that
+  thread is decisive: the Python engine is frozen (#286), so #337 ships only in the Zig engine, where Flash Next on
+  CUDA is the next family after Nemotron. NVFP4 is where upstream's work is, and
+  [#447](https://github.com/ashhart/TensorFold/issues/447) measures this exact checkpoint.
+- TensorFold v0.6.1 to v0.6.6. Upstream absorbed the `TENSORFOLD_PREFILL_ROWS` override (#238) and the Flash Next
+  video input (#240), so `patches/0002-flash-next-v066.patch` carries only copy drafts, the SSD read-ahead, the
+  first-token-before-draft order, the absorb-logits skip and the 96 MiB request bodies. New upstream knobs the
+  recipe passes through: `--vision-image-tokens` (was the `TENSORFOLD_IMAGE_TOKENS` env), `--prefill-fp8` (FP8
+  prompt kernels for this checkpoint's MXFP8 linears), `--api-key`, `tensorfold plan`, and `--name-priority`.
+  NVFP4 checkpoints run on one GPU: `--tp 2` and `--ple-on-ssd` refuse them at startup.
+- The language image's patch (`patches/languages/0010`) is rebased onto v0.6.6; the token lists are byte-identical.
+  `DRAFT_LANGUAGE` serves it as before.
+
+### Fixed
+
+- The `TENSORFOLD_IMAGE_TOKENS` budget is passed as `--vision-image-tokens` (the old env name stopped being read
+  upstream); the video token budget env is unchanged.
+
+Measured 2026-10-06 on the new defaults, one DGX Spark, through the OpenAI API: single-stream decode 54.3 tok/s code
+(greedy), 49.3 tok/s chat sampled; concurrent aggregate 31.6 / 51.1 / 73.6 tok/s at 1 / 2 / 4 streams with thinking
+on (acceptance 0.62-0.67); prefill 1,215-1,835 tok/s from 0.85k to 50k tokens, i.e. the same ~1.8k plateau the MLX
+recipe had at the mid sizes but a lower 0.85k number, and still the ~1.4-1.5x behind vLLM that
+[#447](https://github.com/ashhart/TensorFold/issues/447) reports.
+Startup estimate 83.07 GiB within a 111.71 GiB budget, leaving 34.8 GiB for stream caches against 5 x 4.47 GiB — the
+full 5 x 262,144 pool fits with room to spare (the MLX checkpoint needed 102.5 GiB and its 29.8 GiB of n-gram tables
+on SSD). First load 254 s, of which ~171 s is the one-time GB10 kernel compile; later starts reuse it.
+
+Verified on the same boot: drafted replies equal `"draft": false` (identical `token_sha`), 5 concurrent streams each
+completed, a 26.7k-token needle was retrieved, `tools/visioncheck.py` and `tools/toolcheck.py` both pass.
 
 ## [0.6.0] - 2026-10-02
 
@@ -136,7 +184,8 @@ Commit `7893602`. TensorFold **v0.3.6.2**. Image `v0.3.6.2-b3fd6cff9b72`.
 - `tools/bench.py`, `tools/needle.py`, `tools/toolcheck.py`.
 - `.github`: Sponsors, issue and PR templates.
 
-[Unreleased]: https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/compare/v0.4.0...v0.4.1

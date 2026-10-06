@@ -1,7 +1,7 @@
-Optional MTP draft-vocabulary additions for selected languages.
+Draft vocabularies for the MTP head on TensorFold v0.6.6 (cb2ebf0): language extensions beside the default list, selected with TENSORFOLD_DRAFT_VOCAB ("zh", "zh,ja", "full", or a file of ids). Same lists as the v0.6.1 patch, rebased onto v0.6.6's engine (the hunks moved, the bytes did not).
 --- tensorfold/families/qwen4_exp/__init__.py
 +++ tensorfold/families/qwen4_exp/__init__.py
-@@ -187,10 +187,12 @@
+@@ -194,10 +194,12 @@
                           "has one): without it every round would decode one token. Serve a checkpoint with the "
                           "head, or pass --no-drafts for the serial reference")
      confidence = CONFIDENCE if mtp_confidence is None else float(mtp_confidence)
@@ -103227,15 +103227,15 @@ Optional MTP draft-vocabulary additions for selected languages.
 +248002
 --- tensorfold/families/qwen4_exp/cuda/engine.py
 +++ tensorfold/families/qwen4_exp/cuda/engine.py
-@@ -78,6 +78,7 @@
+@@ -101,6 +101,7 @@
          self.comm = None
          self.vision = None                   # the image tower (``QwenCudaVision``) with --vision
          ids = draft_token_ids(draft_vocab) if self.depth > 0 else None
 +        self.draft_vocab = f"{len(ids):,} token ids ({draft_vocab})" if ids is not None else "the full vocabulary"
          if tp == 2:
-             from tensorfold.cuda.comm import NCCL
+             from tensorfold.cuda.comm import open_comm
  
-@@ -196,7 +197,8 @@
+@@ -245,7 +246,8 @@
          self.cache: list[tuple[list[int], dict]] = []    # (committed ids, what resuming from them needs)
          self.serial = None                                # the serial requests' engine, made on first use
          rule = (f"1 to {self.depth} MTP drafts a round, a chain stops before a later draft under "
