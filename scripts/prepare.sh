@@ -91,7 +91,9 @@ ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
 FROM ${BASE_IMAGE}
 ARG TF_SPEC
 # transformers (the vision tower's modules) and PyAV (video decoding) for --vision
-RUN pip install --no-cache-dir --upgrade "${TF_SPEC}" && pip install --no-cache-dir "transformers==5.17.0" av && \
+RUN pip install --no-cache-dir --upgrade "${TF_SPEC}" && \
+    pip install --no-cache-dir "tensorfold[grammar]" && \
+    pip install --no-cache-dir "transformers==5.17.0" av && \
     tensorfold --version
 COPY . /opt/tf-patches
 RUN cd "$(python -c 'import os, tensorfold; print(os.path.dirname(os.path.dirname(tensorfold.__file__)))')" && \
