@@ -43,14 +43,21 @@ to GHCR yet, so `scripts/prepare.sh` builds the image locally on the first run.
 - The `TENSORFOLD_IMAGE_TOKENS` budget is passed as `--vision-image-tokens` (the old env name stopped being read
   upstream); the video token budget env is unchanged.
 
-Measured 2026-10-06 on the new defaults, one DGX Spark, through the OpenAI API: single-stream decode 54.3 tok/s code
-(greedy), 49.3 tok/s chat sampled; concurrent aggregate 31.6 / 51.1 / 73.6 tok/s at 1 / 2 / 4 streams with thinking
-on (acceptance 0.62-0.67); prefill 1,215-1,835 tok/s from 0.85k to 50k tokens, i.e. the same ~1.8k plateau the MLX
-recipe had at the mid sizes but a lower 0.85k number, and still the ~1.4-1.5x behind vLLM that
-[#447](https://github.com/ashhart/TensorFold/issues/447) reports.
-Startup estimate 83.07 GiB within a 111.71 GiB budget, leaving 34.8 GiB for stream caches against 5 x 4.47 GiB — the
-full 5 x 262,144 pool fits with room to spare (the MLX checkpoint needed 102.5 GiB and its 29.8 GiB of n-gram tables
-on SSD). First load 254 s, of which ~171 s is the one-time GB10 kernel compile; later starts reuse it.
+Measured 2026-10-06 on the new defaults, one DGX Spark, through the OpenAI API, in the README's usual table shape
+(fresh prompt each sample, temperature 0, thinking off, 256 generated tokens):
+
+- **Decode, prose**: 42.3 tok/s at one stream, 77.8 aggregate at two, 143.1 at four.
+- **Decode, code**: 61.1 tok/s at one stream, 110.0 aggregate at two, 195.6 at four.
+- **Prefill**: 1,878 tok/s at 6.3k tokens, 1,952 at 12.6k, 1,866 at 25.2k, 1,880 at 50.3k, 1,680 at 100.6k.
+
+Single-stream decode is below the MLX recipe's tables (63.6 prose / 96.9 code) and the concurrent aggregate is above
+(143.1 / 195.6 against 114.5 / 166.4), but the MLX tables do not record their generation length or thinking mode and
+both move the number several points, so the two sets are the same shape rather than a controlled A/B. Prefill is
+1,680-1,952 tok/s against the MLX recipe's 2,180-2,468, the ~1.4-1.5x gap to vLLM that
+[#447](https://github.com/ashhart/TensorFold/issues/447) reports on this checkpoint. Startup admits 83.07 GiB of a
+111.71 GiB budget, leaving 34-35 GiB for stream caches against 5 x 4.47 GiB at the full window; the MLX checkpoint
+needed 102.5 GiB and its 29.8 GiB of n-gram tables on SSD. First load 254 s, of which ~171 s is the one-time GB10
+kernel compile; later starts reuse it.
 
 Verified on the same boot: drafted replies equal `"draft": false` (identical `token_sha`), 5 concurrent streams each
 completed, a 26.7k-token needle was retrieved, `tools/visioncheck.py` and `tools/toolcheck.py` both pass.

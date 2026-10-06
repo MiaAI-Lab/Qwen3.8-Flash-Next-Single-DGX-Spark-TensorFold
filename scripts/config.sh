@@ -34,10 +34,13 @@ GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-
 SERVED_NAME="${SERVED_NAME:-Qwen3.8-Flash-Next}"   # the model id clients see in /v1/models and replies (tensorfold --name)
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
-# Serving defaults (./start.sh arguments come after them and win). All streams share one memory pool (~103-104 GiB
-# budget on a 128 GB Spark, 75 GiB of it weights), so window x streams x KV bytes must fit: 4 streams x 262,144 tokens
-# at int8 KV is ~97.8 GiB, 5 streams ~102.6 GiB (~4.5 GiB a stream). Other fits: 3 streams bf16 at 262k, 6 streams
-# int4 at 262k, 8 streams int4 at ~250k (tight), 6 streams int8 at ~220k. int4 and bf16 KV change the output slightly.
+# Serving defaults (./start.sh arguments come after them and win). All streams share one memory pool (~110 GiB
+# budget on a 128 GB Spark, ~78 GiB of it GPU-resident weights; the ~29 GiB of n-gram tables stay memory-mapped on
+# the host), so window x streams x KV bytes must fit: with the NVFP4 checkpoint the default admits 83.07 GiB
+# (measured) and leaves 34-35 GiB for stream caches against 4.47 GiB each at the full 262,144-token window, so all
+# five fit with room. Other fits: 3 streams bf16 at 262k, 6 streams int4 at 262k, 8 streams int4 at ~250k (tight),
+# 6 streams int8 at ~220k. int4 and bf16 KV change the output slightly. The MLX checkpoint (MODEL_ID override)
+# admits 102.5 GiB instead: its 29.8 GiB of tables are resident unless PLE_ON_SSD=1.
 PARALLEL="${PARALLEL:-5}"          # requests decoded together (streams)
 CONTEXT="${CONTEXT:-262144}"       # prompt + reply window per stream (the model's native maximum)
 KV_DTYPE="${KV_DTYPE:-int8}"       # bf16 | int8 | int4
@@ -81,7 +84,8 @@ export TENSORFOLD_IMAGE_TOKENS="${TENSORFOLD_IMAGE_TOKENS:-16384}"
 # The whole video's token budget (Qwen3-VL's per-frame sizing; 2 frames a second, at most 256 frames).
 export TENSORFOLD_VIDEO_TOKENS="${TENSORFOLD_VIDEO_TOKENS:-16384}"
 # Startup reserve (since v0.6.0): GiB left out of MemAvailable. Unset, TensorFold takes max(4 GiB, a tenth of RAM)
-# and refuses 5 x 262,144. The knob's floor is 2 GiB; that still fits the measured ~102.5 GiB admission.
+# and refuses 5 x 262,144. The knob's floor is 2 GiB; the NVFP4 checkpoint's default admits 83.07 GiB, so the floor
+# still fits it comfortably (the MLX checkpoint's 102.5 GiB admission was the tight one).
 export TENSORFOLD_MEMORY_RESERVE_GIB="${TENSORFOLD_MEMORY_RESERVE_GIB:-2}"
 # Prompt-lookup drafts ahead of MTP (patch 0002; with PARALLEL >= 2): +6% on replies that repeat the prompt, prose and
 # code unchanged. 0: off.

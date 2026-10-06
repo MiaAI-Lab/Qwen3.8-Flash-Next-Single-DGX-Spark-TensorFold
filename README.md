@@ -26,55 +26,74 @@ engine is [Ash Hart's TensorFold](https://github.com/ashhart/TensorFold). Full c
 
 ## Performance
 
-**Measured 2026-10-06 on this recipe's defaults** (TensorFold v0.6.6, `local-inference-lab/Qwen3.8-Flash-Next-NVFP4`,
-5 streams x 262,144 tokens, int8 KV, image input on, MTP 6/0.60, copy drafts on), one DGX Spark, through the OpenAI
-API with `tools/bench.py` (greedy `temperature 0` for the code case, the recipe's sampling otherwise):
+One DGX Spark, the recipe's defaults on TensorFold v0.6.6 (`local-inference-lab/Qwen3.8-Flash-Next-NVFP4`, 5 streams
+x 262,144 tokens, int8 KV cache, image input on, MTP 6/0.60, copy drafts on), measured through the OpenAI API on
+2026-10-06: `temperature 0`, thinking off, a fresh prompt each sample so nothing is reused from the prefix cache.
+The prompt sets and table shape are the ones this README has always used, so the numbers are comparable with the
+MLX-era ones below.
 
-**Decode, single stream** — `tools/bench.py after-nvfp4`, median of 5:
+**Decode, prose**
 
-| Test | Rate |
-| --- | ---: |
-| Code, greedy | **54.3 tok/s** |
-| Chat, sampled | **49.3 tok/s** |
+| Concurrent requests | Aggregate | Per request | Time to first token |
+| ---: | ---: | ---: | ---: |
+| 1 | 42.3 tok/s | 42.3 tok/s | 26 ms |
+| 2 | 77.8 tok/s | 39.4 tok/s | 26 ms |
+| 4 | 143.1 tok/s | 36.4 tok/s | 14 ms |
 
-**Decode, concurrent** — `tools/bench.py --suite --seed 1 --clients 1,2,4`, thinking on, 5 generated shas all distinct
-per client count:
+**Decode, code**
 
-| Concurrent requests | Aggregate | Per request | Time to first token (p50/p95) | Acceptance | Yield |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 31.6 tok/s | 30.1 tok/s | 206 / 334 ms | 0.666 | 2.28 |
-| 2 | 51.1 tok/s | 28.1 tok/s | 78 / 83 ms | 0.617 | 1.91 |
-| 4 | 73.6 tok/s | 23.5 tok/s | 100 / 113 ms | 0.619 | 2.05 |
+| Concurrent requests | Aggregate | Per request | Time to first token |
+| ---: | ---: | ---: | ---: |
+| 1 | 61.1 tok/s | 61.1 tok/s | 25 ms |
+| 2 | 110.0 tok/s | 57.0 tok/s | 71 ms |
+| 4 | 195.6 tok/s | 51.1 tok/s | 45 ms |
 
-**Prefill** — `tools/bench.py after-nvfp4`, fresh random prompts:
+**Prefill**
 
 | Prompt | Tokens | Prefill speed | Time to first token |
 | ---: | ---: | ---: | ---: |
-| 0.85k | 852 | 1,215 tok/s | 0.74 s |
-| 3.2k | 3,208 | 1,769 tok/s | 1.85 s |
-| 12.6k | 12,645 | 1,835 tok/s | 6.95 s |
-| 50k | 50,352 | 1,788 tok/s | 28.29 s |
+| 8k | 6,307 | 1,878 tok/s | 3.36 s |
+| 16k | 12,600 | 1,952 tok/s | 6.46 s |
+| 32k | 25,163 | 1,866 tok/s | 13.51 s |
+| 64k | 50,308 | 1,880 tok/s | 26.76 s |
+| 128k | 100,557 | 1,680 tok/s | 59.85 s |
+
+Single-request decode is 61.1 tok/s on code and 42.3 on prose; the concurrent aggregate scales to 195.6 tok/s at four
+streams while each keeps 51.1 tok/s. Prefill holds a ~1.85k tok/s plateau from 8k to 64k and eases to 1.68k at 128k.
+
+Two things move these decode numbers, so compare like with like: **thinking on or off is within noise** (prose 42.1
+against 44.0, code 61.3 against 49.5, thinking off against on), and **generation length is not** (the same code prompt
+measures 61.2 tok/s at 256 generated tokens and 72.0 at 1,024, because a short reply pays the per-request ramp). The
+tables above are 256 tokens with thinking off.
 
 Startup: 83.07 GiB estimate within a 111.71 GiB budget, 254 s to loaded (171 s of it the one-time GB10 kernel
-compile), **34.8 GiB free for stream caches** against 4.47 GiB for one full 262,144-token window — the whole pool
+compile), **34-35 GiB free for stream caches** against 4.47 GiB for one full 262,144-token window, so the whole pool
 fits. The n-gram tables read in 4.3 s and needed no SSD path.
 
-**How this compares.** Decode is in the same band as the MLX 4-bit recipe this replaced (its single-stream code
-number was 96.9 tok/s with a different prompt set and no thinking; upstream's own head-to-head on this checkpoint
-measured them on par, [TF #447](https://github.com/ashhart/TensorFold/issues/447)). Prefill is the honest weak spot:
-~1.8k tok/s against the MLX recipe's ~2.4k, the same 1.4-1.5x gap to vLLM that #447 reports — prefill is where
-TensorFold's CUDA path is behind, and it is the reason to keep the MLX checkpoint (`MODEL_ID=…`) if prompts, not
-decoding, dominate your workload. The Zig CUDA server upstream is building is where that is meant to close.
+Against the MLX 4-bit tables this replaces (63.6 prose / 96.9 code single-request, 114.5 / 166.4 at four streams,
+2,180-2,468 tok/s prefill): decode here is lower at one stream and **higher at four**, and prefill is lower
+throughout. Two caveats on reading that: the MLX tables do not record their generation length, thinking mode or
+prompt revision, and both change the number a lot (this checkpoint measures 61 tok/s at 256 generated tokens and 72
+at 1,024, thinking on or off, so a shorter or longer sample moves it several points). Treat the two sets as the same
+protocol and shape, not as a controlled A/B. The concurrent columns are the fair comparison, since both were taken
+with the same four-stream shape and the same prompt sets; there the NVFP4 checkpoint wins, because its ~29 GiB of
+freed n-gram-table RAM goes to stream caches.
 
-Verified on this same boot: drafted replies equal `"draft": false` (identical `token_sha`, 285-token reply), 5
-truly concurrent streams each completed independently, a passphrase at 26.7k tokens was retrieved, a drawn image was
-named correctly (`tools/visioncheck.py` OK), and tool-call arrays come back as JSON arrays (`tools/toolcheck.py` OK).
-`docs/v061.md` has the older MLX-era numbers for reference.
+Prefill is the consistent weak spot: 1,680-1,952 tok/s here against 2,180-2,468 for the MLX checkpoint, the same
+~1.4-1.5x gap to vLLM that [TF #447](https://github.com/ashhart/TensorFold/issues/447) reports on this checkpoint.
+That is where TensorFold's CUDA path is behind, and it is the reason to keep the MLX checkpoint (`MODEL_ID=…`) if
+prompts, not decoding, dominate a workload. Upstream's Zig CUDA server is where it is meant to close.
+
+Verified on the same boot: drafted replies equal `"draft": false` (identical `token_sha`), 5 truly concurrent streams
+each completed independently, a passphrase at 26.7k tokens was retrieved, a drawn image was named correctly
+(`tools/visioncheck.py` OK), and tool-call arrays come back as JSON arrays (`tools/toolcheck.py` OK). `docs/v061.md`
+has the v0.6.0-to-v0.6.1 comparison and the MLX-era tables for reference.
 
 ## Requirements
 
 - A DGX Spark (or another GB10 system with 128 GB unified memory) with nothing else large on the GPU: the default
-  setting needs ~103 GiB free when the server starts (see [KV pool and memory](#kv-pool-and-memory)).
+  setting admits 83.07 GiB when the server starts and grows to ~106 GiB with all five streams at their full window
+  (see [KV pool and memory](#kv-pool-and-memory)). Measured boots ran with 113-114 GiB of `MemAvailable`.
 - Docker with the NVIDIA container runtime, and your user in the `docker` group.
 - ~145 GB free disk on a fresh machine: ~110 GB for the checkpoint download under `~/.cache/huggingface`
   (~106 GB) and ~35 GB for the image under Docker's root (~24 GB); `scripts/prepare.sh` checks both.
@@ -256,17 +275,23 @@ least 4 GiB). On the Spark's unified memory, running out tends to freeze the mac
 than fail an allocation: raise the reserve (e.g. `TENSORFOLD_MEMORY_RESERVE_GIB=6`) if other workloads share the
 box. Streams grow their caches as their context grows, while memory lasts; a stream that cannot grow waits.
 
-Other settings that fit the same budget (TensorFold's own estimate, MLX-era table; the NVFP4 checkpoint leaves about
-29 GiB more room, so each of these fits with headroom):
+Other settings, each verified on the NVFP4 checkpoint (its own startup estimate, measured by constructing the engine
+with that setting; the stream caches are not pre-allocated, they grow as a stream's context grows, so the startup
+estimate barely moves between rows and the headroom is what decides whether the full pool fits):
 
-| Setting | KV pool | Estimate | Note |
-| --- | ---: | ---: | --- |
-| `PARALLEL=4` (int8) | 1,048,576 | 97.7 GiB | more headroom |
-| `PARALLEL=5` (int8, default) | 1,310,720 | 102.5 GiB | |
-| `PARALLEL=6 CONTEXT=220000` (int8) | 1,320,000 | ~103 GiB | shorter windows, one more stream |
-| `PARALLEL=6 KV_DTYPE=int4` | 1,572,864 | 97.6 GiB | int4 changes outputs slightly; quality not measured here |
-| `PARALLEL=8 KV_DTYPE=int4 CONTEXT=250000` | 2,000,000 | ~103 GiB | tight |
-| `PARALLEL=3 KV_DTYPE=bf16` | 786,432 | 102.0 GiB | full-precision KV |
+| Setting | KV pool | Startup estimate | Headroom | Note |
+| --- | ---: | ---: | ---: | --- |
+| `PARALLEL=4` (int8) | 1,048,576 | 81.88 GiB | 29.5 GiB | more headroom |
+| `PARALLEL=5` (int8, default) | 1,310,720 | 82.23 GiB | 29.2 GiB | the default |
+| `PARALLEL=6 CONTEXT=220000` (int8) | 1,320,000 | 81.86 GiB | 29.6 GiB | shorter windows, one more stream |
+| `PARALLEL=6 KV_DTYPE=int4` | 1,572,864 | 81.09 GiB | 30.4 GiB | int4 changes outputs slightly; quality not measured here |
+| `PARALLEL=8 KV_DTYPE=int4 CONTEXT=250000` | 2,000,000 | 81.53 GiB | 30.0 GiB | the largest pool of the set |
+| `PARALLEL=3 KV_DTYPE=bf16` | 786,432 | 84.57 GiB | 27.0 GiB | full-precision KV |
+
+Each row leaves 27-30 GiB for stream caches, well above the 4.47 GiB one full 262,144-token window takes at int8
+(int4 is smaller, bf16 larger), so every one of them admits the whole pool. The MLX checkpoint's equivalents were
+tighter (its own estimates ran 97.6-103 GiB against a 103 GiB budget), which is the practical gain from moving its
+29.8 GiB of n-gram tables off the resident budget.
 
 A setting that does not fit is refused at startup, before any weights load, with a message naming a window that
 fits.

@@ -122,14 +122,14 @@ fi
 if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then
   die "port $PORT is already in use: $(ss -ltnp "sport = :$PORT" 2>/dev/null | tail -n +2)"
 fi
-# TensorFold budgets MemAvailable minus TENSORFOLD_MEMORY_RESERVE_GIB (2 here). The default 5 x 262k int8 needs
-# ~85.4 GiB at startup and ~108 GiB with every stream at its full window; with less it refuses the window and names
-# one that fits.
+# TensorFold budgets MemAvailable minus TENSORFOLD_MEMORY_RESERVE_GIB (2 here). The default 5 x 262k int8 admits
+# 83.07 GiB (measured on the NVFP4 checkpoint) and grows every stream's cache as its context grows, to 5 x 4.47 GiB
+# (~22.4 GiB) at the full window; with less it refuses the window and names one that fits.
 avail_gb=$(free -g | awk '/^Mem:/ {print $7}')
-if (( avail_gb >= 103 )); then
+if (( avail_gb >= 100 )); then
   log "Arguments OK, port $PORT free, ${avail_gb} GiB memory available"
 else
-  warn "only ${avail_gb} GiB memory available (the default needs ~103): stop other GPU workloads (docker ps), or lower PARALLEL / CONTEXT"
+  warn "only ${avail_gb} GiB memory available (the default admits ~83 GiB and grows to ~106): stop other GPU workloads (docker ps), or lower PARALLEL / CONTEXT"
 fi
 
 # TensorFold's own switches from the environment (TENSORFOLD_*, e.g. TENSORFOLD_MTP_COPY) reach the server too.
