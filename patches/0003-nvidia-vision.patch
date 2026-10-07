@@ -1,0 +1,18 @@
+NVIDIA's Qwen3.8-Flash-Next-NVFP4 on TensorFold v0.6.6 (cb2ebf0): its vision_config.model_type is
+"qwen4_exp_vision", which TensorFold's CUDA vision check does not list. The tower is the same as
+local-inference-lab's "qwen4_exp" export field for field (same hidden size, depth, patch and merge
+sizes, head count, no deepstack), so the check needs only the third name.
+--- tensorfold/vision/qwen_cuda.py
++++ tensorfold/vision/qwen_cuda.py
+@@ -44,7 +44,10 @@
+ def vision_config(model_dir: str | Path) -> dict:
+     raw = json.loads((Path(model_dir) / "config.json").read_text())
+     config = raw.get("vision_config")
+-    if not isinstance(config, dict) or config.get("model_type") not in ("qwen3_5", "qwen4_exp"):
++    # NVIDIA's own export names its tower "qwen4_exp_vision"; its modules are the same as
++    # local-inference-lab's "qwen4_exp", field for field (same hidden size, depth, patch and
++    # merge sizes, head count), so the same tower code reads it.
++    if not isinstance(config, dict) or config.get("model_type") not in ("qwen3_5", "qwen4_exp", "qwen4_exp_vision"):
+         raise ValueError("CUDA vision requires a Qwen3.5-compatible vision checkpoint")
+     if config.get("deepstack_visual_indexes"):
+         raise ValueError("CUDA Qwen vision does not support deepstack image features")

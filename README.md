@@ -14,19 +14,23 @@ Serve **Qwen3.8 Flash Next** from a single NVIDIA DGX Spark (GB10, 128 GB) throu
 logits while prompts absorb, 96 MiB request bodies).
 
 **Authored by Mia ([Mia's AI Lab](https://x.com/MiaAI_lab), [MiaAI-Lab](https://github.com/MiaAI-Lab))**: this
-recipe, its scripts and patches, and the switch to the NVFP4 checkpoint. The checkpoint itself comes from
-[local-inference-lab](https://huggingface.co/local-inference-lab) (quantized with NVIDIA's Model Optimizer); the
-engine is [Ash Hart's TensorFold](https://github.com/ashhart/TensorFold). Full credits in
+recipe, its scripts and patches, and the switch to the NVFP4 checkpoint. The checkpoint is
+[NVIDIA's own NVFP4 export](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4), quantized with NVIDIA's
+[Model Optimizer](https://github.com/NVIDIA/Model-Optimizer); the engine is
+[Ash Hart's TensorFold](https://github.com/ashhart/TensorFold). Full credits in
 [`CREDITS.md`](CREDITS.md).
 
-- Checkpoint: [`local-inference-lab/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/local-inference-lab/Qwen3.8-Flash-Next-NVFP4)
-  (NVIDIA ModelOpt NVFP4: FP4 routed experts and n-gram rows, MXFP8 elsewhere, with the MTP draft head; ~106 GB.
-  The MLX 4-bit checkpoint `TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP` stays available as `MODEL_ID` fallback,
-  the only format two ranks and `--ple-on-ssd` read)
+- Checkpoint: [`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
+  (NVIDIA ModelOpt NVFP4: FP4 routed experts, an FP8 n-gram table and block-FP8 MTP experts, with the MTP draft
+  head; ~133 GB, revision `fc694b54`). It needs `patches/0003-nvidia-vision.patch` for its vision tower's
+  `model_type`, which upstream's check does not list yet. The MLX 4-bit checkpoint
+  `TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP` stays available as a `MODEL_ID` fallback, the only format two ranks
+  and `--ple-on-ssd` read; `local-inference-lab/Qwen3.8-Flash-Next-NVFP4` is the other NVFP4 export (smaller, its
+  n-gram table in the main shards).
 
 ## Performance
 
-One DGX Spark, the recipe's defaults on TensorFold v0.6.6 (`local-inference-lab/Qwen3.8-Flash-Next-NVFP4`, 5 streams
+One DGX Spark, the recipe's defaults on TensorFold v0.6.6 (`nvidia/Qwen3.8-Flash-Next-NVFP4`, 5 streams
 x 262,144 tokens, int8 KV cache, image input on, MTP 6/0.60, copy drafts on), measured through the OpenAI API on
 2026-10-06: `temperature 0`, thinking off, a fresh prompt each sample so nothing is reused from the prefix cache.
 The prompt sets and table shape are the ones this README has always used, so the numbers are comparable with the
@@ -36,51 +40,55 @@ MLX-era ones below.
 
 | Concurrent requests | Aggregate | Per request | Time to first token |
 | ---: | ---: | ---: | ---: |
-| 1 | 42.3 tok/s | 42.3 tok/s | 26 ms |
-| 2 | 77.8 tok/s | 39.4 tok/s | 26 ms |
-| 4 | 143.1 tok/s | 36.4 tok/s | 14 ms |
+| 1 | 35.2 tok/s | 35.2 tok/s | 29 ms |
+| 2 | 64.8 tok/s | 32.8 tok/s | 28 ms |
+| 4 | 121.2 tok/s | 30.7 tok/s | 16 ms |
 
 **Decode, code**
 
 | Concurrent requests | Aggregate | Per request | Time to first token |
 | ---: | ---: | ---: | ---: |
-| 1 | 61.1 tok/s | 61.1 tok/s | 25 ms |
-| 2 | 110.0 tok/s | 57.0 tok/s | 71 ms |
-| 4 | 195.6 tok/s | 51.1 tok/s | 45 ms |
+| 1 | 52.1 tok/s | 52.1 tok/s | 29 ms |
+| 2 | 94.8 tok/s | 49.0 tok/s | 77 ms |
+| 4 | 166.2 tok/s | 43.3 tok/s | 50 ms |
 
 **Prefill**
 
 | Prompt | Tokens | Prefill speed | Time to first token |
 | ---: | ---: | ---: | ---: |
-| 8k | 6,307 | 1,878 tok/s | 3.36 s |
-| 16k | 12,600 | 1,952 tok/s | 6.46 s |
-| 32k | 25,163 | 1,866 tok/s | 13.51 s |
-| 64k | 50,308 | 1,880 tok/s | 26.76 s |
-| 128k | 100,557 | 1,680 tok/s | 59.85 s |
+| 8k | 6,307 | 1,558 tok/s | 4.05 s |
+| 16k | 12,600 | 1,616 tok/s | 7.81 s |
+| 32k | 25,163 | 1,567 tok/s | 16.07 s |
+| 64k | 50,308 | 1,503 tok/s | 33.47 s |
+| 128k | 100,557 | 1,479 tok/s | 68.01 s |
 
-Single-request decode is 61.1 tok/s on code and 42.3 on prose; the concurrent aggregate scales to 195.6 tok/s at four
-streams while each keeps 51.1 tok/s. Prefill holds a ~1.85k tok/s plateau from 8k to 64k and eases to 1.68k at 128k.
+Single-request decode is 52.1 tok/s on code and 35.2 on prose; the concurrent aggregate scales to 166.2 tok/s at four
+streams while each keeps 43.3 tok/s. Prefill holds a ~1.5k tok/s plateau from 8k to 64k and eases to 1.48k at 128k.
 
-Two things move these decode numbers, so compare like with like: **thinking on or off is within noise** (prose 42.1
-against 44.0, code 61.3 against 49.5, thinking off against on), and **generation length is not** (the same code prompt
-measures 61.2 tok/s at 256 generated tokens and 72.0 at 1,024, because a short reply pays the per-request ramp). The
-tables above are 256 tokens with thinking off.
+Two things move these decode numbers, so compare like with like: **generation length matters** (a short reply pays
+the per-request ramp), and the tables above are 256 tokens with thinking off.
 
-Startup: 83.07 GiB estimate within a 111.71 GiB budget, 254 s to loaded (171 s of it the one-time GB10 kernel
-compile), **34-35 GiB free for stream caches** against 4.47 GiB for one full 262,144-token window, so the whole pool
-fits. The n-gram tables read in 4.3 s and needed no SSD path.
+Startup: 88.93 GiB estimate within a 107.58 GiB budget, 264 s to loaded (the one-time GB10 kernel compile included),
+**27.7 GiB free for stream caches** against 4.47 GiB for one full 262,144-token window, so the whole pool fits. The
+n-gram tables are the FP8 PLE table in `model-fp8-mtp-ple.safetensors` (47.7 GiB); the engine reports them read in
+9.6 s and re-read after warm-up, and warns they do not fit resident beside the weights and caches, so prompt lookups
+page them from disk. That is the main cost of NVIDIA's export against local-inference-lab's, whose table is smaller and
+stays memory-mapped.
 
 Against the MLX 4-bit tables this replaces (63.6 prose / 96.9 code single-request, 114.5 / 166.4 at four streams,
-2,180-2,468 tok/s prefill): decode here is lower at one stream and **higher at four**, and prefill is lower
-throughout. Two caveats on reading that: the MLX tables do not record their generation length, thinking mode or
-prompt revision, and both change the number a lot (this checkpoint measures 61 tok/s at 256 generated tokens and 72
-at 1,024, thinking on or off, so a shorter or longer sample moves it several points). Treat the two sets as the same
-protocol and shape, not as a controlled A/B. The concurrent columns are the fair comparison, since both were taken
-with the same four-stream shape and the same prompt sets; there the NVFP4 checkpoint wins, because its ~29 GiB of
-freed n-gram-table RAM goes to stream caches.
+2,180-2,468 tok/s prefill): decode and prefill are both lower here at one stream, while the four-stream aggregate is
+level (121.2 against 114.5 prose, 166.2 against 166.4 code). The MLX tables do not record their generation length,
+thinking mode or prompt revision, so treat the two sets as the same shape rather than a controlled A/B.
 
-Prefill is the consistent weak spot: 1,680-1,952 tok/s here against 2,180-2,468 for the MLX checkpoint, the same
-~1.4-1.5x gap to vLLM that [TF #447](https://github.com/ashhart/TensorFold/issues/447) reports on this checkpoint.
+Against local-inference-lab's NVFP4 export, which this recipe also supports via `MODEL_ID`: NVIDIA's is slower here
+(35.2 / 52.1 against 42.3 / 61.1 single-request; 1,479-1,616 against 1,680-1,952 prefill), and the difference tracks
+its FP8 n-gram table being 47.7 GiB and paging from disk, where that export's is smaller and stays mapped. NVIDIA's is
+the vendor's own export with published accuracy tables and the one this recipe defaults to; the other is a drop-in
+`MODEL_ID=local-inference-lab/Qwen3.8-Flash-Next-NVFP4` if prefill matters more than provenance.
+
+Prefill is the consistent weak spot: 1,479-1,616 tok/s here against 2,180-2,468 for the MLX checkpoint, a wider gap
+than the ~1.4-1.5x to vLLM that [TF #447](https://github.com/ashhart/TensorFold/issues/447) reports, for the reason
+above (the paged FP8 table).
 That is where TensorFold's CUDA path is behind, and it is the reason to keep the MLX checkpoint (`MODEL_ID=…`) if
 prompts, not decoding, dominate a workload. Upstream's Zig CUDA server is where it is meant to close.
 
@@ -92,11 +100,11 @@ has the v0.6.0-to-v0.6.1 comparison and the MLX-era tables for reference.
 ## Requirements
 
 - A DGX Spark (or another GB10 system with 128 GB unified memory) with nothing else large on the GPU: the default
-  setting admits 83.07 GiB when the server starts and grows to ~106 GiB with all five streams at their full window
-  (see [KV pool and memory](#kv-pool-and-memory)). Measured boots ran with 113-114 GiB of `MemAvailable`.
+  setting admits 88.93 GiB when the server starts and grows to ~111 GiB with all five streams at their full window
+  (see [KV pool and memory](#kv-pool-and-memory)). Measured boots ran with 110-114 GiB of `MemAvailable`.
 - Docker with the NVIDIA container runtime, and your user in the `docker` group.
-- ~145 GB free disk on a fresh machine: ~110 GB for the checkpoint download under `~/.cache/huggingface`
-  (~106 GB) and ~35 GB for the image under Docker's root (~24 GB); `scripts/prepare.sh` checks both.
+- ~175 GB free disk on a fresh machine: ~133 GB for the checkpoint download under `$HF_CACHE`
+  (~133 GB) and ~35 GB for the image under Docker's root (~24 GB); `scripts/prepare.sh` checks both.
 
 ## Quick start
 
@@ -107,7 +115,7 @@ cd Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold
 ```
 
 That is all. The first run sets everything up (see below): it pulls the prebuilt image (~11 GB) and downloads the
-~106 GiB checkpoint, then compiles the CUDA kernels for the GB10 (a few minutes, once). Later starts take ~2.5 minutes to load the
+~133 GiB checkpoint, then compiles the CUDA kernels for the GB10 (a few minutes, once). Later starts take ~2.5 minutes to load the
 weights. `start.sh` shows each step, the server's log and the loading progress, runs a smoke test, prints
 `Qwen3.8-Flash-Next is now LIVE! on port 8888` with the endpoint, and returns you to the shell.
 
@@ -225,7 +233,7 @@ attached to the server's log and exits with its exit code (for a systemd unit).
    Container Registry (`ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold:v0.6.6-<patches hash>`,
    ~11 GB; `:latest` is the default image, `:languages` the language image); if that tag is not there (e.g. after
    you change `patches/`), or with `PULL=0`, it builds the image locally instead (a few minutes).
-3. Downloads the checkpoint into `~/.cache/huggingface` (resumable).
+3. Downloads the checkpoint into `$HF_CACHE` (resumable).
 4. Verifies the checkpoint with `tensorfold info`.
 
 Run it yourself to download ahead of time or to rebuild the image from scratch:
@@ -253,17 +261,16 @@ TensorFold gives every stream its own cache for a full window, so the KV pool is
 | Memory a stream, allocated (server log, NVFP4 checkpoint) | 4.47 GiB: the KV cache, the sparse-attention index and the stream's own buffers |
 | **Memory for the pool, allocated** | **~22.4 GiB** (5 x 4.47 GiB) |
 
-The server reports these at every start. With the NVFP4 checkpoint (measured 2026-10-06): `CUDA rank 0 startup
-estimate 83.07 GiB within 111.71 GiB; native 262144, allocated prompt/reply window 262144, cache slots 262151` and
-`up to 5 streams, each growing to 262144 prompt/reply tokens while memory lasts (34.8 GiB free for their caches,
-4.47 GiB for one at the full window)`. The 34.8 GiB of headroom against 5 x 4.47 GiB means the whole pool fits,
-with room to spare — more than the MLX checkpoint left, because its 29.8 GiB of n-gram tables no longer compete for
-RAM. The MLX-era numbers were `startup estimate 102.50 GiB within 103.26 GiB`.
+The server reports these at every start. With NVIDIA's checkpoint (measured 2026-10-07): `CUDA rank 0 startup
+estimate 88.93 GiB within 107.58 GiB; native 262144, allocated prompt/reply window 262144, cache slots 262151` and
+`up to 5 streams, each growing to 262144 prompt/reply tokens while memory lasts (27.7 GiB free for their caches,
+4.47 GiB for one at the full window)`. The 27.7 GiB of headroom against 5 x 4.47 GiB means the whole pool fits. Its
+47.7 GiB FP8 n-gram table does not fit resident beside the weights and caches, so the engine reports it pages from
+disk at each lookup. The MLX-era numbers were `startup estimate 102.50 GiB within 103.26 GiB`.
 
-Where the memory goes with the NVFP4 checkpoint (TensorFold's own estimate, measured): the weights and fixed buffers
-take 83.07 GiB of the 111.71 GiB budget, of which the ~78 GiB of GPU-resident weights dominate (the ~29 GiB of n-gram
-tables stay memory-mapped on the host, off the GPU). The MLX recipe for comparison: 75.2 GiB weights + 0.84 GiB
-vision tower + 22.5 GiB stream caches + 4.0 GiB fixed buffers = a 102.5 GiB estimate.
+Where the memory goes with NVIDIA's checkpoint (TensorFold's own estimate, measured): the weights and fixed buffers
+take 88.93 GiB of the 107.58 GiB budget. The MLX recipe for comparison: 75.2 GiB weights + 0.84 GiB vision tower +
+22.5 GiB stream caches + 4.0 GiB fixed buffers = a 102.5 GiB estimate.
 
 The vision tower's scratch (~0.8 GiB at most, measured on a 4,096-token image and a 256-frame video) is taken only
 while an image or video encodes and is handed back right after; startup reserves none for it
@@ -416,9 +423,8 @@ libraries (LGPL). The MIT license above covers this repository's scripts and pat
 ## Credits
 
 Built on [TensorFold](https://github.com/ashhart/TensorFold) by Ash Hart ([ashhart](https://github.com/ashhart)), [Qwen3.8 Flash Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)
-by Qwen, and [local-inference-lab's NVFP4 checkpoint](https://huggingface.co/local-inference-lab/Qwen3.8-Flash-Next-NVFP4)
-(quantized with NVIDIA's [Model Optimizer](https://github.com/NVIDIA/Model-Optimizer); NVIDIA's own
-[nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) export and Vontra's
-MLX 4-bit checkpoint, which this recipe served until v0.6.6, are alternatives), with a prompt-chunk change by
+by Qwen, and [NVIDIA's NVFP4 checkpoint](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) (quantized with
+NVIDIA's [Model Optimizer](https://github.com/NVIDIA/Model-Optimizer); local-inference-lab's NVFP4 export and
+Vontra's MLX 4-bit checkpoint, which this recipe served until v0.6.6, are alternatives), with a prompt-chunk change by
 [MovieMaker93](https://github.com/MovieMaker93) ([TensorFold #40](https://github.com/ashhart/TensorFold/pull/40)). The full list,
 including the runtime stack and licenses, is in [`CREDITS.md`](CREDITS.md).

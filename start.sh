@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Serve Qwen3.8 Flash Next (local-inference-lab/Qwen3.8-Flash-Next-NVFP4, NVIDIA ModelOpt NVFP4) with TensorFold on
+# Serve Qwen3.8 Flash Next (nvidia/Qwen3.8-Flash-Next-NVFP4, NVIDIA ModelOpt NVFP4) with TensorFold on
 # one DGX Spark, end to end: runs scripts/prepare.sh when the image or the checkpoint is not ready yet (first run,
 # or after patches change), launches `tensorfold serve` on port 8888, waits until the OpenAI API answers, then runs
 # a smoke test. Stop it with ./stop.sh. (TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP is the MLX fallback: MODEL_ID=...)
@@ -96,7 +96,7 @@ fi
 # the first run, new patches, another model or image. PREPARE=1 forces it, PREPARE=0 skips it.
 step 1 "Setup: image and checkpoint"
 if [[ "${PREPARE:-auto}" == 1 || ( "${PREPARE:-auto}" != 0 && "$(prepared_state 2>/dev/null)" != "$(cat "$PREPARED_MARKER" 2>/dev/null)" ) ]]; then
-  log "Not ready yet: running scripts/prepare.sh (the first time this pulls the image and downloads ~106 GB)"
+  log "Not ready yet: running scripts/prepare.sh (the first time this pulls the image and downloads ~133 GB)"
   ./scripts/prepare.sh
 else
   log "Ready: $IMAGE and $MODEL_ID${PREPARE:+ (PREPARE=$PREPARE)}"

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Prepare everything needed to serve local-inference-lab/Qwen3.8-Flash-Next-NVFP4 with TensorFold on one DGX Spark:
+# Prepare everything needed to serve nvidia/Qwen3.8-Flash-Next-NVFP4 with TensorFold on one DGX Spark:
 #   1. preflight checks (docker, GPU runtime, disk space)
 #   2. the image: TensorFold plus patches/*.patch (and patches/languages/*.patch with DRAFT_LANGUAGE) on NVIDIA's
 #      PyTorch container, pulled prebuilt from $GHCR_IMAGE when a matching tag is reachable (PULL=0 skips that), else
 #      built locally
-#   3. download the checkpoint into the Hugging Face cache (~106 GB, resumable)
+#   3. download the checkpoint into the Hugging Face cache (~133 GB, resumable)
 #   4. verify the checkpoint with `tensorfold info`
 # ./start.sh runs this by itself when needed. Safe to re-run: every step skips work that is already done.
 # Pass --rebuild to rebuild the image from scratch.
@@ -39,7 +39,7 @@ mkdir -p patches
 PATCHES_HASH=$(patches_hash)
 built_hash=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || true)
 
-# Disk: the checkpoint (~106 GB) if it is not downloaded yet, and the image (~24 GB, more while it unpacks) if it is
+# Disk: the checkpoint (~133 GB) if it is not downloaded yet, and the image (~24 GB, more while it unpacks) if it is
 # not built from these patches yet; both on one filesystem when Docker's root shares it with the HF cache.
 free_gb() { df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc '0-9'; }
 fs_of()   { df --output=target "$1" 2>/dev/null | tail -1; }

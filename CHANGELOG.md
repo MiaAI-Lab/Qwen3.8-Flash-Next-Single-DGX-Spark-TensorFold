@@ -7,20 +7,21 @@ release ends at is given, and the prebuilt images are
 
 ## [0.7.0] - 2026-10-06
 
-TensorFold **v0.6.6** (`cb2ebf0`). Checkpoint `local-inference-lab/Qwen3.8-Flash-Next-NVFP4` (`7c4f1bc1`).
-Images `v0.6.6-35a2e85de8ad` (`:latest`) and `v0.6.6-7c0f3be0bb7e` (`:languages`); the prebuilt tags are not pushed
-to GHCR yet, so `scripts/prepare.sh` builds the image locally on the first run.
+TensorFold **v0.6.6** (`cb2ebf0`). Checkpoint `nvidia/Qwen3.8-Flash-Next-NVFP4` (`fc694b54`).
+Images `v0.6.6-90c81b4e558b` (`:latest`) and its `:languages` build; the prebuilt tags are not pushed to GHCR yet, so
+`scripts/prepare.sh` builds the image locally on the first run.
 
 ### Changed
 
-- The checkpoint is now **NVIDIA ModelOpt NVFP4**
-  ([`local-inference-lab/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/local-inference-lab/Qwen3.8-Flash-Next-NVFP4)):
-  FP4 routed experts and n-gram rows, MXFP8 elsewhere, the MTP head kept. About 106 GB on disk; the ~78 GiB of GPU
-  weights replace the MLX checkpoint's 75.2 GiB resident + 29.8 GiB SSD tables, whose memory goes to the KV pool
-  instead. NVIDIA's own [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
-  shows the format holds quality against FP8 (GPQA 91.5 against 92.0 and friends). The MLX 4-bit checkpoint stays
-  available as `MODEL_ID=TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP` — still the only format two ranks and
-  `--ple-on-ssd` read, and the reason `PLE_ON_SSD` now defaults to 0.
+- The checkpoint is now **NVIDIA's own ModelOpt NVFP4 export**
+  ([`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4), revision `fc694b54`):
+  FP4 routed experts, an FP8 n-gram (PLE) table in its own `model-fp8-mtp-ple.safetensors`, block-FP8 MTP experts and
+  the MTP head kept. About 133 GB on disk. NVIDIA publishes accuracy tables for it (GPQA 91.5 against FP8's 92.0 and
+  friends), so the format's quality is documented rather than inferred. It needs `patches/0003-nvidia-vision.patch`:
+  its tower is named `qwen4_exp_vision`, a name TensorFold's CUDA vision check does not list yet. The
+  `local-inference-lab/Qwen3.8-Flash-Next-NVFP4` export stays available as a `MODEL_ID` override (smaller at ~106 GB,
+  its n-gram table in the main shards, and faster here: see the measurements below), and the MLX 4-bit checkpoint
+  remains the only format two ranks and `--ple-on-ssd` read, which is why `PLE_ON_SSD` now defaults to 0.
 
   Why NVFP4 rather than staying on MLX: the "MLX 4-bit decodes slower" reports traced back to
   [#317](https://github.com/ashhart/TensorFold/issues/317), whose author retracted the regression (it was a cold
@@ -28,7 +29,7 @@ to GHCR yet, so `scripts/prepare.sh` builds the image locally on the first run.
   by @grearjake-star in [#337](https://github.com/ashhart/TensorFold/pull/337)). Upstream's answer at the end of that
   thread is decisive: the Python engine is frozen (#286), so #337 ships only in the Zig engine, where Flash Next on
   CUDA is the next family after Nemotron. NVFP4 is where upstream's work is, and
-  [#447](https://github.com/ashhart/TensorFold/issues/447) measures this exact checkpoint.
+  [#447](https://github.com/ashhart/TensorFold/issues/447) measures an NVFP4 export of this model.
 - TensorFold v0.6.1 to v0.6.6. Upstream absorbed the `TENSORFOLD_PREFILL_ROWS` override (#238) and the Flash Next
   video input (#240), so `patches/0002-flash-next-v066.patch` carries only copy drafts, the SSD read-ahead, the
   first-token-before-draft order, the absorb-logits skip and the 96 MiB request bodies. New upstream knobs the
@@ -43,24 +44,23 @@ to GHCR yet, so `scripts/prepare.sh` builds the image locally on the first run.
 - The `TENSORFOLD_IMAGE_TOKENS` budget is passed as `--vision-image-tokens` (the old env name stopped being read
   upstream); the video token budget env is unchanged.
 
-Measured 2026-10-06 on the new defaults, one DGX Spark, through the OpenAI API, in the README's usual table shape
+Measured 2026-10-07 on NVIDIA's checkpoint, one DGX Spark, through the OpenAI API, in the README's usual table shape
 (fresh prompt each sample, temperature 0, thinking off, 256 generated tokens):
 
-- **Decode, prose**: 42.3 tok/s at one stream, 77.8 aggregate at two, 143.1 at four.
-- **Decode, code**: 61.1 tok/s at one stream, 110.0 aggregate at two, 195.6 at four.
-- **Prefill**: 1,878 tok/s at 6.3k tokens, 1,952 at 12.6k, 1,866 at 25.2k, 1,880 at 50.3k, 1,680 at 100.6k.
+- **Decode, prose**: 35.2 tok/s at one stream, 64.8 aggregate at two, 121.2 at four.
+- **Decode, code**: 52.1 tok/s at one stream, 94.8 aggregate at two, 166.2 at four.
+- **Prefill**: 1,558 tok/s at 6.3k tokens, 1,616 at 12.6k, 1,567 at 25.2k, 1,503 at 50.3k, 1,479 at 100.6k.
 
-Single-stream decode is below the MLX recipe's tables (63.6 prose / 96.9 code) and the concurrent aggregate is above
-(143.1 / 195.6 against 114.5 / 166.4), but the MLX tables do not record their generation length or thinking mode and
-both move the number several points, so the two sets are the same shape rather than a controlled A/B. Prefill is
-1,680-1,952 tok/s against the MLX recipe's 2,180-2,468, the ~1.4-1.5x gap to vLLM that
-[#447](https://github.com/ashhart/TensorFold/issues/447) reports on this checkpoint. Startup admits 83.07 GiB of a
-111.71 GiB budget, leaving 34-35 GiB for stream caches against 5 x 4.47 GiB at the full window; the MLX checkpoint
-needed 102.5 GiB and its 29.8 GiB of n-gram tables on SSD. First load 254 s, of which ~171 s is the one-time GB10
-kernel compile; later starts reuse it.
+NVIDIA's export is slower than local-inference-lab's on the same recipe (42.3 / 61.1 single-request, 1,680-1,952
+prefill), and the difference tracks its FP8 n-gram table: 47.7 GiB in `model-fp8-mtp-ple.safetensors`, which the engine
+reports does not fit resident beside the weights and caches, so prompt lookups page it from disk. Both are below the
+MLX recipe's tables (63.6 prose / 96.9 code, 2,180-2,468 prefill), though the four-stream aggregate is level with MLX
+(121.2 / 166.2 against 114.5 / 166.4). Startup admits 88.93 GiB of a 107.58 GiB budget, leaving 27.7 GiB for stream
+caches against 5 x 4.47 GiB at the full window. First load 264 s including the one-time GB10 kernel compile.
 
-Verified on the same boot: drafted replies equal `"draft": false` (identical `token_sha`), 5 concurrent streams each
-completed, a 26.7k-token needle was retrieved, `tools/visioncheck.py` and `tools/toolcheck.py` both pass.
+Verified on the same boot: drafted replies equal `"draft": false` (identical `token_sha` over 256 tokens), 5 concurrent
+streams each completed independently, `tools/visioncheck.py` passes (the tower loads through the new 0003 patch) and
+`tools/toolcheck.py` returns the array as JSON.
 
 ## [0.6.0] - 2026-10-02
 

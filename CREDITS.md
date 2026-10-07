@@ -8,15 +8,16 @@ This repository is a thin layer of scripts and patches. Almost everything that m
   design, training and evaluations. Released under the **Qwen Community License 1.0**, which governs any use of the
   weights (read it before commercial use, in particular its terms for Model-as-a-Service businesses). The weights are
   not part of this repository; `scripts/prepare.sh` downloads them from Hugging Face.
-- **[local-inference-lab](https://huggingface.co/local-inference-lab)**: the checkpoint served here,
+- **[NVIDIA](https://www.nvidia.com/)**: the checkpoint served here,
+  [`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) (revision `fc694b54`):
+  NVIDIA's own ModelOpt NVFP4 export, with FP4 routed experts, an FP8 n-gram (PLE) table, block-FP8 MTP experts and
+  the preserved MTP head, plus its activation calibration and accuracy tables. Released under the **NVIDIA Open
+  Model License**; the Qwen Community License 1.0 still governs the base weights. The
+  [Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) toolkit that produced the format is NVIDIA's too.
+- **[local-inference-lab](https://huggingface.co/local-inference-lab)**: the other NVFP4 export of the same model,
   [`local-inference-lab/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/local-inference-lab/Qwen3.8-Flash-Next-NVFP4)
-  (revision `7c4f1bc1`): the ModelOpt NVFP4 conversion this recipe switched to (FP4 routed experts and n-gram rows,
-  MXFP8 elsewhere, the MTP head kept), its activation calibration, PLE refinement and packaging.
-- **[NVIDIA](https://www.nvidia.com/)**: the [Model Optimizer](https://github.com/NVIDIA/Model-Optimizer) toolkit
-  that produced the NVFP4 format, and NVIDIA's own
-  [`nvidia/Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) export whose
-  accuracy tables and quantization recipe the community exports build on (NVIDIA Open Model License; the Qwen
-  Community License 1.0 still governs the base weights).
+  (revision `7c4f1bc1`): FP4 routed experts, MXFP8 elsewhere and its n-gram table in the main shards, so it is
+  smaller on disk (~106 GB) and its table stays memory-mapped. Available as a `MODEL_ID` override.
 - **[Vontra](https://huggingface.co/Vontra)**: the checkpoint this recipe served until v0.6.6,
   [`Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP`](https://huggingface.co/Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP): the MLX
   4-bit conversion, the preserved native MTP draft head, validation and packaging. Still the fallback `MODEL_ID`,
@@ -51,6 +52,12 @@ This repository is a thin layer of scripts and patches. Almost everything that m
   **[MovieMaker93](https://github.com/MovieMaker93)** (upstream as #238). Copy drafts use TensorFold's `CopyIndex`
   from the Qwen3.5 27B engine. The v0.5.0 series and the v0.6.0, v0.6.1 and v0.6.6 rebases are by MiaAI-Lab,
   developed with [Claude Code](https://claude.com/claude-code) and Cursor.
+- `0003-nvidia-vision.patch` adds `"qwen4_exp_vision"` to TensorFold's CUDA vision check. NVIDIA's export names
+  its tower that; the tower is the same as local-inference-lab's `"qwen4_exp"` field for field (hidden size 1152,
+  out 2560, depth 27, patch 16, merge 2, 3 channels, intermediate 4304, 16 heads, no deepstack), so the same code
+  reads it. It goes upstream as a one-line allowlist addition; TensorFold's issue
+  [#179](https://github.com/ashhart/TensorFold/issues/179) tracks the neighbouring case, the FP8 n-gram table that
+  NVIDIA's older revision labelled `FP8_BLOCK_SCALES`.
 - `languages/0010-flash-next-draft-languages`: the language token lists come from
   **Javier ([jvr0x](https://github.com/jvr0x))**'s language draft vocabularies for this model's vLLM recipe
   ([MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark#84](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark/pull/84)),

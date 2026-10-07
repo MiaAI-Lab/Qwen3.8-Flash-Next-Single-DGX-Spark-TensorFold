@@ -14,7 +14,7 @@ if [[ -f .env ]]; then
   done < .env
 fi
 
-MODEL_ID="${MODEL_ID:-local-inference-lab/Qwen3.8-Flash-Next-NVFP4}"   # NVIDIA ModelOpt NVFP4 (see CREDITS.md); TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP is the MLX fallback
+MODEL_ID="${MODEL_ID:-nvidia/Qwen3.8-Flash-Next-NVFP4}"   # NVIDIA's own ModelOpt NVFP4 export (see CREDITS.md); local-inference-lab's is the other NVFP4 export, TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP the MLX fallback
 # The patches and start.sh's flags are made for TensorFold v0.6.6 exactly (cb2ebf0). After changing
 # TF_VERSION, TF_REPO or BASE_IMAGE, run `scripts/prepare.sh --rebuild`.
 TF_VERSION="${TF_VERSION:-v0.6.6}"
@@ -99,7 +99,7 @@ HF_CACHE="${HF_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}}"
 # Persists compiled CUDA kernels (torch extensions + triton) so only the first start pays the compile.
 KERNEL_CACHE="${KERNEL_CACHE:-$HOME/.cache/tensorfold-qwen38}"
 
-MIN_FREE_GB="${MIN_FREE_GB:-120}"   # free disk the checkpoint download needs (it is ~106 GB)
+MIN_FREE_GB="${MIN_FREE_GB:-145}"   # free disk the checkpoint download needs (NVIDIA's is ~133 GB)
 IMAGE_FREE_GB="${IMAGE_FREE_GB:-35}"   # free disk under Docker's root that pulling or building the image needs
 
 # Colours only on a terminal.
