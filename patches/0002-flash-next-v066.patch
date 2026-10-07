@@ -1,0 +1,325 @@
+Flash Next recipe on TensorFold v0.6.6 (cb2ebf0): copy drafts with compact MTP rows (TENSORFOLD_MTP_COPY), SSD read-ahead for --ple-on-ssd, the first token out before the next draft chain, no unused MTP draft-vocabulary logits while prompts absorb, 96 MiB request bodies, and 64 MiB video / 64 MiB total image byte budgets to match. TensorFold v0.6.6 itself absorbed the TENSORFOLD_PREFILL_ROWS override (#238) and Flash Next video input (#240), so those hunks are gone from this patch.
+--- tensorfold/families/qwen4_exp/cuda/decode.py
++++ tensorfold/families/qwen4_exp/cuda/decode.py
+@@ -15,7 +15,7 @@
+ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
+ 
+ from . import CONFIDENCE, DEPTH
+-from .forward import Cut, commit, cut_snapshot, forward
++from .forward import Cut, commit, cut_snapshot, forward, read_ahead
+ from . import image_rows
+ from .state import CAND, Buffers, State
+ from .mtp import mtp_forward
+@@ -308,7 +308,7 @@
+     if not 0 < st.pos < len(prompt):
+         raise ValueError("a resumed prompt must extend the cached tokens")
+     if _absorbs(e, mtp) and resume.get("tail") is not None:
+-        mtp_forward(e.w, st, e.pbuf, [prompt[st.pos]], resume["tail"])
++        mtp_forward(e.w, st, e.pbuf, [prompt[st.pos]], resume["tail"], logits=False)
+         st.set_mtp_len(st.mtp_len + 1)
+     return st.pos
+ 
+@@ -323,6 +323,10 @@
+     chunk = list(prompt[start:end])
+     R = len(chunk)
+     final = end == len(prompt)
++    if not final and st.ple_history is not None:
++        hist = np.concatenate([np.asarray(st.ple_history, dtype=np.int64),
++                               np.asarray(chunk, dtype=np.int64)])[-(w.cfg.ngram_size - 1):]
++        read_ahead(w, hist, prompt[end:end + e.prefill_rows])
+     point = keep_at - start if keep_at is not None and start < keep_at <= end else 0     # the kept point's row
+     cut = Cut(point) if 0 < point < R else None           # inside the chunk, not at its end
+     # only the prompt's last row is sampled: the head runs on the final chunk alone
+@@ -336,7 +340,7 @@
+         snap = cut_snapshot(w, st, pb, cut, mtp_len) if cut is not None else None
+     nxt = list(prompt[start + 1:end + 1])
+     if use_mtp and nxt:
+-        mtp_forward(w, st, pb, nxt, pb.streams[:len(nxt)])
++        mtp_forward(w, st, pb, nxt, pb.streams[:len(nxt)], logits=False)
+         st.set_mtp_len(st.mtp_len + len(nxt))
+     commit(w, st, pb, R, R)
+     if point:                                            # as a fresh prefill of prompt[:keep_at] leaves it
+--- tensorfold/families/qwen4_exp/cuda/forward.py
++++ tensorfold/families/qwen4_exp/cuda/forward.py
+@@ -487,6 +487,19 @@
+     return segs
+ 
+ 
++def read_ahead(w: Weights, history: np.ndarray, tokens: Sequence[int]) -> None:
++    """Start reading n-gram rows a later stage of ``tokens`` after ``history`` will look up."""
++
++    if not len(tokens):
++        return
++    toks = np.asarray(tokens, dtype=np.int64)
++    for layer in w.layers:
++        ple = layer.ple
++        start = getattr(getattr(ple, "table", None), "read_ahead", None) if ple is not None and getattr(w, "x3", None) is None else None
++        if start is not None:
++            start(ple.ngram.ids(history, toks))
++
++
+ def compute(w: Weights, segs: Sequence[Seg], b: Buffers, *, logits: bool = True, context: int | None = None,
+             ends: Sequence[int] = (), cuts: Sequence[Cut] = (), features=None):
+     """The forward's GPU work on staged rows (capturable); ``context`` bounds attention, ``ends`` get the head, ``cuts`` keep states."""
+--- tensorfold/families/qwen4_exp/cuda/mtp.py
++++ tensorfold/families/qwen4_exp/cuda/mtp.py
+@@ -34,9 +34,10 @@
+     return segs
+ 
+ 
+-def mtp_compute(w: Weights, segs: Sequence, b: Buffers, *, last_only: bool = True,
+-                context: int | None = None) -> torch.Tensor:
+-    """The MTP head's GPU work (capturable); ``last_only``: the draft head's logits of each stream's last row."""
++def mtp_compute(w: Weights, segs: Sequence, b: Buffers, *, last_only: bool = True, logits: bool = True,
++                context: int | None = None) -> torch.Tensor | None:
++    """The MTP head's GPU work (capturable); ``last_only``: the draft head's logits of each stream's last row.
++    ``logits=False`` absorbs into the MTP cache and skips the unused draft-vocabulary projection."""
+ 
+     c = w.cfg
+     m = w.mtp
+@@ -49,6 +50,8 @@
+     glue.add_streams(b.mtp_eo[:n], b.mtp_hs[:n * c.streams], b.h[:n], c.streams)
+     pending = layer_forward(m.layer, w, segs, b, n, None, mtp=True, context=context)
+     finish(w, m.mixer, b, n, pending, logits=False)
++    if not logits:
++        return None
+     if not last_only:
+         return _mm(b.mixed[:n], w.head, b.xs_mixed[:n], b.logits[:n], b)
+     head = w.head if w.draft_head is None else w.draft_head
+@@ -68,7 +71,7 @@
+ 
+ @torch.no_grad()
+ def mtp_forward(w: Weights, st: State, b: Buffers, next_tokens: Sequence[int], streams: torch.Tensor,
+-                *, last_only: bool = True) -> torch.Tensor:
+-    """Process bf16 main-model streams and next tokens into last-row or all-row logits plus b.streams[:n], appending n cache entries while the caller advances ``st.mtp_len``."""
++                *, last_only: bool = True, logits: bool = True) -> torch.Tensor | None:
++    """Process bf16 main-model streams and next tokens into last-row or all-row logits plus b.streams[:n], appending n cache entries while the caller advances ``st.mtp_len``. ``logits=False`` skips the unused draft-vocabulary projection."""
+ 
+-    return mtp_compute(w, mtp_stage(w, b, [(st, next_tokens, streams)]), b, last_only=last_only)
++    return mtp_compute(w, mtp_stage(w, b, [(st, next_tokens, streams)]), b, last_only=last_only, logits=logits)
+--- tensorfold/families/qwen4_exp/cuda/multi.py
++++ tensorfold/families/qwen4_exp/cuda/multi.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ import time
+ 
+ import numpy as np
+@@ -20,7 +21,7 @@
+ from .decode import (PREFILL_ROWS, WARM_TAIL, Engine, _gathered_fits, choose_gathered_streams,
+                      entry_end, prefill_begin, tp_sample_rows)
+ from . import attn_multi, gdn_multi, image_rows, prefixes
+-from .forward import commit, compute, compute_mixed, converges, stage
++from .forward import commit, compute, compute_mixed, converges, read_ahead, stage
+ from .mtp import mtp_compute, mtp_stage
+ from .state import Buffers, State
+ from .multi_solo import Alone, solo
+@@ -32,6 +33,7 @@
+ FIRST, STEP = 256, 8192          # rows an idle slot keeps; rows a stream's caches grow by at a time
+ GIB = 1024**3
+ SHARE = 0.0                      # --decode-share: a round alone takes this share of its pass's time (0: whole passes)
++COPY_MATCH = 8                   # copy drafts: the context's last this many tokens seen before, and as many after them
+ 
+ 
+ def _slot(w, st: State, buf: Buffers, mbuf: Buffers, pbuf: Buffers, capacity: int, prefill_rows: int) -> Engine:
+@@ -56,6 +58,7 @@
+         self.w, self.depth, self.confidence, self.capacity = w, depth, confidence, capacity
+         self.points = points                         # a prompt's message starts to keep states at, or None
+         self.vision = vision
++        self.copy = os.environ.get("TENSORFOLD_MTP_COPY", "0") == "1"
+         self.eos = tuple(w.cfg.eos) if stop_eos else ()
+         rows = slots * (depth + 1)
+         # a round's window and a prompt pass share each layer's expert launch: the pass's buffers hold both
+@@ -272,7 +275,10 @@
+         mtp = s.draft and self.depth > 0 and self.mbuf is not None
+         try:
+             begin = prefill_begin(e, s.prompt, mtp=mtp, resume=resume)
++            image = s.vision is not None
+             image_rows.begin(e, s, self.vision)
++            if image:
++                torch.cuda.empty_cache()                 # the tower's scratch back before the prompt's passes
+         except Exception:
+             self._drop_kept(st)
+             self.free.append(st)
+@@ -284,6 +290,10 @@
+                 if s.draft and st.image_positions is None and self.points is not None else []
+         s.sid, s.st = self.next_id, st
+         self.next_id += 1
++        if self.copy and s.draft:
++            from tensorfold.families.qwen3_5.cuda.decode import CopyIndex
++
++            s.copies = CopyIndex(COPY_MATCH)
+         s.prefill_s = time.perf_counter() - t0
+         same = resume is not None and self._keep_at(s) == begin         # the same prompt again: its own point
+         self.fills[s.sid] = [e, mtp, begin, (resume["state"], resume["tail"]) if same else None]
+@@ -399,7 +409,8 @@
+                     s.error = exc
+             last = s.error is not None or len(s.out) + len(new) >= s.count or end in self._ends(s)
+             kept.append((s, a0, rows[:len(path)], new, last))
+-        self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last])
++        self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last],
++                        {s.sid: fresh for s, _, _, fresh, last in kept if getattr(s, "copies", None) is not None and not last})
+         for s, _, _, new, _ in kept:
+             if s.error is not None:
+                 s.done = True
+@@ -414,8 +425,9 @@
+             self.held.pop(s.sid, None)
+         return failed + done + ended
+ 
+-    def _draft_all(self, streams: list) -> None:
+-        """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth."""
++    def _draft_all(self, streams: list, new: dict | None = None) -> None:
++        """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth.
++        A stream whose context repeats earlier text drafts that continuation instead of an MTP row."""
+ 
+         for s, _, _ in streams:
+             s.drafts = []
+@@ -434,6 +446,18 @@
+         for (s, _, keep), (st, a0, a1) in zip(todo, segs):
+             st.set_mtp_len(st.mtp_len + len(keep))
+         active = [(s, a1 - 1) for s, (_, _, a1) in zip([t[0] for t in todo], segs)]
++        if new:
++            for s, _ in active:
++                if s.sid in new and getattr(s, "copies", None) is not None:
++                    s.context.extend(new[s.sid])
++                    s.drafts = s.copies.propose(s.context, max(room[s.sid], COPY_MATCH))[:room[s.sid]]
++                    del s.context[len(s.context) - len(new[s.sid]):]
++            keep_rows = [i for i, (s, _) in enumerate(active) if not s.drafts]
++            if len(keep_rows) != len(active):
++                logits = logits[keep_rows]
++            active = [active[i] for i in keep_rows]
++            if not active:
++                return
+         for j in range(self.depth):
+             picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active])
+             nxt = []
+--- tensorfold/families/qwen4_exp/cuda/multi_fill.py
++++ tensorfold/families/qwen4_exp/cuda/multi_fill.py
+@@ -4,6 +4,7 @@
+ 
+ import time
+ 
++import numpy as np
+ import torch
+ 
+ from tensorfold.cuda.logprobs import capture
+@@ -11,7 +12,7 @@
+ 
+ from . import image_rows
+ from .decode import _gathered_fits, choose_gathered, entry_end, draft, tp_sample_rows
+-from .forward import Cut, commit, compute, cut_snapshot, stage
++from .forward import Cut, commit, compute, cut_snapshot, read_ahead, stage
+ from .mtp import mtp_compute, mtp_stage
+ from .state import CAND, ENDS
+ from .multi_tp import OutOfStep
+@@ -98,6 +99,7 @@
+             self.pass_index += 1
+         t0 = time.perf_counter()
+         try:
++            self._read_ahead(pieces)
+             segs = stage(self.w, self.pbuf, [(s.st, s.prompt[a:a + n]) for s, a, n in pieces])
+             ends, cuts = self._end_rows(pieces, segs), self._cuts(pieces, segs)
+             logits = compute(self.w, segs, self.pbuf, logits=bool(ends), ends=ends, cuts=cuts)
+@@ -112,6 +114,17 @@
+             self.row_s = extra if self.row_s is None else 0.7 * self.row_s + 0.3 * extra
+         return self._joined(pieces, heads, lasts, (time.perf_counter() - t0) / len(pieces), candidates)
+ 
++    def _read_ahead(self, pieces) -> None:
++        """Overlap the next piece's n-gram reads with this pass."""
++
++        ngram = self.w.cfg.ngram_size - 1
++        for s, a, n in pieces:
++            if a + n >= len(s.prompt) or s.st.ple_history is None:
++                continue
++            hist = np.concatenate([np.asarray(s.st.ple_history, dtype=np.int64),
++                                   np.asarray(s.prompt[a:a + n], dtype=np.int64)])[-ngram:]
++            read_ahead(self.w, hist, s.prompt[a + n:a + n + self.prefill_rows])
++
+     @staticmethod
+     def _end_rows(pieces, segs) -> list[int]:
+         """The pass rows that end a prompt (each gets the head)."""
+@@ -156,7 +169,7 @@
+                   for (s, a, n), (_, a0, _) in zip(pieces, segs) if self.fills[s.sid][1] and a + 1 < len(s.prompt)]
+         if absorb:                   # the MTP head absorbs each prompt's rows (its cache in position order)
+             absorb = [(st, nxt, streams[:len(nxt)]) for st, nxt, streams in absorb]
+-            mtp_compute(self.w, mtp_stage(self.w, self.pbuf, absorb), self.pbuf)
++            mtp_compute(self.w, mtp_stage(self.w, self.pbuf, absorb), self.pbuf, logits=False)
+             for st, nxt, _ in absorb:
+                 st.set_mtp_len(st.mtp_len + len(nxt))
+         for (s, a, n), (st, a0, _) in zip(pieces, segs):
+@@ -216,11 +229,13 @@
+                 s.constraint.advance([first])
+             head += 1
+             s.context = list(s.prompt)
+-            s.drafts = draft(e, last, [first], st.pos + 1, min(self.depth, s.count - 1), s.sampling,
+-                             self.confidence) if mtp and s.count > 1 else []
++            s.drafts = []
+             s.started = time.perf_counter()
+             self.streams[s.sid] = s
+-            s.take([first], self._ends(s))
++            s.take([first], self._ends(s))               # the first token goes out before the next draft
++            if mtp and not s.done and s.count > 1:
++                s.drafts = draft(e, last, [first], st.pos + 1, min(self.depth, s.count - 1), s.sampling,
++                                 self.confidence)
+             if s.done:
+                 joined.append(s)
+         self._joined_ranks()
+--- tensorfold/families/qwen4_exp/host_table.py
++++ tensorfold/families/qwen4_exp/host_table.py
+@@ -326,7 +326,7 @@
+         return NVFP4Table(files, scale("weight_scale_2"))
+     if used[0] == "fp8":
+         return FP8Table(files, scale("weight_scale"))
+-    table = BF16Table(files) if used[0] == "bf16" else SSDTable(files) if ssd else HostTable(files)
++    table = BF16Table(files) if used[0] == "bf16" else ReadAhead(SSDTable(files)) if ssd else HostTable(files)
+     table.weight_scale = float(scale("weight_scale"))
+     return table
+ 
+--- tensorfold/server/request_body.py
++++ tensorfold/server/request_body.py
+@@ -7,7 +7,7 @@
+ 
+ from tensorfold.server.errors import RequestError
+ 
+-LIMIT = 32 * 1024**2
++LIMIT = 96 * 1024**2
+ _METADATA_LIMIT = 65536
+ 
+ 
+--- tensorfold/server/responses.py
++++ tensorfold/server/responses.py
+@@ -17,7 +17,7 @@
+ from tensorfold.server.request_body import read_body
+ from tensorfold.server.responses_translate import Reply, _id, messages, translate
+ 
+-LIMIT = 32 * 1024**2
++LIMIT = 96 * 1024**2
+ 
+ 
+ def route(path: str) -> str | None:
+--- tensorfold/vision/images.py
++++ tensorfold/vision/images.py
+@@ -25,7 +25,7 @@
+ class ImageLimits:
+     max_images: int = 4
+     max_encoded_bytes: int = 10 * 1024 * 1024
+-    max_total_encoded_bytes: int = 20 * 1024 * 1024
++    max_total_encoded_bytes: int = 64 * 1024 * 1024
+     max_dimension: int = 8192
+     max_pixels: int = 16 * 1024 * 1024
+     max_total_pixels: int = 32 * 1024 * 1024
+--- tensorfold/vision/videos.py
++++ tensorfold/vision/videos.py
+@@ -20,8 +20,8 @@
+ @dataclass(frozen=True, slots=True)
+ class VideoLimits:
+     max_videos: int = 2
+-    max_encoded_bytes: int = 16 * 1024 * 1024         # base64 makes it a third larger in the 32 MiB request body
+-    max_total_encoded_bytes: int = 20 * 1024 * 1024
++    max_encoded_bytes: int = 64 * 1024 * 1024         # the recipe's 96 MiB request bodies
++    max_total_encoded_bytes: int = 96 * 1024 * 1024
+     max_dimension: int = 8192
+     max_seconds: float = 3600.0          # of footage; frames past the sampled ones are decoded and dropped
+     fps: float = 2.0                      # frames sampled a second (Qwen3-VL's rate)

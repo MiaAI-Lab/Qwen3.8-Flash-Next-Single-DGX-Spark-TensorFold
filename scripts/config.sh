@@ -14,10 +14,10 @@ if [[ -f .env ]]; then
   done < .env
 fi
 
-MODEL_ID="${MODEL_ID:-Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP}"   # MLX 4-bit, group size 32, with the MTP head
-# The patches and start.sh's flags are made for TensorFold v0.6.1 exactly (17c73e1). After changing
+MODEL_ID="${MODEL_ID:-nvidia/Qwen3.8-Flash-Next-NVFP4}"   # NVIDIA's own ModelOpt NVFP4 export (see CREDITS.md); local-inference-lab's is the other NVFP4 export, TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP the MLX fallback
+# The patches and start.sh's flags are made for TensorFold v0.6.6 exactly (cb2ebf0). After changing
 # TF_VERSION, TF_REPO or BASE_IMAGE, run `scripts/prepare.sh --rebuild`.
-TF_VERSION="${TF_VERSION:-v0.6.1}"
+TF_VERSION="${TF_VERSION:-v0.6.6}"
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
 # Replies mostly in Chinese or Japanese: DRAFT_LANGUAGE=zh or ja (in .env) serves the second image, which adds that
@@ -34,21 +34,27 @@ GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-
 SERVED_NAME="${SERVED_NAME:-Qwen3.8-Flash-Next}"   # the model id clients see in /v1/models and replies (tensorfold --name)
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
-# Serving defaults (./start.sh arguments come after them and win). All streams share one memory pool (~103-104 GiB
-# budget on a 128 GB Spark, 75 GiB of it weights), so window x streams x KV bytes must fit: 4 streams x 262,144 tokens
-# at int8 KV is ~97.8 GiB, 5 streams ~102.6 GiB (~4.5 GiB a stream). Other fits: 3 streams bf16 at 262k, 6 streams
-# int4 at 262k, 8 streams int4 at ~250k (tight), 6 streams int8 at ~220k. int4 and bf16 KV change the output slightly.
+# Serving defaults (./start.sh arguments come after them and win). All streams share one memory pool (~110 GiB
+# budget on a 128 GB Spark, ~78 GiB of it GPU-resident weights; the ~29 GiB of n-gram tables stay memory-mapped on
+# the host), so window x streams x KV bytes must fit: with the NVFP4 checkpoint the default admits 83.07 GiB
+# (measured) and leaves 34-35 GiB for stream caches against 4.47 GiB each at the full 262,144-token window, so all
+# five fit with room. Other fits: 3 streams bf16 at 262k, 6 streams int4 at 262k, 8 streams int4 at ~250k (tight),
+# 6 streams int8 at ~220k. int4 and bf16 KV change the output slightly. The MLX checkpoint (MODEL_ID override)
+# admits 102.5 GiB instead: its 29.8 GiB of tables are resident unless PLE_ON_SSD=1.
 PARALLEL="${PARALLEL:-5}"          # requests decoded together (streams)
 CONTEXT="${CONTEXT:-262144}"       # prompt + reply window per stream (the model's native maximum)
 KV_DTYPE="${KV_DTYPE:-int8}"       # bf16 | int8 | int4
-PLE_ON_SSD="${PLE_ON_SSD:-1}"      # 1: read the 29.8 GiB n-gram tables from SSD, leaving that RAM to the KV cache
-# Image input (TensorFold's Flash Next vision; video and many images from patch 0002): the model's own vision tower,
-# 0.84 GiB. Its ~0.8 GiB of scratch is taken only while an image or video encodes and handed back right after, so
-# startup reserves none for it. VISION=0: text only.
+# The NVFP4 checkpoint's n-gram tables ship in the checkpoint and load with the weights (memory-mapped on
+# the host), so --ple-on-ssd does not apply to it; the MLX checkpoint (MODEL_ID override) does. 1 there:
+# read the 29.8 GiB tables from SSD, leaving that RAM to the KV cache.
+PLE_ON_SSD="${PLE_ON_SSD:-0}"
+# Image input (TensorFold's Flash Next vision; video input and many images come from patch 0002): the model's
+# own vision tower, 0.84 GiB. Its ~0.8 GiB of scratch is taken only while an image or video encodes and handed
+# back right after, so startup reserves none for it (TENSORFOLD_VISION_WORKSPACE_MIB=0 below). VISION=0: text only.
 VISION="${VISION:-1}"
 VISION_URLS="${VISION_URLS:-0}"    # 1: also accept public https:// image and video URLs (default: data URLs only)
-# Images a request may carry (--vision-max-images; a chat's turns all count). They share TENSORFOLD_IMAGE_TOKENS.
-# Empty: TensorFold's own limit (4).
+# Images a request may carry (--vision-max-images; a chat's turns all count). They share the visual-token
+# budget (--vision-image-tokens, TENSORFOLD_IMAGE_TOKENS below). Empty: TensorFold's own limit (4).
 VISION_MAX_IMAGES="${VISION_MAX_IMAGES-${TENSORFOLD_MAX_IMAGES:-50}}"
 # MTP drafting: at most MTP_DRAFTS drafts a round, a chain stopping before a draft under MTP_CONFIDENCE.
 # Swept 2026-09-29 (identical output in every arm): 6/0.60 beat the stock 6/0.30 by ~3% on
@@ -67,35 +73,33 @@ THINKING="${THINKING:-1}"
 # can end a thinking reply before it answers (finish_reason "length", no content or tool call). The value is clamped
 # to the room left in the stream's window and reserves no memory; a request's own max_tokens wins.
 MAX_TOKENS="${MAX_TOKENS:-32768}"
-# TensorFold switches (start.sh passes every TENSORFOLD_* variable into the container).
-# Prompt piece rows. Unset, TensorFold v0.6.1 picks 2,048 with vision and 4,096 without (while nothing decodes,
-# if memory allows). With the n-gram tables on SSD (PLE_ON_SSD=1) 4,096 measured 10-30% slower from 5k to 16k
-# tokens and ~3% slower at 31k (2026-10-02), so this recipe keeps 2,048 there. TENSORFOLD_PREFILL_ROWS=N (256 to
-# 16,384, patch 0002) forces N-row pieces, admitted with the window; empty: TensorFold's choice.
-if [[ "$PLE_ON_SSD" == 1 ]]; then export TENSORFOLD_PREFILL_ROWS="${TENSORFOLD_PREFILL_ROWS-2048}"; fi
+# Prompt piece rows: unset, TensorFold v0.6.6 picks 2,048 with vision and 4,096 without (while nothing decodes,
+# if memory allows). TENSORFOLD_PREFILL_ROWS=N (256 to 16,384; upstream since v0.6.3, #238) forces N-row pieces,
+# admitted with the window.
 # What startup reserves for the vision tower's scratch (MiB); 0: it comes from the system reserve while it encodes.
 export TENSORFOLD_VISION_WORKSPACE_MIB="${TENSORFOLD_VISION_WORKSPACE_MIB:-0}"
-# The tokens a request's images share (VISION_MAX_IMAGES above), each image at most 4,096 (one image is sized as
-# before). The tower encodes them 16,384 patches at a time, the scratch one image needs.
+# The tokens a request's images share (--vision-image-tokens; VISION_MAX_IMAGES above), each image at most
+# 4,096. The tower encodes them 16,384 patches at a time, the scratch one image needs.
 export TENSORFOLD_IMAGE_TOKENS="${TENSORFOLD_IMAGE_TOKENS:-16384}"
 # The whole video's token budget (Qwen3-VL's per-frame sizing; 2 frames a second, at most 256 frames).
 export TENSORFOLD_VIDEO_TOKENS="${TENSORFOLD_VIDEO_TOKENS:-16384}"
 # Startup reserve (since v0.6.0): GiB left out of MemAvailable. Unset, TensorFold takes max(4 GiB, a tenth of RAM)
-# and refuses 5 x 262,144. The knob's floor is 2 GiB; that still fits the measured ~102.5 GiB admission.
+# and refuses 5 x 262,144. The knob's floor is 2 GiB; the NVFP4 checkpoint's default admits 83.07 GiB, so the floor
+# still fits it comfortably (the MLX checkpoint's 102.5 GiB admission was the tight one).
 export TENSORFOLD_MEMORY_RESERVE_GIB="${TENSORFOLD_MEMORY_RESERVE_GIB:-2}"
-# Prompt-lookup drafts ahead of MTP (patch 0007; with PARALLEL >= 2): +6% on replies that repeat the prompt, prose and
+# Prompt-lookup drafts ahead of MTP (patch 0002; with PARALLEL >= 2): +6% on replies that repeat the prompt, prose and
 # code unchanged. 0: off.
 export TENSORFOLD_MTP_COPY="${TENSORFOLD_MTP_COPY:-1}"
 # The draft list the language image serves (DRAFT_LANGUAGE above).
 [[ -z "$DRAFT_LANGUAGE" ]] || export TENSORFOLD_DRAFT_VOCAB="$DRAFT_LANGUAGE"
-# No "is there a newer TensorFold" call to GitHub at each start: the patches are for v0.6.1 anyway. 0: check.
+# No "is there a newer TensorFold" call to GitHub at each start: the patches are for v0.6.6 anyway. 0: check.
 export TENSORFOLD_NO_UPDATE_CHECK="${TENSORFOLD_NO_UPDATE_CHECK:-1}"
 
 HF_CACHE="${HF_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}}"
 # Persists compiled CUDA kernels (torch extensions + triton) so only the first start pays the compile.
 KERNEL_CACHE="${KERNEL_CACHE:-$HOME/.cache/tensorfold-qwen38}"
 
-MIN_FREE_GB="${MIN_FREE_GB:-125}"   # free disk the checkpoint download needs (it is ~114 GB)
+MIN_FREE_GB="${MIN_FREE_GB:-145}"   # free disk the checkpoint download needs (NVIDIA's is ~133 GB)
 IMAGE_FREE_GB="${IMAGE_FREE_GB:-35}"   # free disk under Docker's root that pulling or building the image needs
 
 # Colours only on a terminal.

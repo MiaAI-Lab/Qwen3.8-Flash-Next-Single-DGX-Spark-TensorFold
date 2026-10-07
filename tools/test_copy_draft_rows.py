@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Copy/MTP proposal-row ownership in MultiDecoder._draft_all, without loading the model.
 
-Patch 0007 drops copy-covered streams from `active` but left their compact MTP rows in `logits`.
+Copy drafts drop copy-covered streams from `active`, but their compact MTP rows stay in `logits`.
 `_picks` reads those rows sequentially, so a remaining stream can sample another stream's proposal.
-Patch 0010 compacts logits to the surviving todo ordinals. Residual `row` stays a buffer offset.
+The patch compacts logits to the surviving todo ordinals. Residual `row` stays a buffer offset.
 
 Usage:
   TF_SRC=/path/to/patched/src python3 tools/test_copy_draft_rows.py
 
-TF_SRC is TensorFold's `src` directory with this recipe's patches already applied (0002-0013 on v0.5.0).
+TF_SRC is TensorFold's `src` directory with this recipe's patches already applied (0002 + 0010 on v0.6.6).
 Exit code 1 if any case misaligns. This checks control-flow row ownership, not model accuracy.
 """
 from __future__ import annotations
@@ -92,6 +92,7 @@ def run_case(draft_all, copies, keeps, depth=1, samplings=None):
     streams = [t[0] for t in todo]
     decoder = NS(depth=depth, confidence=0.6, w=None,
                  mbuf=NS(streams=list(range(64))), buf=NS(streams=list(range(64))),
+                 _mtp=lambda segs: Rows(st.logit_id for st, _, _ in segs),
                  _picks=lambda logits, positions, smp: [(int(logits[i]), 1.0) for i in range(len(positions))])
     new = {s.sid: [2] for s in streams}
     draft_all(decoder, todo, new)

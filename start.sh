@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Serve Qwen3.8 Flash Next (Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP) with TensorFold on one DGX Spark, end to end:
-# runs scripts/prepare.sh when the image or the checkpoint is not ready yet (first run, or after patches change),
-# launches `tensorfold serve` on port 8888, waits until the OpenAI API answers, then runs a smoke test.
-# Stop it with ./stop.sh.
+# Serve Qwen3.8 Flash Next (nvidia/Qwen3.8-Flash-Next-NVFP4, NVIDIA ModelOpt NVFP4) with TensorFold on
+# one DGX Spark, end to end: runs scripts/prepare.sh when the image or the checkpoint is not ready yet (first run,
+# or after patches change), launches `tensorfold serve` on port 8888, waits until the OpenAI API answers, then runs
+# a smoke test. Stop it with ./stop.sh. (TensorFold/Qwen3.8-Flash-Next-MLX-4bit-MTP is the MLX fallback: MODEL_ID=...)
 #
 # Usage: ./start.sh [restart] [extra tensorfold serve args]
-#   ./start.sh                         # scripts/config.sh defaults: 5 streams x 262,144 tokens, int8 KV, --ple-on-ssd,
+#   ./start.sh                         # scripts/config.sh defaults: 5 streams x 262,144 tokens, int8 KV,
 #                                      # image and video input (--vision)
 #                                      # (if the server already runs, says so and leaves it alone)
 #   ./start.sh restart                 # stop the running server (./stop.sh), then start it again, e.g. to apply
@@ -17,9 +17,9 @@
 # Extra arguments come after the defaults, so they win (the last value of a flag counts).
 # Settings, from the environment or ./.env (KEY=value lines): PARALLEL, CONTEXT, KV_DTYPE, DRAFT_LANGUAGE, PLE_ON_SSD,
 #      VISION, VISION_URLS, VISION_MAX_IMAGES, MTP_DRAFTS, MTP_CONFIDENCE, TEMPERATURE, TOP_P, TOP_K, THINKING,
-#      MAX_TOKENS, SERVED_NAME, PORT, HOST, CONTAINER_NAME, IMAGE (see scripts/config.sh); TENSORFOLD_* (passed to the server);
-#      PREPARE (auto | 1 | 0); FOREGROUND=1 (stay attached, exit with the server's code); WAIT_TIMEOUT (seconds,
-#      default 1800); HF_HUB_OFFLINE=0 (let TensorFold reach the Hub; default serves from the local cache only)
+#      MAX_TOKENS, SERVED_NAME, PORT, HOST, CONTAINER_NAME, IMAGE (see scripts/config.sh); TENSORFOLD_* (passed to the
+#      server); PREPARE (auto | 1 | 0); FOREGROUND=1 (stay attached, exit with the server's code); WAIT_TIMEOUT
+#      (seconds, default 1800); HF_HUB_OFFLINE=0 (let TensorFold reach the Hub; default serves from the local cache only)
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source ./scripts/config.sh
@@ -42,6 +42,7 @@ SERVE_ARGS=(--name "$SERVED_NAME" --parallel "$PARALLEL" --context "$CONTEXT" --
 [[ "$VISION" == 1 ]] && SERVE_ARGS+=(--vision)
 [[ "$VISION" == 1 && "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)
 [[ "$VISION" == 1 && -n "$VISION_MAX_IMAGES" ]] && SERVE_ARGS+=(--vision-max-images "$VISION_MAX_IMAGES")
+[[ "$VISION" == 1 && -n "${TENSORFOLD_IMAGE_TOKENS:-}" ]] && SERVE_ARGS+=(--vision-image-tokens "$TENSORFOLD_IMAGE_TOKENS")
 if [[ "$THINKING" == 1 ]]; then SERVE_ARGS+=(--thinking); else SERVE_ARGS+=(--no-thinking); fi
 SERVE_ARGS+=("$@")
 # The effective value of a flag (its last occurrence, as --flag value or --flag=value).
@@ -95,7 +96,7 @@ fi
 # the first run, new patches, another model or image. PREPARE=1 forces it, PREPARE=0 skips it.
 step 1 "Setup: image and checkpoint"
 if [[ "${PREPARE:-auto}" == 1 || ( "${PREPARE:-auto}" != 0 && "$(prepared_state 2>/dev/null)" != "$(cat "$PREPARED_MARKER" 2>/dev/null)" ) ]]; then
-  log "Not ready yet: running scripts/prepare.sh (the first time this pulls the image and downloads ~106 GiB)"
+  log "Not ready yet: running scripts/prepare.sh (the first time this pulls the image and downloads ~133 GB)"
   ./scripts/prepare.sh
 else
   log "Ready: $IMAGE and $MODEL_ID${PREPARE:+ (PREPARE=$PREPARE)}"
@@ -121,14 +122,14 @@ fi
 if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then
   die "port $PORT is already in use: $(ss -ltnp "sport = :$PORT" 2>/dev/null | tail -n +2)"
 fi
-# TensorFold budgets MemAvailable minus TENSORFOLD_MEMORY_RESERVE_GIB (2 here). The default 5 x 262k int8 needs
-# ~85.4 GiB at startup and ~108 GiB with every stream at its full window; with less it refuses the window and names
-# one that fits.
+# TensorFold budgets MemAvailable minus TENSORFOLD_MEMORY_RESERVE_GIB (2 here). The default 5 x 262k int8 admits
+# 83.07 GiB (measured on the NVFP4 checkpoint) and grows every stream's cache as its context grows, to 5 x 4.47 GiB
+# (~22.4 GiB) at the full window; with less it refuses the window and names one that fits.
 avail_gb=$(free -g | awk '/^Mem:/ {print $7}')
-if (( avail_gb >= 103 )); then
+if (( avail_gb >= 100 )); then
   log "Arguments OK, port $PORT free, ${avail_gb} GiB memory available"
 else
-  warn "only ${avail_gb} GiB memory available (the default needs ~103): stop other GPU workloads (docker ps), or lower PARALLEL / CONTEXT"
+  warn "only ${avail_gb} GiB memory available (the default admits ~83 GiB and grows to ~106): stop other GPU workloads (docker ps), or lower PARALLEL / CONTEXT"
 fi
 
 # TensorFold's own switches from the environment (TENSORFOLD_*, e.g. TENSORFOLD_MTP_COPY) reach the server too.
@@ -156,7 +157,7 @@ if [[ "${FOREGROUND:-0}" == 1 ]]; then
 fi
 
 # ---------------------------------------------------------------- 4. load, with the server's log and a heartbeat
-step 4 "Loading: ~75 GiB of weights (~2.5 min; the very first start also compiles CUDA kernels)"
+step 4 "Loading: ~78 GiB of weights (the n-gram tables stay memory-mapped on the host; ~2.5 min; the very first start also compiles CUDA kernels)"
 # NVIDIA's container banner, without its license notice (GOVERNING TERMS ...), which stays visible
 NOISE='^\s*$|^=+$|^== PyTorch ==|^NVIDIA Release|Copyright|All rights reserved|PyTorch Version|Various files include|NOTE: CUDA Forward|Using CUDA|cuda-compatibility|Container image|torch/utils/_pytree\.py.*register_constant'
 # docker logs is the background job, so killing it ends the whole pipeline (no orphaned `docker logs -f`)
