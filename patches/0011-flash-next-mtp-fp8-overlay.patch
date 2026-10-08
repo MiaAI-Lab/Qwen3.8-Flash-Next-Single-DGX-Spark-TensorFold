@@ -1,0 +1,50 @@
+diff --git a/zig/src/families/flashnext/cuda_engine.zig b/zig/src/families/flashnext/cuda_engine.zig
+index 9f2ec3a..bfde11b 100644
+--- a/zig/src/families/flashnext/cuda_engine.zig
++++ b/zig/src/families/flashnext/cuda_engine.zig
+@@ -400,7 +400,10 @@ pub const Engine = struct {
+         // and MTP experts; lossy against the bf16 ones, opt-in)
+         var overlay_buf: [1024]u8 = undefined;
+         const overlay: ?[]const u8 = if (e.c.int4ar() and envGet("TF_FLASHNEXT_INT4AR_FAST") != null and !envOff("TF_FLASHNEXT_INT4AR_FAST")) try std.fmt.bufPrint(&overlay_buf, "{s}/fast-fp8", .{dir}) else null;
+-        e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp, .mode = .device, .driver = d, .overlay = overlay });
++        // TF_FLASHNEXT_MTP_FP8=DIR, an overlay of the MTP layer's bf16 linears on block FP8 (tools/mtp_fp8.py);
++        // the head only drafts, so the kept tokens are the target's either way
++        const overlay2: ?[]const u8 = if (o.mtp) envGet("TF_FLASHNEXT_MTP_FP8") else null;
++        e.w = try weights.load(gpa, io, dir, &e.c, .{ .rank = o.rank, .world = o.world, .mtp = o.mtp, .draft_head = o.mtp, .mode = .device, .driver = d, .overlay = overlay, .overlay2 = overlay2 });
+         errdefer e.w.deinit();
+         if (o.mtp and e.w.mtp == null) return error.NoMtpHead;
+         e.g = try geometry(&e.c, o.world, e.w.mtp != null);
+diff --git a/zig/src/families/flashnext/cuda_weights.zig b/zig/src/families/flashnext/cuda_weights.zig
+index e000172..04c2b28 100644
+--- a/zig/src/families/flashnext/cuda_weights.zig
++++ b/zig/src/families/flashnext/cuda_weights.zig
+@@ -52,6 +52,8 @@ pub const Options = struct {
+     /// a directory whose safetensors take precedence over the checkpoint's for the names they hold (INT4-AutoRound's
+     /// fast-fp8/: block-FP8 hyper-connections and MTP experts); the shadowed checkpoint tensors are read as nothing
+     overlay: ?[]const u8 = null,
++    /// a second overlay directory (TF_FLASHNEXT_MTP_FP8: the MTP layer's bf16 linears on block FP8, drafts only)
++    overlay2: ?[]const u8 = null,
+     threads: u32 = 16,
+     /// drop the checkpoint's pages once a layer's tensors are on the device (Python's reader.release)
+     release_pages: bool = true,
+@@ -1359,7 +1361,9 @@ const Loader = struct {
+             lw.gdn = if (int4ar and try L.isFp8(try L.nameOf("{s}.in_proj_qkv", .{nm}))) try L.gdn8(try std.fmt.bufPrint(&pb, "{s}.gdn", .{path}), nm) else try L.gdn(try std.fmt.bufPrint(&pb, "{s}.gdn", .{path}), nm);
+         } else {
+             const nm = try std.fmt.bufPrint(&nb, "{s}.self_attn", .{base});
+-            lw.attn = if (int4ar and try L.isFp8(try L.nameOf("{s}.q_proj", .{nm}))) try L.attention8(try std.fmt.bufPrint(&pb, "{s}.attn", .{path}), nm) else try L.attention(try std.fmt.bufPrint(&pb, "{s}.attn", .{path}), nm);
++            // the MTP layer too when an overlay (TF_FLASHNEXT_MTP_FP8) holds its q/k/v/o on block FP8
++            const fp8_attn = (int4ar or (i < 0 and L.c.int4ar())) and try L.isFp8(try L.nameOf("{s}.q_proj", .{nm}));
++            lw.attn = if (fp8_attn) try L.attention8(try std.fmt.bufPrint(&pb, "{s}.attn", .{path}), nm) else try L.attention(try std.fmt.bufPrint(&pb, "{s}.attn", .{path}), nm);
+         }
+         lw.moe = if (int4ar) try L.moe8(try std.fmt.bufPrint(&pb, "{s}.moe", .{path}), try std.fmt.bufPrint(&nb, "{s}.mlp", .{base})) else try L.moe(try std.fmt.bufPrint(&pb, "{s}.moe", .{path}), try std.fmt.bufPrint(&nb, "{s}.mlp", .{base}), i < 0);
+         if (with_ple and i >= 0) if (L.c.pleIndex(@intCast(i))) |pi| {
+@@ -1484,6 +1488,9 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const Confi
+     defer L.deinit();
+     L.prefix = if (L.has("language_model.model.embed_tokens.weight")) "language_model." else "";
+     try L.openExtra(dir);
++    // the first overlay holding a name wins (Loader.get): overlay2 first, since fast-fp8/'s extra tensors repeat the
++    // MTP layer's bf16 linears that overlay2 replaces
++    if (o.overlay2) |ov| try L.openOverlay(ov);
+     if (o.overlay) |ov| try L.openOverlay(ov);
+     L.mbase = if (L.has(try L.nameOf("{s}model.language_model.embed_tokens.weight", .{L.prefix}))) "model.language_model." else "model.";
+ 

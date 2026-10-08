@@ -214,5 +214,18 @@ print("qwen4_exp, AutoRound int4 g%s, %d n-gram table files, %d tensors in %d sh
 snap="$dir/snapshots/$rev"
 info=$(python3 -I -c "$CHECK_PY" "$snap" 2>&1) || die "the checkpoint at $snap is not ready: $info"
 log "Checkpoint OK: $info"
+if [[ "$MTP_FP8" == 1 ]]; then
+  sub=$(mtp_fp8_sub)
+  if [[ -f "$HF_CACHE/$sub/mtp-fp8.safetensors" ]]; then
+    log "MTP FP8 overlay: $HF_CACHE/$sub (present)"
+  else
+    log "Writing the MTP layer's linears on block FP8 (tools/mtp_fp8.py) into $HF_CACHE/$sub"
+    mkdir -p "$HF_CACHE/$sub"
+    docker run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD/tools":/tools:ro \
+      -v "$HF_CACHE":/hf --entrypoint python3 "$IMAGE" /tools/mtp_fp8.py \
+      "/hf/hub/models--${MODEL_ID//\//--}/snapshots/$rev" "/hf/$sub" ||
+      die "tools/mtp_fp8.py failed (MTP_FP8=0 serves without the overlay)"
+  fi
+fi
 prepared_state > "$PREPARED_MARKER"
 log "Done. Start the server with ./start.sh (port $PORT)."
