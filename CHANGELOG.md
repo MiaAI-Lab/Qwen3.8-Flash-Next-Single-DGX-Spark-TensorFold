@@ -3,40 +3,16 @@
 Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:zig-db28187`, built by
 `scripts/prepare.sh` from TensorFold `db281878` plus `patches/`.
 
-## Unreleased: engine `37763df` (the two-Spark recipe's v1.1 fixes)
+## [1.0.0] - 2026-10-08
 
-Merged into `zig-single` as `453439d`. `patches/0001`–`0009` are that tree against TensorFold `db281878`.
-`zig/src/cuda/graph.zig` ships in `patches/0001-build-registry-server.patch`. The kernel set is unchanged.
-Local image `tensorfold-qwen38:zig-db28187` label `tf.patches` is `4144696f21e3`
-(`sha256:68bff44f627d2a1fc7dd980354ad7bde22cdf5bd41675f8cc3bc2ba9c0b60edc`; the previous image was `d84d7cc22655`).
-Published as `ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold:zig-db28187-4144696f21e3` and `:latest`
-(`sha256:cb98098439d95d2bff27bc771ba180e5857613ecc41f6b6e81e494782df9433a`).
-The kernel-set check passed: 320 kernels, `KERNEL_SOURCE_MTIME=1791318675`.
+TensorFold's Zig engine (`tensorfold-native`, TP=1). Engine `37763df`, merged into `zig-single` as `453439d`
+(owner build `20e709a` plus the graph-failure fallback and the full-window admission fix). `patches/0001`–`0009`
+are that tree against TensorFold `db281878`. `zig/src/cuda/graph.zig` ships in
+`patches/0001-build-registry-server.patch`. The kernel set is unchanged (`KERNEL_SOURCE_MTIME=1791318675`; the
+kernel-set check passed, 320 kernels).
 
-### Fixed
-- **A server exit under long load.** A CUDA graph capture, instantiate or upload that fails now leaves the round's
-  result from its eager run in place (same bits), pauses graph captures for a while (64 rounds, doubling on repeated
-  failures, up to 4096), and logs a warning. The server keeps serving. `TF_FLASHNEXT_GRAPH_LOG=1` logs the graph
-  counts and a context-wide check before each instantiate. It is off by default. The two-Spark stack hit
-  `cuGraphInstantiateWithFlags: CUDA_ERROR_NOT_PERMITTED` after about 15 minutes of heavy load; this server runs the
-  same engine.
-- **Requests that fill the window exactly were refused**
-  ([#1](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/issues/1),
-  [#2](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/pull/2), reported, diagnosed and fixed by
-  [321sssrt-bit](https://github.com/321sssrt-bit)): admission counted the draft window against `--context`, so a
-  prompt plus `max_tokens` equal to the window got `PromptTooLong`. The engine already keeps those rows beyond the
-  window; admission now checks prompt + reply against `--context`.
-
-### Added
-- `tools/context_boundary.py` (by [321sssrt-bit](https://github.com/321sssrt-bit), from
-  [PR #2](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/pull/2)): full prompt/reply budgets
-  succeed with drafts on and off, one token over the window returns HTTP 400.
-
-## Unreleased: INT4-AutoRound, FP8 KV, image and video
-
-The serving path is TensorFold's Zig engine (`tensorfold-native`, TP=1). The engine is `37763df` (owner build
-`20e709a` plus the graph-failure fallback and the full-window admission fix), merged into `zig-single` as `453439d`.
-`patches/0001`–`0009` are that tree against TensorFold `db281878`.
+Image `ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold:zig-db28187-4144696f21e3` and `:latest`
+(`sha256:cb98098439d95d2bff27bc771ba180e5857613ecc41f6b6e81e494782df9433a`). Label `tf.patches` is `4144696f21e3`.
 
 ### Upgrade from the Python recipe
 
@@ -62,10 +38,29 @@ The serving path is TensorFold's Zig engine (`tensorfold-native`, TP=1). The eng
   which holds six full 262,144-token windows. A request that would not fit is refused. `TF_FLASHNEXT_PRODUCT_STREAMS`
   is 2.
 
-### Earlier Zig boot (still the measured tables in the README)
+### Fixed
+- **A server exit under long load.** A CUDA graph capture, instantiate or upload that fails now leaves the round's
+  result from its eager run in place (same bits), pauses graph captures for a while (64 rounds, doubling on repeated
+  failures, up to 4096), and logs a warning. The server keeps serving. `TF_FLASHNEXT_GRAPH_LOG=1` logs the graph
+  counts and a context-wide check before each instantiate. It is off by default. The two-Spark stack hit
+  `cuGraphInstantiateWithFlags: CUDA_ERROR_NOT_PERMITTED` after about 15 minutes of heavy load; this server runs the
+  same engine.
+- **Requests that fill the window exactly were refused**
+  ([#1](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/issues/1),
+  [#2](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/pull/2), reported, diagnosed and fixed by
+  [321sssrt-bit](https://github.com/321sssrt-bit)): admission counted the draft window against `--context`, so a
+  prompt plus `max_tokens` equal to the window got `PromptTooLong`. The engine already keeps those rows beyond the
+  window; admission now checks prompt + reply against `--context`.
+
+### Added
+- `tools/context_boundary.py` (by [321sssrt-bit](https://github.com/321sssrt-bit), from
+  [PR #2](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/pull/2)): full prompt/reply budgets
+  succeed with drafts on and off, one token over the window returns HTTP 400.
+
+### Earlier Zig boot
 
 Engine `6eb39c1`, bf16 KV, text only, spark4: prose 63.3 / 95.4 / 118.5 / 148.6 tok/s at 1 / 2 / 3 / 4 requests.
-Sequence memory on that boot was 33.28 GiB. Those tables are replaced when the FP8 + vision boot is measured.
+Sequence memory on that boot was 33.28 GiB. The README's current tables are the later FP8 and vision boot.
 
 ## Python recipe, through 0.6.0
 
@@ -198,7 +193,7 @@ Commit `7893602`. TensorFold **v0.3.6.2**. Image `v0.3.6.2-b3fd6cff9b72`.
 - `tools/bench.py`, `tools/needle.py`, `tools/toolcheck.py`.
 - `.github`: Sponsors, issue and PR templates.
 
-[Unreleased]: https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/compare/v0.6.0...HEAD
+[1.0.0]: https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/compare/v0.6.0...HEAD
 [0.6.0]: https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/compare/v0.4.0...v0.4.1
