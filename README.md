@@ -296,6 +296,7 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `PORT` / `HOST` | `8888` / `0.0.0.0` | where the API listens |
 | `KV_DTYPE` | `fp8` | lossy (~98.8% top-1 agreement with bf16, about 1.8x the pool). `bf16` is exact. Works with `VISION=1`. Adapted from MiaAI-Lab's GLM recipe patch `0038-glm-kv-fp8` |
 | `TENSORFOLD_MEMORY_RESERVE_GIB` | `10` | kept free when the engine sizes the pool. `prepare.sh` and `start.sh` refuse a Spark below this |
+| `TF_FLASHNEXT_CONFIDENCE` | `-0.15` | the running-product stop: a draft chain stops once its drafts' joint chance falls under 0.15 (the engine's own `-0.4` was tuned at TP=2). Drafts only; replies match |
 | `TF_FLASHNEXT_PRODUCT_STREAMS` | `2` | running-product draft stop at this many streams or fewer; confidence 0.5 above it |
 | `TF_FLASHNEXT_PREFILL_TAIL` | `512` | a short last prompt chunk joins the previous one |
 | `MODEL_REVISION` | `14642741…` | the checkpoint commit this recipe serves |

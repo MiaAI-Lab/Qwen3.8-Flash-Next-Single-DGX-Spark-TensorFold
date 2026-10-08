@@ -69,9 +69,11 @@ PARALLEL="${PARALLEL:-8}"
 # MTP: up to this many drafts a round, kept while confidence stays at least this. Drafts are checked, so replies match
 # serial decoding. PROVISIONAL with the gated engine (6eb39c1).
 export TF_FLASHNEXT_DEPTH="${TF_FLASHNEXT_DEPTH:-15}"
-# Unset TF_FLASHNEXT_CONFIDENCE: the engine uses the running product (-0.4) while at most
-# TF_FLASHNEXT_PRODUCT_STREAMS streams are live, and confidence 0.5 above that. Setting
-# TF_FLASHNEXT_CONFIDENCE=0.5 forces the per-draft rule at every width.
+# The drafts' stop rule: a running product of the drafts' chances, the chain stopping once it falls under
+# -TF_FLASHNEXT_CONFIDENCE, while at most TF_FLASHNEXT_PRODUCT_STREAMS streams are live; confidence 0.5 a draft above
+# that. The engine's own default (-0.4) was tuned at TP=2; on one Spark -0.15 drafts deeper and decodes faster (README
+# "Configuration"). TF_FLASHNEXT_CONFIDENCE=0.5 forces the per-draft rule at every width. Drafts only: replies match.
+export TF_FLASHNEXT_CONFIDENCE="${TF_FLASHNEXT_CONFIDENCE:--0.15}"
 export TF_FLASHNEXT_PRODUCT_STREAMS="${TF_FLASHNEXT_PRODUCT_STREAMS:-2}"
 export TF_FLASHNEXT_PREFILL_TAIL="${TF_FLASHNEXT_PREFILL_TAIL:-512}"
 # KV cache (--kv-dtype). fp8 is the default: about 1.84x the pool of bf16, and lossy (~98.8% top-1 agreement with a

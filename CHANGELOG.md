@@ -3,6 +3,12 @@
 Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:zig-db28187`, built by
 `scripts/prepare.sh` from TensorFold `db281878` plus `patches/`.
 
+## Unreleased
+
+- `TF_FLASHNEXT_CONFIDENCE` defaults to `-0.15` (was unset: the engine's `-0.4`, tuned at TP=2). The running-product
+  draft stop at up to two live streams lets chains run deeper on one Spark: decode +10% (prose) and +3% (code) at one
+  client, +7% and +1% at two, replies byte-identical (it changes only where a draft chain stops).
+
 ## [1.0.0] - 2026-10-08
 
 TensorFold's Zig engine (`tensorfold-native`, TP=1). Engine `37763df`, merged into `zig-single` as `453439d`
