@@ -74,6 +74,10 @@ export TF_FLASHNEXT_DEPTH="${TF_FLASHNEXT_DEPTH:-15}"
 # TF_FLASHNEXT_CONFIDENCE=0.5 forces the per-draft rule at every width.
 export TF_FLASHNEXT_PRODUCT_STREAMS="${TF_FLASHNEXT_PRODUCT_STREAMS:-2}"
 export TF_FLASHNEXT_PREFILL_TAIL="${TF_FLASHNEXT_PREFILL_TAIL:-512}"
+# The MTP layer's bf16 linears (attention, hyper-connections) on block FP8 for drafting (patches/0011): prepare.sh
+# writes them with tools/mtp_fp8.py into $HF_CACHE/tensorfold-mtp-fp8/, start.sh passes TF_FLASHNEXT_MTP_FP8. Drafts
+# only, so replies match; MTP_FP8=0 drafts from the checkpoint's bf16 layer.
+MTP_FP8="${MTP_FP8:-1}"
 # KV cache (--kv-dtype). fp8 is the default: about 1.84x the pool of bf16, and lossy (~98.8% top-1 agreement with a
 # bf16 cache, so a free-running reply can differ). bf16 is exact: KV_DTYPE=bf16. FP8 works together with --vision.
 KV_DTYPE="${KV_DTYPE:-fp8}"
@@ -142,6 +146,8 @@ snapshot_rev() {
   if [[ -n "$MODEL_REVISION" ]]; then echo "$MODEL_REVISION"
   else cat "$(model_cache_dir)/refs/main" 2>/dev/null; fi
 }
+# The MTP FP8 overlay of the pinned checkpoint, relative to the HF cache (start.sh mounts the cache read-only)
+mtp_fp8_sub() { echo "tensorfold-mtp-fp8/${MODEL_ID//\//--}/$(snapshot_rev)"; }
 
 PREPARED_MARKER="$STATE_DIR/prepared"
 prepared_state() {
@@ -149,5 +155,9 @@ prepared_state() {
   hash=$(image_hash)
   label=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo missing)
   rev=$(snapshot_rev)
-  echo "model=$MODEL_ID@$rev image=$label patches=$hash"
+  local fp8=off
+  if [[ "$MTP_FP8" == 1 ]]; then
+    if [[ -f "$HF_CACHE/$(mtp_fp8_sub)/mtp-fp8.safetensors" ]]; then fp8=present; else fp8=missing; fi
+  fi
+  echo "model=$MODEL_ID@$rev image=$label patches=$hash mtp_fp8=$fp8"
 }

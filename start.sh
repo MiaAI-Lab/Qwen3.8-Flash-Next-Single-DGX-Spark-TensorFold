@@ -12,7 +12,7 @@
 #   DRY_RUN=1 ./start.sh               # print the docker command and exit
 # Extra arguments go to tensorfold-native serve after the defaults, so they win.
 # Settings, from the environment or ./.env (scripts/config.sh):
-#   serving  CONTEXT, PARALLEL, MAX_TOKENS, THINKING, DRAFTS, TEMPERATURE, TOP_P, TOP_K, SERVED_NAME, HOST, PORT
+#   serving  CONTEXT, PARALLEL, MAX_TOKENS, THINKING, DRAFTS, MTP_FP8, TEMPERATURE, TOP_P, TOP_K, SERVED_NAME, HOST, PORT
 #   files    MODEL_ID, MODEL_REVISION, HF_CACHE, KERNEL_CACHE, STATE_DIR
 #   image    IMAGE, TF_REPO, TF_REF, ZIG_VERSION, BASE_IMAGE, GHCR_IMAGE, CONTAINER_NAME
 #   setup    PREPARE (auto | 1 | 0), PULL, FOREGROUND=1, WAIT_TIMEOUT, DRY_RUN=1, MEM_NEED_GIB, MEM_CHECK=0
@@ -34,7 +34,7 @@ for arg in "$@"; do [[ "$arg" == -h || "$arg" == --help ]] && { usage; exit 0; }
 [[ "$CONTEXT" =~ ^[1-9][0-9]*$ && "$CONTEXT" -le 1048576 ]] || die "CONTEXT is a token count up to 1048576, not $CONTEXT"
 [[ "$PARALLEL" =~ ^([1-9]|1[0-6])$ ]] || die "PARALLEL is 1 to 16, not $PARALLEL"
 [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] || die "MAX_TOKENS is a token count, not $MAX_TOKENS"
-for v in THINKING DRAFTS VISION VISION_URLS; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
+for v in THINKING DRAFTS VISION VISION_URLS MTP_FP8; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
 [[ "$TF_FLASHNEXT_YARN" =~ ^(0|4)$ ]] || die "TF_FLASHNEXT_YARN is 0 or 4, not $TF_FLASHNEXT_YARN"
 (( CONTEXT <= 262144 || TF_FLASHNEXT_YARN != 0 )) || die "CONTEXT=$CONTEXT is past 262,144: it needs YaRN (TF_FLASHNEXT_YARN=4)"
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
@@ -164,6 +164,15 @@ fi
 full=$(kv_gib "$(arg_value --context)")
 if (( PARALLEL * full + 66 + TENSORFOLD_MEMORY_RESERVE_GIB > 121 )); then
   warn "$PARALLEL full windows are ~$((PARALLEL * full)) GiB of $KV_DTYPE cache beside ~66 GiB of weights: the engine keeps $TENSORFOLD_MEMORY_RESERVE_GIB GiB free and refuses a request that would not fit"
+fi
+# MTP_FP8=1: the drafts' MTP layer on block FP8 (patches/0011), from the overlay prepare.sh wrote under the HF cache
+if [[ "$MTP_FP8" == 1 && "$DRAFTS" == 1 && -z "${TF_FLASHNEXT_MTP_FP8:-}" ]]; then
+  if [[ -f "$HF_CACHE/$(mtp_fp8_sub)/mtp-fp8.safetensors" ]]; then
+    TF_FLASHNEXT_MTP_FP8="/root/.cache/huggingface/$(mtp_fp8_sub)"
+    export TF_FLASHNEXT_MTP_FP8
+  else
+    warn "MTP_FP8=1 but $HF_CACHE/$(mtp_fp8_sub) has no overlay: drafting from the bf16 layer (run scripts/prepare.sh)"
+  fi
 fi
 
 ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" -e TENSORFOLD_CUDA_KERNELS="$KERNELS_PATH")

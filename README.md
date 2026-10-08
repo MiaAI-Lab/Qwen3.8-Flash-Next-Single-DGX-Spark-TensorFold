@@ -283,6 +283,7 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `PARALLEL` | `8` | requests decoded together. One that would not fit (prompt plus `max_tokens`) is refused |
 | `CONTEXT` | `262144` | prompt + reply window. `1048576` turns on YaRN factor 4 |
 | `DRAFTS` | `1` | MTP drafts; `0` passes `--no-drafts` |
+| `MTP_FP8` | `1` | the drafts' MTP layer on block FP8 (`patches/0011`): `prepare.sh` writes the overlay with `tools/mtp_fp8.py` into `$HF_CACHE/tensorfold-mtp-fp8/`. Drafts only; replies match. `0` drafts from the bf16 layer |
 | `TF_FLASHNEXT_DEPTH` | `15` | drafts a round. The stop rule is the engine's hybrid (see `TF_FLASHNEXT_PRODUCT_STREAMS`) |
 | `TEMPERATURE` / `TOP_P` / `TOP_K` | `1.0` / `0.95` / `20` | default sampling; a request's own values win |
 | `THINKING` | `1` | think before answering; `0` passes `--no-thinking` |
@@ -330,9 +331,15 @@ the model was still thinking.
 
 ## What the patches are
 
-`patches/*.patch` is the Zig Flash Next CUDA engine against TensorFold `db281878` (the `zig-flashnext` pin), applied
-with `git apply` in the checkout root. They are the engine, not speed patches on a Python package. Drafts are still
-checked: a drafted reply matches `"draft": false`.
+`patches/0001`-`0009` are the Zig Flash Next CUDA engine against TensorFold `db281878` (the `zig-flashnext` pin),
+applied with `git apply` in the checkout root. They are the engine, not speed patches on a Python package. Drafts are
+still checked: a drafted reply matches `"draft": false`.
+
+Speed patches on top of the engine (each keeps every reply byte-identical):
+
+| Patch | What it changes |
+| --- | --- |
+| `0011-flash-next-mtp-fp8-overlay` | `TF_FLASHNEXT_MTP_FP8=DIR`: a second overlay, read before the checkpoint's `fast-fp8/`, and the MTP layer's attention taken on block FP8 when the overlay holds it. With `tools/mtp_fp8.py`'s file the MTP layer's bf16 linears (~139 MB read a draft step) become ~70 MB of block FP8. The MTP head only drafts, so replies do not change |
 
 ## Checks
 
