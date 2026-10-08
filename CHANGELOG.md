@@ -3,6 +3,13 @@
 Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:zig-db28187`, built by
 `scripts/prepare.sh` from TensorFold `db281878` plus `patches/`.
 
+## Unreleased
+
+- `patches/0010-flash-next-argmax-lse-rows`: the greedy pick and the logsumexp maxima over a vocabulary row run on
+  1024 threads a row instead of 256 (one block reads the row; 256 threads read a 248,320-column row at about 8 GB/s).
+  The pick and the maxima do not depend on which thread reads which column, so every reply stays byte-identical.
+  Decode +0.3 to +1% at 1-4 clients..
+
 ## [1.0.0] - 2026-10-08
 
 TensorFold's Zig engine (`tensorfold-native`, TP=1). Engine `37763df`, merged into `zig-single` as `453439d`

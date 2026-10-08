@@ -1,0 +1,60 @@
+diff --git a/zig/kernels/cuda/torch_ops/fn_logsumexp.cu b/zig/kernels/cuda/torch_ops/fn_logsumexp.cu
+index a25e08c..56e0c52 100644
+--- a/zig/kernels/cuda/torch_ops/fn_logsumexp.cu
++++ b/zig/kernels/cuda/torch_ops/fn_logsumexp.cu
+@@ -74,14 +74,26 @@ __device__ float tf_lse_warp_tree(float v, float* shared) {
+ 
+ }  // namespace
+ 
+-// Row maxima with NaN winning, then |max| == inf set to 0 (torch's masked_fill before the subtraction).
++// Row maxima with NaN winning, then |max| == inf set to 0 (torch's masked_fill before the subtraction). Any block of
++// up to 1024 threads (a power of two): a maximum is the same whichever thread reads which column (launched with
++// 1024, four loads in flight a thread, where 256 threads read one row at a time and a draft-vocabulary row took ~50 us).
+ extern "C" __global__ void tf_fn_lse_max_kernel(const float* x, float* maxes, uint32_t rows, uint32_t n) {
+-    __shared__ float best[256];
++    __shared__ float best[1024];
+     const uint32_t row = blockIdx.x;
+     if (row >= rows) return;
+     float m = -INFINITY;
+-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+-        const float v = x[uint64_t(row) * n + i];
++    const float* r = x + uint64_t(row) * n;
++    const uint32_t step = blockDim.x;
++    uint32_t i = threadIdx.x;
++    for (; i + 3 * step < n; i += 4 * step) {
++        float v[4];
++#pragma unroll
++        for (int u = 0; u < 4; ++u) v[u] = r[i + u * step];
++#pragma unroll
++        for (int u = 0; u < 4; ++u) m = (v[u] != v[u] || m != m) ? (m != m ? m : v[u]) : fmaxf(m, v[u]);
++    }
++    for (; i < n; i += step) {
++        const float v = r[i];
+         m = (v != v || m != m) ? (m != m ? m : v) : fmaxf(m, v);
+     }
+     best[threadIdx.x] = m;
+diff --git a/zig/src/families/flashnext/cuda_torch_ops.zig b/zig/src/families/flashnext/cuda_torch_ops.zig
+index ea76a57..c2f5bd6 100644
+--- a/zig/src/families/flashnext/cuda_torch_ops.zig
++++ b/zig/src/families/flashnext/cuda_torch_ops.zig
+@@ -150,7 +150,7 @@ pub const Lse = struct {
+         a.add(maxes);
+         a.add(@as(u32, @intCast(rows)));
+         a.add(@as(u32, @intCast(n)));
+-        try t.go(l.max, .{ rows, 1 }, 256, &a);
++        try t.go(l.max, .{ rows, 1 }, 1024, &a); // fn_logsumexp.cu: any power of two to 1024, the same maxima
+         var b: cuda.Args = .{};
+         for ([_]u64{ in, maxes, partial }) |v| b.add(v);
+         for ([_]usize{ rows, n, c.ctas, @intFromBool(c.split) }) |v| b.add(@as(u32, @intCast(v)));
+@@ -310,7 +310,10 @@ pub const Torch = struct {
+         a.add(out);
+         for ([_]usize{ rows, vocab, ld }) |v| a.add(@as(i64, @intCast(v)));
+         a.add(@as(i32, 0)); // dtype 0: bf16
+-        try t.go(t.f.argmax, .{ rows, 1 }, 256, &a);
++        // 1024 threads (the kernel's launch bound), not 256: a row is one block, and 256 threads read a 248,320-column
++        // row at ~8 GB/s; the pick is a total order (the first maximum, a NaN first), so every thread count returns
++        // the same index
++        try t.go(t.f.argmax, .{ rows, 1 }, 1024, &a);
+     }
+ 
+     /// torch.topk(rows of fp32 `columns` wide, k, sorted=False): values [rows, k] fp32 and int64 columns, in
