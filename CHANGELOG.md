@@ -3,6 +3,13 @@
 Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:zig-db28187`, built by
 `scripts/prepare.sh` from TensorFold `db281878` plus `patches/`.
 
+## Unreleased
+
+- `patches/0013-flash-next-copy-window` and `TF_FLASHNEXT_WINDOW=64` (the default): a lone stream's verify window
+  holds 64 rows, so copied continuations (file edits, verbatim repeats) grow 15 -> 31 -> 63 rows; the MTP chain stays
+  at `TF_FLASHNEXT_DEPTH`. One client: file copies 2.3x, one-word rewrites +54%, one-line edits +84%; prose and code
+  decode unchanged; every reply byte-identical. `16` is the old window.
+
 ## [1.0.0] - 2026-10-08
 
 TensorFold's Zig engine (`tensorfold-native`, TP=1). Engine `37763df`, merged into `zig-single` as `453439d`
