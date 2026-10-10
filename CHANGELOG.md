@@ -3,6 +3,14 @@
 Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:zig-db28187`, built by
 `scripts/prepare.sh` from TensorFold `db281878` plus `patches/`.
 
+## Unreleased
+
+- `patches/0012-flash-next-ngram-host-gather` and `TF_FLASHNEXT_NGRAM_THREADS=32`, `_PREFETCH=1`, `_RANDOM=1`
+  (the defaults): at one Spark the n-gram table's rows are gathered by a 32-thread gang, rows are touched ahead of
+  their chunk or draft, and the table's mappings are `MADV_RANDOM`. Cold prompts of new text 2-9x faster (8k 19-26 s
+  -> 3.0 s, 128k 100 s -> 50 s), decode of new text at four clients +27%; warm prompts unchanged, every reply
+  byte-identical.
+
 ## [1.0.0] - 2026-10-08
 
 TensorFold's Zig engine (`tensorfold-native`, TP=1). Engine `37763df`, merged into `zig-single` as `453439d`

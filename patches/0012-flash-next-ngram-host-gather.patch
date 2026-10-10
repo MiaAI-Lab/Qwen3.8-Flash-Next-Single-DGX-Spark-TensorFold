@@ -1,0 +1,509 @@
+diff --git a/zig/src/families/flashnext/cuda_engine.zig b/zig/src/families/flashnext/cuda_engine.zig
+index bfde11b..c3bea72 100644
+--- a/zig/src/families/flashnext/cuda_engine.zig
++++ b/zig/src/families/flashnext/cuda_engine.zig
+@@ -26,6 +26,7 @@ const fwd = @import("cuda_forward.zig");
+ const fp8 = @import("cuda_fp8.zig");
+ const int4 = @import("cuda_int4.zig");
+ const mtp = @import("cuda_mtp.zig");
++const ngh = @import("cuda_ngram_host.zig");
+ const vmm = @import("cuda_vmm.zig");
+ const nucleus = @import("cuda_nucleus.zig");
+ const profs = @import("cuda_prof.zig");
+@@ -433,6 +434,17 @@ pub const Engine = struct {
+         errdefer e.memo.deinit();
+         e.f = try fwd.Forward.init(gpa, d, e.stream, .{ .k = &e.k, .s = e.stream }, .{ .set = &e.set, .s = e.stream, .memo = &e.memo }, th, &e.w, &e.c, e.g, e.dims, e.prefill_rows + e.prefill_tail);
+         errdefer e.f.deinit();
++        // one GPU: the host-mapped n-gram table's gather over a gang of threads, its prefetch queue and MADV_RANDOM
++        // (cuda_ngram_host.zig; env TF_FLASHNEXT_NGRAM_*, unset: the stock gather on this thread)
++        if (e.w.table) |*tab| if (tab.gpu == null) {
++            const no = try ngh.Options.fromEnv();
++            if (no.random) tab.adviseRandom();
++            if (no.threads > 0) for (e.w.layers) |l| if (l.ple) |p| {
++                e.f.ngh = try ngh.Host.create(gpa, io, tab, p.ngram, no);
++                break;
++            };
++        };
++        errdefer if (e.f.ngh) |h| h.destroy();
+         e.f.comm = o.comm;
+         // decode rounds' DeltaNet scratch: every stream's window rows, two rounds' kept inputs
+         try e.f.initRound(rows, @max(1, o.streams));
+@@ -642,6 +654,8 @@ pub const Engine = struct {
+             cs.deinit();
+             for (&e.f.cs_ev) |*ev| ev.deinit();
+         }
++        if (e.f.ngh) |h| h.destroy();
++        e.f.ngh = null;
+         e.f.deinit();
+         e.pbuf.deinit();
+         if (e.mbuf) |*m| m.deinit();
+@@ -927,8 +941,18 @@ pub const Engine = struct {
+         if (e.pass_times) pw[0] += try e.passLap(&t_pw);
+         var kept: ?*Snapshot = null;
+         errdefer if (kept) |k| e.freeSnapshot(k);
++        errdefer if (e.f.ngh) |h| h.dropTouches(); // a pass that failed leaves no rows queued for the next one
+         var chunk: usize = 0;
++        // the prompt's n-gram rows touched ahead of their chunks (cuda_ngram_host.zig): chunk 0 is gathered at once
++        // by the gang, the next `ahead` chunks are queued now, each later chunk when it is `ahead` chunks away
++        var queued: usize = start;
+         while (start < prompt.len) : (chunk += 1) {
++            if (e.f.ngh) |h| if (h.o.prefetch) {
++                const to = @min(prompt.len, start + (h.o.ahead + 1) * e.prefill_rows);
++                const from = @max(queued, e.chunkEnd(start, prompt.len));
++                if (to > from) h.touchPrompt(prompt, from, to);
++                queued = @max(queued, to);
++            };
+             var end = e.chunkEnd(start, prompt.len);
+             if (o.keep_at) |k| if (start < k and k < end) {
+                 end = k;
+@@ -1093,6 +1117,8 @@ pub const Engine = struct {
+         kept: ?*Snapshot = null,
+         done: bool = false,
+         first: u32 = 0,
++        /// prompt tokens before this were queued for the n-gram prefetch (cuda_ngram_host.zig)
++        queued: usize = 0,
+     };
+ 
+     /// prefillWith's start (reset, or restore and the MTP tail absorbed) for a prompt that then fills in slices.
+@@ -1121,6 +1147,7 @@ pub const Engine = struct {
+ 
+     pub fn fillFree(e: *Engine, fl: *Fill) void {
+         if (e.pfill == fl) e.pfill = null;
++        if (!fl.done) if (e.f.ngh) |h| h.dropTouches(); // a cancelled fill: its rows ahead are not wanted
+         if (fl.kept) |k| e.freeSnapshot(k);
+         e.gpa.free(fl.prompt);
+         e.gpa.destroy(fl);
+@@ -1141,6 +1168,13 @@ pub const Engine = struct {
+                 if (e.pfill != null and e.pfill.? != fl) return error.PromptBuffersBusy;
+                 e.pfill = fl;
+                 var end = e.chunkEnd(fl.start, fl.prompt.len);
++                if (e.f.ngh) |h| if (h.o.prefetch) {
++                    // as prefillWith: the next `ahead` chunks' rows touched while this one computes
++                    const to = @min(fl.prompt.len, fl.start + (h.o.ahead + 1) * e.prefill_rows);
++                    const from = @max(@max(fl.queued, fl.start), end);
++                    if (to > from) h.touchPrompt(fl.prompt, from, to);
++                    fl.queued = @max(fl.queued, to);
++                };
+                 if (fl.keep_at) |k| if (fl.start < k and k < end) {
+                     end = k;
+                 };
+@@ -1443,6 +1477,9 @@ pub const Engine = struct {
+         // each stream's stop rule (cuda_decode.Stop: per draft, running product or none), as its solo chain's
+         var stops: [64]decode.Stop = undefined;
+         for (reqs, 0..) |r, i| stops[i] = .{ .c = r.confidence };
++        // the next window's rows touched ahead of its stage: its pending token now (its predecessors are the
++        // committed history), each draft as the chain draws it (cuda_ngram_host.zig)
++        if (e.f.ngh) |h| for (reqs) |r| if (r.next.len > 0) h.touchTokens(r.seq.st.history[0 .. h.g.n - 1], &.{@as(i64, @intCast(r.next[r.next.len - 1]))});
+         var lg = logits;
+         var rows = reqs.len; // the head's rows of the step just run, active[k] at row k
+         var row_of: [64]usize = undefined; // active k's row in that step
+@@ -1470,6 +1507,7 @@ pub const Engine = struct {
+                 if (!t.propose) continue;
+                 r.out[r.drafted] = @intCast(got.token);
+                 r.drafted += 1;
++                if (e.f.ngh) |h| if (r.next.len > 0) h.touchDraft(&r.seq.st.history, r.next[r.next.len - 1], r.out[0..r.drafted]);
+                 if (t.more and j + 1 < @min(r.count, r.out.len)) {
+                     next[n_next] = .{ .req = a.req, .row = a.row, .tok = @intCast(got.token) };
+                     n_next += 1;
+diff --git a/zig/src/families/flashnext/cuda_forward.zig b/zig/src/families/flashnext/cuda_forward.zig
+index a054b6f..ed356d5 100644
+--- a/zig/src/families/flashnext/cuda_forward.zig
++++ b/zig/src/families/flashnext/cuda_forward.zig
+@@ -26,6 +26,7 @@ const prompt = @import("cuda_prompt.zig");
+ const moep = @import("cuda_moe_prompt.zig");
+ const fp8 = @import("cuda_fp8.zig");
+ const int4 = @import("cuda_int4.zig");
++const ngh = @import("cuda_ngram_host.zig");
+ 
+ const Allocator = std.mem.Allocator;
+ const W = weights;
+@@ -492,6 +493,9 @@ pub const Forward = struct {
+     seqs: std.ArrayList(*Seq) = .empty,
+     /// two ranks: the n-gram table's GPU gather of this rank's heads (fn_pack.cu)
+     gather: ?W.Gather = null,
++    /// one GPU: the host gather over a gang of threads and the prefetch queue (cuda_ngram_host.zig; null: the
++    /// stock gather on the caller's thread). The engine owns it.
++    ngh: ?*ngh.Host = null,
+     eps: f32,
+     vocab_offset: i64 = 0,
+     /// the sampling scratch (cuda_engine.zig sizes it for the head rows); `candidates` reads it at two ranks
+@@ -1196,7 +1200,7 @@ pub const Forward = struct {
+                 continue;
+             }
+             const out = std.mem.bytesAsSlice(u16, f.pin.bytes[rows_at..][0 .. R * heads * table.width * 2]);
+-            try table.gather(nid, @alignCast(out));
++            if (f.ngh) |h| try h.gather(nid, @alignCast(out)) else try table.gather(nid, @alignCast(out));
+             try f.upload(x.b.ple_v, rows_at, R * heads * table.width * 2);
+         };
+         for (windows) |w| w.seq.staged = true;
+diff --git a/zig/src/families/flashnext/cuda_ngram_host.zig b/zig/src/families/flashnext/cuda_ngram_host.zig
+new file mode 100644
+index 0000000..32cc757
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_ngram_host.zig
+@@ -0,0 +1,334 @@
++//! The n-gram (PLE) table at one GPU is host-mapped (cuda_weights.zig openTable) and gathered on the host a row at
++//! a time (NgramTable.gather): a row the page cache does not hold is a synchronous page fault, ~120 us with the
++//! kernel's 128 KiB read-around, ~60 us with MADV_RANDOM (random 4 KiB reads on a DGX Spark's NVMe), and a prompt
++//! of new text touches 16 cold rows a token. This module keeps the gather's bits (the same rows through the same LUT
++//! into the same positions) and changes only when and on which thread the pages are read:
++//! - the gang: a gather of at least `min` rows is split into blocks over `threads` worker threads plus the caller's,
++//!   so cold rows fault in parallel (the drive does ~200k 4 KiB reads/s at 32 in flight against ~8k serial);
++//! - the prefetch queue: row ids whose pages should be resident soon are touched by the same workers in the
++//!   background (a prompt's next chunks during prefill, the drafts as the MTP chain produces them in decode);
++//! - MADV_RANDOM on the table's mappings (NgramTable.adviseRandom, when `random` is set): a miss reads its page only.
++//! Env: TF_FLASHNEXT_NGRAM_THREADS (worker threads; unset or 0: the caller's thread only, the stock path),
++//! TF_FLASHNEXT_NGRAM_MIN (rows below which a gather stays on the caller's thread, default 32),
++//! TF_FLASHNEXT_NGRAM_PREFETCH (1: the prompt and draft prefetches), TF_FLASHNEXT_NGRAM_RANDOM (1: MADV_RANDOM),
++//! TF_FLASHNEXT_NGRAM_AHEAD (prompt chunks queued ahead of the one being staged, default 2).
++const std = @import("std");
++const weights = @import("cuda_weights.zig");
++const ngram = @import("cuda_ngram.zig");
++
++pub const Options = struct {
++    threads: u32 = 0,
++    min: usize = 32,
++    prefetch: bool = false,
++    random: bool = false,
++    ahead: usize = 2,
++
++    pub fn fromEnv() !Options {
++        var o: Options = .{};
++        if (std.c.getenv("TF_FLASHNEXT_NGRAM_THREADS")) |v| o.threads = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return error.BadNgramThreads;
++        if (std.c.getenv("TF_FLASHNEXT_NGRAM_MIN")) |v| o.min = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadNgramThreads;
++        if (std.c.getenv("TF_FLASHNEXT_NGRAM_PREFETCH")) |v| o.prefetch = !std.mem.eql(u8, std.mem.span(v), "0");
++        if (std.c.getenv("TF_FLASHNEXT_NGRAM_RANDOM")) |v| o.random = !std.mem.eql(u8, std.mem.span(v), "0");
++        if (std.c.getenv("TF_FLASHNEXT_NGRAM_AHEAD")) |v| o.ahead = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadNgramThreads;
++        if (o.threads > 128) return error.BadNgramThreads;
++        if (o.prefetch and o.threads == 0) return error.BadNgramThreads; // the prefetch runs on the workers
++        return o;
++    }
++};
++
++/// The gang and the prefetch queue over one table.
++pub const Host = struct {
++    gpa: std.mem.Allocator,
++    io: std.Io,
++    table: *const weights.NgramTable,
++    g: ngram.NGram,
++    o: Options,
++    threads: []std.Thread,
++    mu: std.Io.Mutex = .init,
++    /// workers wait here for a gather block, a touch batch or `quit`
++    work: std.Io.Condition = .init,
++    /// the gather's caller waits here until every block is done
++    done: std.Io.Condition = .init,
++    quit: bool = false,
++    // the gather in progress (one at a time; the caller works on it too)
++    g_ids: []const i64 = &.{},
++    g_out: []u16 = &.{},
++    g_block: usize = 1,
++    g_next: usize = 0, // next block to take
++    g_blocks: usize = 0, // blocks in all
++    g_left: usize = 0, // blocks not finished
++    g_fail: bool = false,
++    // row ids whose pages the workers touch in the background, oldest first
++    touch: std.ArrayList(i64) = .empty,
++    touch_next: usize = 0,
++    /// counts, for the log: rows gathered by the gang, rows queued for touching
++    gathered: u64 = 0,
++    touched: u64 = 0,
++
++    pub fn create(gpa: std.mem.Allocator, io: std.Io, table: *const weights.NgramTable, g: ngram.NGram, o: Options) !*Host {
++        const h = try gpa.create(Host);
++        errdefer gpa.destroy(h);
++        h.* = .{ .gpa = gpa, .io = io, .table = table, .g = g, .o = o, .threads = &.{} };
++        const threads = try gpa.alloc(std.Thread, o.threads);
++        errdefer gpa.free(threads);
++        var n: usize = 0;
++        errdefer h.stop(threads[0..n]);
++        for (threads) |*t| {
++            t.* = try std.Thread.spawn(.{}, worker, .{h});
++            n += 1;
++        }
++        h.threads = threads;
++        std.log.info("n-gram table on the host: {d} gather threads (blocks from {d} rows), prefetch {s} ({d} chunks ahead), pages read {s}", .{ o.threads, o.min, if (o.prefetch) "on" else "off", o.ahead, if (o.random) "one at a time (MADV_RANDOM)" else "with the kernel's read-around" });
++        return h;
++    }
++
++    fn stop(h: *Host, threads: []std.Thread) void {
++        h.mu.lockUncancelable(h.io);
++        h.quit = true;
++        h.work.broadcast(h.io);
++        h.mu.unlock(h.io);
++        for (threads) |t| t.join();
++    }
++
++    pub fn destroy(h: *Host) void {
++        h.stop(h.threads);
++        h.gpa.free(h.threads);
++        h.touch.deinit(h.gpa);
++        std.log.info("n-gram host gang: {d} rows gathered in parallel, {d} rows queued ahead", .{ h.gathered, h.touched });
++        h.gpa.destroy(h);
++    }
++
++    /// Rows `ids` -> `out[ids.len][width]` bf16 bits: NgramTable.gather's bits, blocks of rows over the gang when
++    /// there are at least `min` of them.
++    pub fn gather(h: *Host, ids: []const i64, out: []u16) !void {
++        const t = h.table;
++        if (out.len != ids.len * t.width) return error.NgramOutLength;
++        if (h.threads.len == 0 or ids.len < h.o.min) return t.gather(ids, out);
++        // blocks small enough that cold rows spread over every thread, at least 4 rows each, at most 256
++        const want = ids.len / ((h.threads.len + 1) * 4);
++        const size = @max(@as(usize, 4), @min(want, 256));
++        const blocks = (ids.len + size - 1) / size;
++        h.mu.lockUncancelable(h.io);
++        h.g_ids = ids;
++        h.g_out = out;
++        h.g_block = size;
++        h.g_next = 0;
++        h.g_blocks = blocks;
++        h.g_left = blocks;
++        h.g_fail = false;
++        h.gathered += ids.len;
++        h.work.broadcast(h.io);
++        // the caller takes blocks too, then waits for the rest
++        while (h.g_next < h.g_blocks) {
++            const b = h.g_next;
++            h.g_next += 1;
++            h.mu.unlock(h.io);
++            const ok = h.block(b);
++            h.mu.lockUncancelable(h.io);
++            if (!ok) h.g_fail = true;
++            h.g_left -= 1;
++        }
++        while (h.g_left > 0) h.done.waitUncancelable(h.io, &h.mu);
++        const failed = h.g_fail;
++        h.g_ids = &.{};
++        h.g_out = &.{};
++        h.g_blocks = 0;
++        h.mu.unlock(h.io);
++        if (failed) return error.NgramIdOutOfRange;
++    }
++
++    /// Block `b` of the gather in progress (the ids and out slices are read without the lock: they stay until
++    /// g_left reaches zero and the caller returns).
++    fn block(h: *Host, b: usize) bool {
++        const t = h.table;
++        const lo = b * h.g_block;
++        const hi = @min(lo + h.g_block, h.g_ids.len);
++        t.gather(h.g_ids[lo..hi], h.g_out[lo * t.width .. hi * t.width]) catch return false;
++        return true;
++    }
++
++    /// Row ids whose pages should be resident soon: queued for the workers (nothing waits on them).
++    pub fn touchRows(h: *Host, ids: []const i64) void {
++        if (!h.o.prefetch or ids.len == 0) return;
++        h.mu.lockUncancelable(h.io);
++        defer h.mu.unlock(h.io);
++        h.touch.appendSlice(h.gpa, ids) catch return;
++        h.touched += ids.len;
++        h.work.broadcast(h.io);
++    }
++
++    /// The rows of `tokens` after `history` (the n - 1 tokens before them), queued for touching.
++    pub fn touchTokens(h: *Host, history: []const i64, tokens: []const i64) void {
++        if (!h.o.prefetch or tokens.len == 0) return;
++        var stack: [64 * ngram.max_heads]i64 = undefined;
++        const n = tokens.len * h.g.heads;
++        const buf = if (n <= stack.len) stack[0..n] else h.gpa.alloc(i64, n) catch return;
++        defer if (n > stack.len) h.gpa.free(buf);
++        h.g.ids(history, tokens, buf) catch return;
++        h.touchRows(buf);
++    }
++
++    /// The newest draft's rows queued for touching: `drafts` follow `first` (the next window's pending token), which
++    /// follows the stream's committed `history`; the newest draft's n - 1 predecessors come from there.
++    pub fn touchDraft(h: *Host, history: []const i64, first: u32, drafts: []const u32) void {
++        if (!h.o.prefetch or drafts.len == 0) return;
++        const c = h.g.n - 1;
++        var hist: [ngram.max_n]i64 = undefined;
++        draftHistory(history[0..c], first, drafts, hist[0..c]);
++        h.touchTokens(hist[0..c], &.{@as(i64, @intCast(drafts[drafts.len - 1]))});
++    }
++
++    /// Prompt tokens [from, to) of `prompt` queued for touching, each token's rows after its own predecessors
++    /// (the prompt's start has the EOS history, as stage's ids give it; a resumed prompt's chunks keep their
++    /// predecessors too).
++    pub fn touchPrompt(h: *Host, prompt: []const u32, from: usize, to: usize) void {
++        if (!h.o.prefetch or from >= to) return;
++        const c = h.g.n - 1;
++        var hist: [ngram.max_n]i64 = undefined;
++        var toks: [1024]i64 = undefined;
++        var at = from;
++        while (at < to) {
++            const end = @min(to, at + toks.len);
++            for (0..c) |i| hist[i] = if (at + i >= c) @as(i64, @intCast(prompt[at + i - c])) else h.g.eos;
++            for (toks[0 .. end - at], prompt[at..end]) |*d, s| d.* = @intCast(s);
++            h.touchTokens(hist[0..c], toks[0 .. end - at]);
++            at = end;
++        }
++    }
++
++    /// Everything queued but not yet touched is dropped (a prompt that stopped early).
++    pub fn dropTouches(h: *Host) void {
++        h.mu.lockUncancelable(h.io);
++        defer h.mu.unlock(h.io);
++        h.touch.clearRetainingCapacity();
++        h.touch_next = 0;
++    }
++
++    fn worker(h: *Host) void {
++        var batch: [32]i64 = undefined;
++        h.mu.lockUncancelable(h.io);
++        while (true) {
++            if (h.quit) break;
++            if (h.g_next < h.g_blocks) {
++                const b = h.g_next;
++                h.g_next += 1;
++                h.mu.unlock(h.io);
++                const ok = h.block(b);
++                h.mu.lockUncancelable(h.io);
++                if (!ok) h.g_fail = true;
++                h.g_left -= 1;
++                if (h.g_left == 0) h.done.signal(h.io);
++                continue;
++            }
++            if (h.touch_next < h.touch.items.len) {
++                const n = @min(batch.len, h.touch.items.len - h.touch_next);
++                @memcpy(batch[0..n], h.touch.items[h.touch_next..][0..n]);
++                h.touch_next += n;
++                if (h.touch_next == h.touch.items.len) {
++                    h.touch.clearRetainingCapacity();
++                    h.touch_next = 0;
++                }
++                h.mu.unlock(h.io);
++                h.table.touch(batch[0..n]);
++                h.mu.lockUncancelable(h.io);
++                continue;
++            }
++            h.work.waitUncancelable(h.io, &h.mu);
++        }
++        h.mu.unlock(h.io);
++    }
++};
++
++/// The `out.len` tokens before the newest of `drafts` in the sequence history ++ [first] ++ drafts (history holds
++/// at least out.len tokens, the stream's committed n - 1).
++fn draftHistory(history: []const i64, first: u32, drafts: []const u32, out: []i64) void {
++    const newest: isize = @intCast(drafts.len); // its position in [first, drafts...]
++    for (out, 0..) |*o, i| {
++        const pos = newest - @as(isize, @intCast(out.len - i));
++        o.* = if (pos >= 1) @intCast(drafts[@intCast(pos - 1)]) else if (pos == 0) @intCast(first) else history[@intCast(@as(isize, @intCast(history.len)) + pos)];
++    }
++}
++
++test "a draft's predecessors give the ids stage computes for the next window" {
++    const g = try ngram.NGram.init(.{ .vocab = 248320, .ngram_size = 3, .heads_per_ngram = 8, .vocab_base = 20000000, .divisor = 128, .seed = 1234, .eos = 248044, .embed_dim = 2560 });
++    const history = [_]i64{ 123, 456 };
++    const first: u32 = 789;
++    const drafts = [_]u32{ 11, 248044, 7, 8 };
++    // the next window as stage sees it: first, then the drafts, after the history
++    const window = [_]i64{ 789, 11, 248044, 7, 8 };
++    var want: [window.len * 16]i64 = undefined;
++    try g.ids(&history, &window, &want);
++    for (1..drafts.len + 1) |n| {
++        var hist: [2]i64 = undefined;
++        draftHistory(&history, first, drafts[0..n], &hist);
++        var got: [16]i64 = undefined;
++        try g.ids(&hist, &.{@as(i64, @intCast(drafts[n - 1]))}, &got);
++        try std.testing.expectEqualSlices(i64, want[n * 16 ..][0..16], &got);
++    }
++}
++
++test "a chunk's touch ids from its own history equal the whole prompt's at those positions" {
++    const g = try ngram.NGram.init(.{ .vocab = 248320, .ngram_size = 3, .heads_per_ngram = 8, .vocab_base = 20000000, .divisor = 128, .seed = 1234, .eos = 248044, .embed_dim = 2560 });
++    const toks = [_]i64{ 9707, 11, 1879, 248044, 314, 2001, 248319, 0, 248044, 248044, 77, 5, 6, 7 };
++    var h: [2]i64 = undefined;
++    g.initialHistory(&h);
++    var all: [toks.len * 16]i64 = undefined;
++    try g.ids(&h, &toks, &all);
++    const from = 5;
++    var part: [(toks.len - from) * 16]i64 = undefined;
++    try g.ids(toks[from - 2 .. from], toks[from..], &part);
++    try std.testing.expectEqualSlices(i64, all[from * 16 ..], &part);
++}
++
++test "the gang's gather is the serial gather byte for byte, errors included" {
++    const gpa = std.testing.allocator;
++    const io = std.testing.io;
++    const g = try ngram.NGram.init(.{ .vocab = 248320, .ngram_size = 3, .heads_per_ngram = 8, .vocab_base = 20000000, .divisor = 128, .seed = 1234, .eos = 248044, .embed_dim = 2560 });
++    // three shards of random fp8 codes, the last shorter, as the table's own layout
++    const width: u32 = 160;
++    const shard_rows = [_]u64{ 100, 100, 37 };
++    var t: weights.NgramTable = .{ .gpa = gpa, .io = io, .width = width, .fp8 = true };
++    defer {
++        for (t.shards.items) |s| gpa.free(s);
++        t.shards.deinit(gpa);
++        t.starts.deinit(gpa);
++    }
++    var prng = std.Random.DefaultPrng.init(7);
++    const rnd = prng.random();
++    try t.starts.append(gpa, 0);
++    for (shard_rows) |n| {
++        const bytes = try gpa.alloc(u8, n * width);
++        rnd.bytes(bytes);
++        try t.shards.append(gpa, bytes);
++        try t.starts.append(gpa, t.starts.items[t.starts.items.len - 1] + n);
++    }
++    t.rows = t.starts.items[t.starts.items.len - 1];
++    for (&t.lut, 0..) |*v, i| v.* = @intCast((i * 2654435761) & 0xFFFF);
++    const h = try Host.create(gpa, io, &t, g, .{ .threads = 5, .min = 32, .prefetch = true });
++    defer h.destroy();
++    // sizes below and above the threshold, ids over every shard and both boundaries, repeats included
++    for ([_]usize{ 1, 31, 32, 33, 200, 1000, 4097 }) |n| {
++        const ids = try gpa.alloc(i64, n);
++        defer gpa.free(ids);
++        for (ids, 0..) |*id, i| id.* = if (i % 7 == 0) 199 else if (i % 11 == 0) 100 else @intCast(rnd.uintLessThan(u64, t.rows));
++        const want = try gpa.alloc(u16, n * width);
++        defer gpa.free(want);
++        const got = try gpa.alloc(u16, n * width);
++        defer gpa.free(got);
++        try t.gather(ids, want);
++        @memset(got, 0xAAAA);
++        try h.gather(ids, got);
++        try std.testing.expectEqualSlices(u16, want, got);
++        h.touchRows(ids); // the prefetch path over the same ids (a mutant that skips the touch is not what this tests)
++    }
++    // an id past the table fails the gang as it fails the serial gather
++    const bad = try gpa.alloc(i64, 64);
++    defer gpa.free(bad);
++    @memset(bad, 3);
++    bad[50] = @intCast(t.rows);
++    const out = try gpa.alloc(u16, 64 * width);
++    defer gpa.free(out);
++    try std.testing.expectError(error.NgramIdOutOfRange, t.gather(bad, out));
++    try std.testing.expectError(error.NgramIdOutOfRange, h.gather(bad, out));
++    try std.testing.expectError(error.NgramOutLength, h.gather(bad, out[0..10]));
++}
+diff --git a/zig/src/families/flashnext/cuda_weights.zig b/zig/src/families/flashnext/cuda_weights.zig
+index 04c2b28..255318e 100644
+--- a/zig/src/families/flashnext/cuda_weights.zig
++++ b/zig/src/families/flashnext/cuda_weights.zig
+@@ -164,6 +164,26 @@ pub const NgramTable = struct {
+             }
+         }
+     }
++
++    /// The rows' pages touched (a byte at each end of every row, so a row across two pages brings both): a later
++    /// gather finds them resident (cuda_ngram_host.zig's prefetch). Ids out of range are skipped.
++    pub fn touch(t: *const NgramTable, ids: []const i64) void {
++        for (ids) |id| {
++            if (id < 0 or id >= t.rows) continue;
++            const r = t.row(@intCast(id));
++            std.mem.doNotOptimizeAway(@as(*const volatile u8, @ptrCast(r.ptr)).*);
++            std.mem.doNotOptimizeAway(@as(*const volatile u8, @ptrCast(r.ptr + r.len - 1)).*);
++        }
++    }
++
++    /// MADV_RANDOM over every shard file's mapping: a page fault reads that page alone, not the kernel's 128 KiB
++    /// read-around (rows are 160 B at hashed offsets, so the neighbours are never the next rows).
++    pub fn adviseRandom(t: *NgramTable) void {
++        for (t.files.items) |*f| {
++            const m = f.map.memory;
++            std.posix.madvise(m.ptr, m.len, std.posix.MADV.RANDOM) catch |err| std.log.warn("madvise(MADV_RANDOM) over the n-gram table: {s}", .{@errorName(err)});
++        }
++    }
+ };
+ 
+ /// The n-gram table's GPU gather (zig/kernels/cuda/fn_pack.cu): a window's global row ids (device int64
