@@ -3,6 +3,13 @@
 Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:zig-db28187`, built by
 `scripts/prepare.sh` from TensorFold `db281878` plus `patches/`.
 
+## Unreleased
+
+- `patches/0017-flash-next-batched-draws` (on by default; `TF_FLASHNEXT_BATCH_DRAWS=0`,
+  `TF_FLASHNEXT_BATCH_WINDOWS=0` restore the old path): at one rank a draft level's greedy draws over every stream run
+  as one fused kernel and one read, and a shared round's greedy windows as one argmax and one read; each row's bytes
+  as its own draw's (`tensorfold draft-check`). Decode +1 to +2.7% at 4-8 clients; every reply byte-identical.
+
 ## [1.0.0] - 2026-10-08
 
 TensorFold's Zig engine (`tensorfold-native`, TP=1). Engine `37763df`, merged into `zig-single` as `453439d`

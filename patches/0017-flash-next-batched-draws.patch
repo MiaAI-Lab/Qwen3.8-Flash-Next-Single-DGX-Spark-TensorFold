@@ -1,0 +1,586 @@
+diff --git a/zig/kernels/cuda/torch_ops/fn_logsumexp.cu b/zig/kernels/cuda/torch_ops/fn_logsumexp.cu
+index 56e0c52..549d853 100644
+--- a/zig/kernels/cuda/torch_ops/fn_logsumexp.cu
++++ b/zig/kernels/cuda/torch_ops/fn_logsumexp.cu
+@@ -26,8 +26,10 @@
+ // maxes, partial, R, N, ctas, split); tf_fn_lse_finish_kernel<<<R, (bw, bh)>>>(partial, maxes, out, R, ctas).
+ // Scratch: maxes R floats, partial R * ctas floats. No dynamic shared memory. Compile with --fmad=false --ftz=false.
+ #include <cuda_runtime.h>
++#include <cuda_bf16.h>
+ #include <stdint.h>
+ #include <math.h>
++#include "argmax_order.h"
+ 
+ namespace {
+ 
+@@ -168,6 +170,137 @@ extern "C" __global__ void tf_fn_lse_finish_kernel(const float* partial, const f
+     if (threadIdx.x == 0 && threadIdx.y == 0) out[row] = __fadd_rn(logf(s), maxes[row]);
+ }
+ 
++// Engine.sample_draft, greedy, over `rows` consecutive bf16 rows `n` apart, one block a row: out[3 row] =
++// [the first maximum's value, the row's log-sum-exp, its column as fp32], the bytes tf_fn_draft_pick_kernel writes
++// after tf_argmax_rows (argmax_order.h: the first NaN, else the largest value at the lowest column, a total order
++// over the columns, so any block shape finds the same one) and tf_fn_logsumexp over that one row copied alone
++// (shift 0). The sum runs ATen's order for ONE row, tf_fn_logsumexp_config(1, n): block (bw, 1) and `ctas` CTAs'
++// partials folded by the finish tree; this block walks the CTAs one after another (its threads are CTA y's
++// (x, 0) each time), so a row's sum is the same whether it is drawn alone or beside other streams' rows. Launch
++// <<<rows, bw>>> with bw and ctas from that config (bh is 1 for one row; ctas <= 512).
++extern "C" __global__ void tf_fn_draft_greedy_rows_kernel(const __nv_bfloat16* logits, float* out, uint32_t rows,
++                                                          uint32_t n, uint32_t ctas) {
++    __shared__ float shared[kMaxThreads];
++    __shared__ float partials[kMaxThreads];
++    __shared__ TFMaxCandidate warps[32];
++    const uint32_t row = blockIdx.x;
++    if (row >= rows) return;
++    const __nv_bfloat16* r = logits + uint64_t(row) * n;
++    const uint16_t* bits = reinterpret_cast<const uint16_t*>(r);
++    const uint32_t bw = blockDim.x;
++    // the first maximum: every thread's best over its columns (16 bytes a load over the aligned body, the few
++    // columns before and after it one at a time: the order is immaterial), the warps' bests, then the block's
++    TFMaxCandidate best = tf_max_empty();
++    const uint32_t head = min(uint32_t((16u - uint32_t(reinterpret_cast<uintptr_t>(bits) & 15u)) & 15u) / 2u, n);
++    const uint32_t body = (n - head) / 8u;
++    for (uint32_t col = threadIdx.x; col < head; col += bw)
++        best = tf_max_pick(best, tf_max_bits(uint32_t(bits[col]) << 16, col));
++    const uint4* vectors = reinterpret_cast<const uint4*>(bits + head);
++    uint32_t v = threadIdx.x;
++    for (; v + 3 * bw < body; v += 4 * bw) {
++        uint4 q[4];
++#pragma unroll
++        for (int u = 0; u < 4; ++u) q[u] = vectors[v + u * bw];
++#pragma unroll
++        for (int u = 0; u < 4; ++u) {
++            const uint32_t words[4] = {q[u].x, q[u].y, q[u].z, q[u].w};
++            const uint32_t column = head + (v + u * bw) * 8u;
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                best = tf_max_pick(best, tf_max_bits(words[j] << 16, column + 2 * j));
++                best = tf_max_pick(best, tf_max_bits(words[j] & 0xffff0000u, column + 2 * j + 1));
++            }
++        }
++    }
++    for (; v < body; v += bw) {
++        const uint4 q = vectors[v];
++        const uint32_t words[4] = {q.x, q.y, q.z, q.w};
++        const uint32_t column = head + v * 8u;
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            best = tf_max_pick(best, tf_max_bits(words[j] << 16, column + 2 * j));
++            best = tf_max_pick(best, tf_max_bits(words[j] & 0xffff0000u, column + 2 * j + 1));
++        }
++    }
++    for (uint32_t col = head + body * 8u + threadIdx.x; col < n; col += bw)
++        best = tf_max_pick(best, tf_max_bits(uint32_t(bits[col]) << 16, col));
++    for (int offset = 16; offset != 0; offset >>= 1) {
++        TFMaxCandidate other;
++        other.key = __shfl_down_sync(0xffffffffu, best.key, offset);
++        other.nan = __shfl_down_sync(0xffffffffu, best.nan, offset);
++        const uint32_t lo = __shfl_down_sync(0xffffffffu, uint32_t(best.column), offset);
++        const uint32_t hi = __shfl_down_sync(0xffffffffu, uint32_t(best.column >> 32), offset);
++        other.column = (uint64_t(hi) << 32) | lo;
++        best = tf_max_pick(best, other);
++    }
++    const int lane = int(threadIdx.x) & 31;
++    const int warp = int(threadIdx.x) >> 5;
++    if (lane == 0) warps[warp] = best;
++    __syncthreads();
++    if (warp == 0) {
++        best = lane < int(bw >> 5) ? warps[lane] : tf_max_empty();
++        for (int offset = 16; offset != 0; offset >>= 1) {
++            TFMaxCandidate other;
++            other.key = __shfl_down_sync(0xffffffffu, best.key, offset);
++            other.nan = __shfl_down_sync(0xffffffffu, best.nan, offset);
++            const uint32_t lo = __shfl_down_sync(0xffffffffu, uint32_t(best.column), offset);
++            const uint32_t hi = __shfl_down_sync(0xffffffffu, uint32_t(best.column >> 32), offset);
++            other.column = (uint64_t(hi) << 32) | lo;
++            best = tf_max_pick(best, other);
++        }
++        if (lane == 0) warps[0] = best;
++    }
++    __syncthreads();
++    const uint32_t c = uint32_t(warps[0].column);
++    const float top = __bfloat162float(r[c]);
++    // tf_fn_lse_max_kernel's maximum: a NaN when the row holds one (the first NaN is the pick: `top` is it), else the
++    // largest value; |m| == inf -> 0
++    const float m = fabsf(top) == INFINITY ? 0.0f : top;
++    // tf_fn_lse_sum_kernel for one row (split, bh 1, shift 0), CTA by CTA; tf_fn_lse_finish_kernel's fold. The four
++    // columns a thread takes a step are one 8-byte load where the row allows it (the same four values in the same
++    // accumulators either way).
++    const bool aligned8 = (reinterpret_cast<uintptr_t>(bits) & 7u) == 0;
++    for (uint32_t by = 0; by < ctas; ++by) {
++        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
++        const int64_t stride = int64_t(bw) * int64_t(ctas);
++        int64_t idx = int64_t(threadIdx.x) + int64_t(by) * int64_t(bw);
++        if (aligned8) {
++            const uint2* quads = reinterpret_cast<const uint2*>(bits);
++            while (idx * 4 + 3 < int64_t(n)) {
++                const uint2 q = quads[idx];
++                const uint32_t w[4] = {q.x << 16, q.x & 0xffff0000u, q.y << 16, q.y & 0xffff0000u};
++#pragma unroll
++                for (int i = 0; i < 4; i++) acc[i] = __fadd_rn(acc[i], expf(__fsub_rn(__uint_as_float(w[i]), m)));
++                idx += stride;
++            }
++        } else {
++            while (idx * 4 + 3 < int64_t(n)) {
++                for (int i = 0; i < 4; i++) acc[i] = __fadd_rn(acc[i], expf(__fsub_rn(__bfloat162float(r[idx * 4 + i]), m)));
++                idx += stride;
++            }
++        }
++        const int64_t tail = int64_t(n) - int64_t(n % 4) + int64_t(threadIdx.x);
++        if (by == 0 && tail < int64_t(n)) acc[0] = __fadd_rn(acc[0], expf(__fsub_rn(__bfloat162float(r[tail]), m)));
++        for (int i = 1; i < 4; i++) acc[0] = __fadd_rn(acc[0], acc[i]);
++        const float v = tf_lse_lane_tree(acc[0], shared);
++        if (threadIdx.x == 0) partials[by] = v;
++    }
++    __syncthreads();
++    float s;
++    if (ctas == 1) {
++        s = partials[0];
++    } else {
++        float v = 0.0f;
++        for (uint32_t t = threadIdx.x; t < ctas; t += bw) v = __fadd_rn(v, partials[t]);
++        s = tf_lse_lane_tree(v, shared);
++    }
++    if (threadIdx.x == 0) {
++        out[row * 3] = top;
++        out[row * 3 + 1] = __fadd_rn(logf(s), m);
++        out[row * 3 + 2] = __ll2float_rn((long long)c);
++    }
++}
++
+ // ---- development launchers (ctypes parity checks only) ----
+ 
+ static int tf_lse_last_pow2(int v) {
+diff --git a/zig/src/cli/flashnext_cuda.zig b/zig/src/cli/flashnext_cuda.zig
+index 378d138..dc7a314 100644
+--- a/zig/src/cli/flashnext_cuda.zig
++++ b/zig/src/cli/flashnext_cuda.zig
+@@ -47,6 +47,8 @@ const usage =
+     \\           Python's Fp8BlockLinear on tools/zig/check_fp8block.py's cases in DIR, bytes compared, timed)
+     \\  tensorfold int4-check MODEL   (no weights: the GPTQ int4 expert and head kernels (cuda_int4.zig) against a host
+     \\           reference from the GPTQ bytes, row/tile invariance, plan == dense, then their speed)
++    \\  tensorfold draft-check MODEL [--rows N,N,...]   (no weights: the batched greedy draft draw (one block a row)
++    \\           against the per-row draw it replaces, bytes compared on adversarial rows, then both timed)
+     \\  tensorfold agree MODEL CAPTURE_DIR --report OUT.json [--against REF.json] [--max-tokens N] [--only NAME,...]
+     \\           (each captured prompt's greedy serial reply written to OUT.json; with REF.json, another run's replies
+     \\           teacher-forced: the top-1 agreement of this engine's greedy draws with them, and where the free
+@@ -275,6 +277,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
+     if (std.mem.eql(u8, cmd, "qsa-check")) return qsaCheck(gpa, init.io, &ctx, kernels);
+     if (std.mem.eql(u8, cmd, "fp4-check")) return fp4Check(gpa, init.io, &ctx, kernels, o);
+     if (std.mem.eql(u8, cmd, "glue-check")) return glueCheck(gpa, init.io, &ctx, kernels);
++    if (std.mem.eql(u8, cmd, "draft-check")) return draftCheck(gpa, &ctx, o);
+     const mtp = !std.mem.eql(u8, cmd, "check-weights-nomtp");
+     // two ranks: both run the same command (every engine call in the same order), rank 0 listening on --master
+     var server: ?flashnext.link.Server = null;
+@@ -1364,6 +1367,26 @@ fn fp4Check(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, kernels: []con
+     return if (ok) 0 else 1;
+ }
+ 
++/// `draft-check`: no checkpoint; the batched greedy draft draw (one block a row) against the per-row draw it
++/// replaces, bytes compared on adversarial rows at the draft vocabulary's width and the head's, then both timed.
++fn draftCheck(gpa: Allocator, ctx: *const cuda.Context, o: Options) !u8 {
++    var ops = try flashnext.torch_ops.Ops.load(ctx);
++    defer ops.deinit();
++    var stream = try cuda.Stream.init(ctx.d, true);
++    defer stream.deinit();
++    const th = ops.on(stream);
++    var rows: std.ArrayList(usize) = .empty;
++    defer rows.deinit(gpa);
++    if (o.rows.len > 0) {
++        var it = std.mem.tokenizeScalar(u8, o.rows, ',');
++        while (it.next()) |r| try rows.append(gpa, try std.fmt.parseInt(usize, r, 10));
++    } else try rows.appendSlice(gpa, &flashnext.draft_check.default_rows);
++    const ok = try flashnext.draft_check.check(gpa, ctx.d, th, rows.items);
++    try flashnext.draft_check.bench(gpa, ctx.d, th, &.{ 1, 2, 4, 8, 16 }, 50);
++    std.debug.print("{s} draft-check: the batched greedy draft draw {s} the per-row draw\n", .{ if (ok) "PASS" else "FAIL", if (ok) "byte-equal to" else "DIFFERS from" });
++    return if (ok) 0 else 1;
++}
++
+ /// bench-many's prompts: 32 a kind, stream i takes prompt i % 32 (user turns, the chat template around them).
+ const bench_code = [_][]const u8{
+     "Write a Python function that parses an ISO 8601 date string without using datetime, with tests.",
+diff --git a/zig/src/families/flashnext/cuda.zig b/zig/src/families/flashnext/cuda.zig
+index fb9fc62..4d6a764 100644
+--- a/zig/src/families/flashnext/cuda.zig
++++ b/zig/src/families/flashnext/cuda.zig
+@@ -30,6 +30,7 @@ pub const moe_prompt = @import("cuda_moe_prompt.zig");
+ pub const fp8 = @import("cuda_fp8.zig");
+ pub const int4 = @import("cuda_int4.zig");
+ pub const int4_check = @import("cuda_int4_check.zig");
++pub const draft_check = @import("cuda_draft_check.zig");
+ pub const Engine = engine.Engine;
+ 
+ test {
+@@ -59,4 +60,5 @@ test {
+     _ = fp8;
+     _ = int4;
+     _ = int4_check;
++    _ = draft_check;
+ }
+diff --git a/zig/src/families/flashnext/cuda_draft_check.zig b/zig/src/families/flashnext/cuda_draft_check.zig
+new file mode 100644
+index 0000000..9edd09f
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_draft_check.zig
+@@ -0,0 +1,158 @@
++//! `draft-check` (no checkpoint): the batched greedy draft draw (cuda_torch_ops.Torch.draftGreedyRows, one
++//! block a row) against the per-row path it replaces (draftGreedy: toF32, logsumexp, argmax, draftPick over one row
++//! copied alone), bytes compared over the draft vocabulary's width and the main head's, several row counts and
++//! adversarial rows (ties, NaN, +-inf, signed zeros, subnormals, wide exponents); then both timed.
++const std = @import("std");
++const cuda = @import("cuda");
++const tops = @import("cuda_torch_ops.zig");
++
++pub const widths = [_]usize{ 79591, 248320, 4096, 1000, 131 };
++pub const default_rows = [_]usize{ 1, 2, 3, 4, 5, 8, 16, 64 };
++
++const Fill = enum { normal, wide, ties, nan, inf, neg_inf, zeros, subnormal, mixed };
++const fills = [_]Fill{ .normal, .wide, .ties, .nan, .inf, .neg_inf, .zeros, .subnormal, .mixed };
++
++fn bf16Bits(v: f32) u16 {
++    return @truncate(@as(u32, @bitCast(v)) >> 16);
++}
++
++/// `rows` rows of `n` bf16 values: the fill's shape, every row different (its own maximum column).
++fn fill(h: []u16, rows: usize, n: usize, r: std.Random, how: Fill) void {
++    for (0..rows) |row| {
++        const x = h[row * n ..][0..n];
++        for (x) |*v| v.* = switch (how) {
++            .normal, .nan, .inf, .neg_inf, .zeros, .ties, .mixed => bf16Bits(@floatCast(r.floatNorm(f64) * 3.0)),
++            .wide => bf16Bits((if (r.boolean()) @as(f32, -1) else 1) * std.math.ldexp(1.0 + r.float(f32), r.intRangeAtMost(i32, -30, 30))),
++            .subnormal => @as(u16, @intCast(r.uintLessThan(u32, 0x80))) | (if (r.boolean()) @as(u16, 0x8000) else 0),
++        };
++        switch (how) {
++            .ties => {
++                // the maximum at several columns, the first of them the pick
++                const top = bf16Bits(9.5);
++                for (0..5) |_| x[r.uintLessThan(usize, n)] = top;
++            },
++            .nan => x[r.uintLessThan(usize, n)] = 0x7fc0 | @as(u16, @intCast(r.uintLessThan(u32, 0x3f))),
++            .inf => x[r.uintLessThan(usize, n)] = 0x7f80,
++            .neg_inf => for (x) |*v| {
++                v.* = 0xff80;
++            },
++            .zeros => {
++                // the row's maximum is zero, both signs present
++                for (x) |*v| v.* = bf16Bits(-@abs(@as(f32, @floatCast(r.floatNorm(f64)))) - 1.0);
++                x[r.uintLessThan(usize, n)] = 0x8000;
++                x[r.uintLessThan(usize, n)] = 0x0000;
++            },
++            .mixed => {
++                x[r.uintLessThan(usize, n)] = 0xff80;
++                x[r.uintLessThan(usize, n)] = 0x0001;
++                x[r.uintLessThan(usize, n)] = bf16Bits(80.0);
++            },
++            else => {},
++        }
++    }
++}
++
++pub fn check(gpa: std.mem.Allocator, d: *const cuda.Driver, th: tops.Torch, rows_list: []const usize) !bool {
++    var prng = std.Random.DefaultPrng.init(0x4e71_a1d4);
++    const r = prng.random();
++    var all = true;
++    var max_rows: usize = 0;
++    for (rows_list) |m| max_rows = @max(max_rows, m);
++    for (widths) |n| {
++        const sz = try tops.Torch.Sample.bytes(th.f, 1, n, 1);
++        var scratch: [7]cuda.DeviceBuffer = undefined;
++        var taken: usize = 0;
++        defer for (scratch[0..taken]) |*b| b.free();
++        var s: tops.Torch.Sample = undefined;
++        inline for (.{ "f32", "vals", "idx", "topk", "lse", "lse_scratch", "col" }, 0..) |name, i| {
++            scratch[i] = try cuda.DeviceBuffer.alloc(d, @max(sz[i], 256));
++            taken += 1;
++            @field(s, name) = scratch[i].ptr;
++        }
++        var x = try cuda.DeviceBuffer.alloc(d, max_rows * n * 2);
++        defer x.free();
++        var o1 = try cuda.DeviceBuffer.alloc(d, max_rows * 3 * 4);
++        defer o1.free();
++        var o2 = try cuda.DeviceBuffer.alloc(d, max_rows * 3 * 4);
++        defer o2.free();
++        const h = try gpa.alloc(u16, max_rows * n);
++        defer gpa.free(h);
++        const h1 = try gpa.alloc(f32, max_rows * 3);
++        defer gpa.free(h1);
++        const h2 = try gpa.alloc(f32, max_rows * 3);
++        defer gpa.free(h2);
++        for (fills) |how| {
++            fill(h, max_rows, n, r, how);
++            try x.upload(0, std.mem.sliceAsBytes(h));
++            for (rows_list) |m| {
++                try o1.fill8(0xA5, th.s.handle);
++                try o2.fill8(0x5A, th.s.handle);
++                // the old way: each row copied alone (draftGreedy's toF32 at offset 0), its [max, lse, col]
++                for (0..m) |row| try th.draftGreedy(x.ptr + row * n * 2, n, s, o1.ptr + row * 12);
++                try th.draftGreedyRows(x.ptr, m, n, o2.ptr);
++                try th.s.synchronize();
++                try o1.download(0, std.mem.sliceAsBytes(h1[0 .. m * 3]));
++                try o2.download(0, std.mem.sliceAsBytes(h2[0 .. m * 3]));
++                var differ: usize = 0;
++                var first: ?usize = null;
++                for (0..m * 3) |i| if (@as(u32, @bitCast(h1[i])) != @as(u32, @bitCast(h2[i]))) {
++                    differ += 1;
++                    if (first == null) first = i;
++                };
++                if (differ != 0) all = false;
++                std.debug.print("{s} draft greedy rows N {d} {s} rows {d}", .{ if (differ == 0) "EQUAL" else "DIFFER", n, @tagName(how), m });
++                if (first) |f0| std.debug.print(": {d} of {d} values differ, first row {d} field {d}: {x:0>8} vs {x:0>8}", .{ differ, m * 3, f0 / 3, f0 % 3, @as(u32, @bitCast(h1[f0])), @as(u32, @bitCast(h2[f0])) });
++                std.debug.print("\n", .{});
++            }
++        }
++    }
++    return all;
++}
++
++/// Mean microseconds of `rows` greedy draws the old way (one row's four launches each, one wait at the end) and
++/// batched (one launch), `reps` each, over the draft vocabulary's width.
++pub fn bench(gpa: std.mem.Allocator, d: *const cuda.Driver, th: tops.Torch, rows_list: []const usize, reps: usize) !void {
++    var prng = std.Random.DefaultPrng.init(7);
++    const r = prng.random();
++    const n = widths[0];
++    var max_rows: usize = 0;
++    for (rows_list) |m| max_rows = @max(max_rows, m);
++    const sz = try tops.Torch.Sample.bytes(th.f, 1, n, 1);
++    var scratch: [7]cuda.DeviceBuffer = undefined;
++    var taken: usize = 0;
++    defer for (scratch[0..taken]) |*b| b.free();
++    var s: tops.Torch.Sample = undefined;
++    inline for (.{ "f32", "vals", "idx", "topk", "lse", "lse_scratch", "col" }, 0..) |name, i| {
++        scratch[i] = try cuda.DeviceBuffer.alloc(d, @max(sz[i], 256));
++        taken += 1;
++        @field(s, name) = scratch[i].ptr;
++    }
++    var x = try cuda.DeviceBuffer.alloc(d, max_rows * n * 2);
++    defer x.free();
++    var o = try cuda.DeviceBuffer.alloc(d, max_rows * 3 * 4);
++    defer o.free();
++    const h = try gpa.alloc(u16, max_rows * n);
++    defer gpa.free(h);
++    fill(h, max_rows, n, r, .normal);
++    try x.upload(0, std.mem.sliceAsBytes(h));
++    var e0 = try cuda.Event.init(d, true);
++    defer e0.deinit();
++    var e1 = try cuda.Event.init(d, true);
++    defer e1.deinit();
++    for (rows_list) |m| {
++        var us: [2]f64 = undefined;
++        for (0..2) |which| {
++            for (0..3) |_| if (which == 0) {
++                for (0..m) |row| try th.draftGreedy(x.ptr + row * n * 2, n, s, o.ptr + row * 12);
++            } else try th.draftGreedyRows(x.ptr, m, n, o.ptr);
++            try e0.record(th.s);
++            for (0..reps) |_| if (which == 0) {
++                for (0..m) |row| try th.draftGreedy(x.ptr + row * n * 2, n, s, o.ptr + row * 12);
++            } else try th.draftGreedyRows(x.ptr, m, n, o.ptr);
++            try e1.record(th.s);
++            try e1.synchronize();
++            us[which] = @as(f64, try cuda.Event.elapsedMs(e0, e1)) * 1000.0 / @as(f64, @floatFromInt(reps));
++        }
++        std.debug.print("draft greedy N {d} rows {d}: a row at a time {d:.1} us, one launch {d:.1} us ({d:.2}x)\n", .{ n, m, us[0], us[1], us[0] / us[1] });
++    }
++}
+diff --git a/zig/src/families/flashnext/cuda_engine.zig b/zig/src/families/flashnext/cuda_engine.zig
+index 765b530..9e18f0f 100644
+--- a/zig/src/families/flashnext/cuda_engine.zig
++++ b/zig/src/families/flashnext/cuda_engine.zig
+@@ -327,6 +327,13 @@ pub const Engine = struct {
+     cand_have: u64 = std.math.maxInt(u64),
+     /// TF_FLASHNEXT_DRAW_ONCE=0: each window's and draft's draws read the candidates again (the old way)
+     draw_once: bool = true,
++    /// TF_FLASHNEXT_BATCH_DRAWS=0: a draft level's greedy draws one stream at a time (the old way)
++    batch_draws: bool = true,
++    /// TF_FLASHNEXT_BATCH_WINDOWS=0: a shared round's greedy window draws one window at a time (the old way)
++    batch_windows: bool = true,
++    /// one rank, greedy windows: the round's argmax over every window's rows, read once (cand_round it belongs to)
++    round_ids: []i32 = &.{},
++    ids_have: u64 = std.math.maxInt(u64),
+     /// generateMany's served hybrid (gate-many --served): a running product applies while at most this many streams
+     /// are live, `wide_confidence` above (maxInt: the request's rule always)
+     product_streams: usize = std.math.maxInt(usize),
+@@ -451,6 +458,8 @@ pub const Engine = struct {
+         const rows = @max(8, @max(@max(1, o.streams) * (e.depth + 1), window));
+         e.round_segs = try gpa.alloc(fwd.Seg, @max(1, o.streams));
+         errdefer gpa.free(e.round_segs);
++        e.round_ids = try gpa.alloc(i32, rows);
++        errdefer gpa.free(e.round_ids);
+         const ag = tri.AttnGeometry.init(e.max_len, e.g.index_budget, e.g.index_ratio);
+         e.buf = .{ .b = try state.Buffers.init(d, e.g, rows, .{ .moe_prefill = true, .capacity = e.max_len }), .y_f32 = false, .attn = ag };
+         errdefer e.buf.deinit();
+@@ -495,6 +504,11 @@ pub const Engine = struct {
+         // prompt matmuls without split-K partials when the kernel set has them (TF_FLASHNEXT_PROMPT_MM=0: off)
+         e.f.prompt_mm = !envOff(prompt_mm.env) and prompt_mm.available(&e.set);
+         e.draw_once = !envOff("TF_FLASHNEXT_DRAW_ONCE");
++        // one rank, greedy: a draft level's draws and a shared round's window draws in one launch and one read each
++        // (TF_FLASHNEXT_BATCH_DRAWS=0 / TF_FLASHNEXT_BATCH_WINDOWS=0: one stream / one window at a time)
++        e.batch_draws = !envOff("TF_FLASHNEXT_BATCH_DRAWS");
++        e.batch_windows = !envOff("TF_FLASHNEXT_BATCH_WINDOWS");
++        if (o.world == 1) std.log.info("greedy draws: a draft level's {s}, a shared round's windows {s}", .{ if (e.batch_draws) "in one launch" else "a stream at a time", if (e.batch_windows) "in one launch" else "a window at a time" });
+         // the shared expert beside the routed experts on a second stream (TF_FLASHNEXT_SHARED_SIDE=0: in line)
+         if (!envOff("TF_FLASHNEXT_SHARED_SIDE")) try e.f.initSide();
+         // INT4-AutoRound's projections: block-FP8 columns stored in place (TF_FLASHNEXT_FP8_LD=0: scratch + copy)
+@@ -597,7 +611,7 @@ pub const Engine = struct {
+         const main_sz = try sampleSizes(&e.torch.f, &.{ .{ state.max_rows, e.g.head_n, max_k }, .{ 1, e.g.head_n, max_k }, .{ rows, e.g.head_n, state.cand }, .{ 1, draft_n, state.cand }, .{ rows, draft_n, state.cand } });
+         const draft_sz = try sampleSizes(&e.torch.f, &.{.{ 1, draft_n, draft_n }});
+         const pack = state.max_rows * (2 * max_k + 1) * 4;
+-        const fixed = [_]usize{ e.g.head_n * 2, o.world * (2 * state.cand + 1) * 4, (2 * draft_n + 1) * 4, if (o.world > 1) pack else 0, if (o.world > 1) o.world * pack else 0, @max(e.g.head_n, draft_n) * 8, 8, 8 };
++        const fixed = [_]usize{ e.g.head_n * 2, o.world * (2 * state.cand + 1) * 4, (2 * draft_n + 1) * 4, if (o.world > 1) pack else 0, if (o.world > 1) o.world * pack else 0, @max(e.g.head_n, draft_n) * 8, 8, 8, mtp.Draws.max_batch_rows * 3 * 4 };
+         e.extra = .{ .buf = try cuda.DeviceBuffer.alloc(d, aligned(&main_sz) + aligned(&draft_sz) + aligned(&fixed)) };
+         errdefer e.extra.buf.free();
+         try e.extra.buf.fill8(0, null);
+@@ -607,11 +621,12 @@ pub const Engine = struct {
+         e.last_logits = e.extra.take(fixed[0]);
+         e.last_cand = e.extra.take(fixed[1]);
+         const draft_out = e.extra.take(fixed[2]);
++        const draft_rows_out = e.extra.take(fixed[8]);
+         if (o.world > 1) e.tp = .{ .s = e.main_sample, .pack = e.extra.take(fixed[3]), .all = e.extra.take(fixed[4]), .max_rows = state.max_rows, .max_k = max_k };
+         e.nsc = .{ .mass = e.extra.take(fixed[5]), .top = e.extra.take(fixed[6]), .sum = e.extra.take(fixed[7]) };
+         if (e.w.mtp != null) {
+             if (e.w.draft_head != null) e.draft_host = try weights.draftIds(gpa, weights.draft_vocab, e.c.vocab, o.rank, o.world);
+-            e.draws = .{ .gpa = gpa, .ids = if (e.w.draft_head != null) e.draft_host else null, .columns = draft_n, .world = o.world, .s = draft_s, .out = draft_out, .max_k = draft_n, .tp = e.tp, .nsc = e.nsc };
++            e.draws = .{ .gpa = gpa, .ids = if (e.w.draft_head != null) e.draft_host else null, .columns = draft_n, .world = o.world, .s = draft_s, .out = draft_out, .max_k = draft_n, .rows_out = draft_rows_out, .tp = e.tp, .nsc = e.nsc };
+         }
+         errdefer gpa.free(e.draft_host);
+         if (o.vmm) {
+@@ -686,6 +701,7 @@ pub const Engine = struct {
+         e.freeSeq(e.own);
+         e.gpa.free(e.draft_host);
+         e.gpa.free(e.round_segs);
++        e.gpa.free(e.round_ids);
+         e.extra.buf.free();
+         if (e.prof) |p| p.deinit(e.gpa);
+         e.cand_host.deinit(e.gpa);
+@@ -1511,6 +1527,17 @@ pub const Engine = struct {
+             }
+             return e.chooseFrom(e.cand_host.items, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, out);
+         }
++        if (e.world == 1 and smp == null and e.batch_windows and e.round_n > 1 and total <= e.round_ids.len) {
++            // one rank, greedy: the round's argmax over every window's rows in one launch, read once (one wait); a
++            // row's pick is one block's whichever rows share the launch (one launch and one wait a round, not a window)
++            if (e.ids_have != e.cand_round) {
++                try e.f.th.argmax(e.buf.b.logits, e.g.head_n, e.g.head_n, e.main_sample.col, total);
++                try e.read(e.main_sample.col, std.mem.sliceAsBytes(e.round_ids[0..total]));
++                e.ids_have = e.cand_round;
++            }
++            for (out[0 .. sg.a1 - sg.a0], e.round_ids[sg.a0..sg.a1]) |*o, x| o.* = @intCast(x);
++            return;
++        }
+         try e.drawRows(e.buf.b.logits, e.buf.b.cand_all, total, sg.a0, sg.a1 - sg.a0, sg.seq.st.pos + 1, smp, out);
+     }
+ 
+@@ -1611,11 +1638,25 @@ pub const Engine = struct {
+                 cands = c;
+                 try e.read(mb.b.cand_all, std.mem.sliceAsBytes(c));
+             }
++            // one rank: every greedy stream's draw in one launch and one read (the step's rows, each row's bytes as
++            // its own draw's); the sampled streams keep their own draws (the draws were one launch and one
++            // wait a stream a level, ~130 us each at 4 streams)
++            var picks: [mtp.Draws.max_batch_rows * 3]f32 = undefined;
++            var batched = false;
++            if (e.world == 1 and rows <= mtp.Draws.max_batch_rows and e.batch_draws) {
++                for (active[0..n_active]) |a| if (reqs[a.req].sampling == null or reqs[a.req].sampling.?.temperature <= 0) {
++                    try d.sampleDraftRows(&e.f, lg, rows, picks[0 .. rows * 3]);
++                    batched = true;
++                    break;
++                };
++            }
+             for (active[0..n_active], 0..) |a, k| {
+                 const r = &reqs[a.req];
+                 const smp: ?lanes.Sampling = if (r.sampling) |x| (if (x.temperature > 0) x else null) else null;
+                 const got = if (cands != null and sampler.gatheredFits(smp))
+                     try d.gatheredFrom(cands.?, row_of[k], rows, r.seq.st.pos + 1 + j, smp)
++                else if (batched and smp == null)
++                    d.drawOfRow(picks[row_of[k] * 3 ..][0..3])
+                 else
+                     try d.sampleDraftRow(&e.f, mb, lg, row_of[k], rows, r.seq.st.pos + 1 + j, smp);
+                 const t = stops[a.req].take(j, got.prob);
+diff --git a/zig/src/families/flashnext/cuda_mtp.zig b/zig/src/families/flashnext/cuda_mtp.zig
+index f7b31ba..f8a39f0 100644
+--- a/zig/src/families/flashnext/cuda_mtp.zig
++++ b/zig/src/families/flashnext/cuda_mtp.zig
+@@ -202,6 +202,8 @@ pub const Draws = struct {
+     out: u64,
+     /// the most top-k values `out` holds (columns: any top_k)
+     max_k: usize,
++    /// one rank: a shared step's rows' greedy picks, [max_batch_rows, 3] fp32 (sampleDraftRows)
++    rows_out: u64 = 0,
+     /// two ranks: tp_sample_rows' scratch, for samplers past the gathered candidates
+     tp: ?TpScratch = null,
+     /// two ranks, top_k off: nucleus_rows' device scratch
+@@ -246,6 +248,24 @@ pub const Draws = struct {
+         return sampler.drawRow(d.gpa, got[0..k], ids, position, s, got[k]);
+     }
+ 
++    /// The most rows sampleDraftRows draws at once (a shared step's streams: Engine.draftMany's 64).
++    pub const max_batch_rows = 64;
++
++    /// One rank, greedy: sampleDraftRow's device half over rows [0, rows) of the head's `rows` rows in one launch and
++    /// one read into `got` [rows, 3] (each row's [max, lse, column], the bytes of its own draftGreedy); drawOfRow
++    /// turns a row's three into its draw.
++    pub fn sampleDraftRows(d: *const Draws, f: *Forward, logits_base: u64, rows: usize, got: []f32) !void {
++        if (d.world > 1 or rows > max_batch_rows or got.len < rows * 3) return error.TopKPastScratch;
++        try f.th.draftGreedyRows(logits_base, rows, d.columns, d.rows_out);
++        try d.read(f, d.rows_out, std.mem.sliceAsBytes(got[0 .. rows * 3]));
++    }
++
++    /// sampleDraftRow's host half of a greedy row sampleDraftRows read: the token and its probability.
++    pub fn drawOfRow(d: *const Draws, got: []const f32) sampler.Draw {
++        const c: usize = @intFromFloat(got[2]);
++        return .{ .token = d.id(c), .prob = exp(@as(f64, got[0]) - @as(f64, got[1])) };
++    }
++
+     /// decode.sample_mapped (a chain without the confidence rule): the keyed draw over the head's row.
+     pub fn drawDraft(d: *const Draws, f: *Forward, x: *const Bufs, logits: u64, position: u64, s: ?lanes.Sampling) !u64 {
+         if (d.world > 1) return (try d.gathered(f, x, 0, 1, position, s)).token;
+diff --git a/zig/src/families/flashnext/cuda_torch_ops.zig b/zig/src/families/flashnext/cuda_torch_ops.zig
+index c2f5bd6..0ad879a 100644
+--- a/zig/src/families/flashnext/cuda_torch_ops.zig
++++ b/zig/src/families/flashnext/cuda_torch_ops.zig
+@@ -23,6 +23,8 @@ const kk = cuda.kernels;
+ /// topk.cu's column tile and threads; its workspace is four 8-bit digit passes, then ordered compaction.
+ const topk_tile = 4096;
+ const topk_threads = 256;
++/// fn_logsumexp.cu's kMaxThreads: the widest block its trees take, and the most CTA partials the greedy-rows kernel folds.
++const kMaxBlock = 512;
+ 
+ fn tiles(columns: usize) usize {
+     return (columns + topk_tile - 1) / topk_tile;
+@@ -99,12 +101,14 @@ pub const Lse = struct {
+     max: cuda.Function,
+     sum: cuda.Function,
+     finish: cuda.Function,
++    /// the draft head's greedy draws over several rows at once (draftGreedyRows)
++    greedy_rows: cuda.Function,
+     /// the device's multiprocessors and threads a multiprocessor (ATen sizes its CTAs by them); Ops.load sets them
+     mp: usize = 0,
+     threads_mp: usize = 0,
+ 
+     fn resolve(m: cuda.Module) !Lse {
+-        return .{ .max = try m.function("tf_fn_lse_max_kernel"), .sum = try m.function("tf_fn_lse_sum_kernel"), .finish = try m.function("tf_fn_lse_finish_kernel") };
++        return .{ .max = try m.function("tf_fn_lse_max_kernel"), .sum = try m.function("tf_fn_lse_sum_kernel"), .finish = try m.function("tf_fn_lse_finish_kernel"), .greedy_rows = try m.function("tf_fn_draft_greedy_rows_kernel") };
+     }
+ 
+     pub const Config = struct { bw: usize, bh: usize, grid_x: usize, ctas: usize, split: bool };
+@@ -449,6 +453,21 @@ pub const Torch = struct {
+         try t.draftPick(logits, s.col, s.lse, out);
+     }
+ 
++    /// draftGreedy over `rows` consecutive rows of the draft head's bf16 logits (`columns` apart): out [rows, 3]
++    /// (draftPick's [max, lse, column] a row), each row's bytes as draftGreedy's over that row alone - one launch and
++    /// one read for a shared step's streams instead of one each. One block a row, in ATen's single-row
++    /// reduce config (fn_logsumexp.cu tf_fn_draft_greedy_rows_kernel).
++    pub fn draftGreedyRows(t: Torch, logits: u64, rows: usize, columns: usize, out: u64) !void {
++        if (rows == 0) return;
++        const c = try Lse.config(1, columns, t.f.lse.mp, t.f.lse.threads_mp);
++        if (c.bh != 1 or c.ctas > kMaxBlock or rows > 65535) return error.LseShape;
++        var a: cuda.Args = .{};
++        a.add(logits);
++        a.add(out);
++        for ([_]usize{ rows, columns, c.ctas }) |v| a.add(@as(u32, @intCast(v)));
++        try t.go(t.f.lse.greedy_rows, .{ rows, 1 }, @intCast(c.bw), &a);
++    }
++
+     /// Engine.sample_draft with a top_k: out [2k + 1] (draftPack) from the draft head's bf16 row.
+     pub fn draftTopk(t: Torch, logits: u64, columns: usize, k: usize, s: Sample, out: u64) !void {
+         try t.toF32(logits, s.f32, columns);
