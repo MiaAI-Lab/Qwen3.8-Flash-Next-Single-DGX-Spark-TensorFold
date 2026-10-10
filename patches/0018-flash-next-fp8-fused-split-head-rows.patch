@@ -1,0 +1,593 @@
+diff --git a/zig/kernels/cuda/fn_int4.cu b/zig/kernels/cuda/fn_int4.cu
+index 338b220..6548b0b 100644
+--- a/zig/kernels/cuda/fn_int4.cu
++++ b/zig/kernels/cuda/fn_int4.cu
+@@ -186,9 +186,10 @@ __device__ __forceinline__ void store(const float (&acc)[MATS][NT][4], void* out
+ }
+ 
+ // A warp a unit: (item, NT n8 tiles of every matrix). Items (expert, first member, count) from the experts plan, or,
+-// with `items` null, the dense rows [16 i, 16 i + 16) of `rows` (the head: one matrix, members the rows themselves).
+-// `slots`: a member p reads input row p / slots (gate/up from token rows), 0: row p (down from pair rows). A pass
+-// takes MT tiles of 16 rows: the weights a group are loaded once for them (prompt items of up to 64 pairs).
++// with `items` null, the dense rows [16 MT i, 16 MT (i + 1)) of `rows` (the head: one matrix, members the rows
++// themselves). `slots`: a member p reads input row p / slots (gate/up from token rows), 0: row p (down from pair
++// rows). A pass takes MT tiles of 16 rows: the weights a group are loaded once for them (prompt items of up to 64
++// pairs, the head's 32-row items).
+ template <int GS, int NT, int MT, int MATS, int EPI, int WARPS>
+ __global__ void __launch_bounds__(WARPS * 32)
+     int4_kernel(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint32_t* __restrict__ W,
+@@ -197,12 +198,13 @@ __global__ void __launch_bounds__(WARPS * 32)
+                 int out_stride, float limit, int skip) {
+   const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
+   const int KG = K / GS, NB = N / (8 * NT);
+-  const int n_items = items ? __ldg(counts) : (rows + 15) / 16;
++  // dense items of 16 MT rows (the head of rows > 16 at MT 2: its weights read once for 32 rows)
++  const int n_items = items ? __ldg(counts) : (rows + 16 * MT - 1) / (16 * MT);
+   const int units = n_items * NB;
+   const size_t mat_words = (size_t)N * K / 8, mat_scales = (size_t)N * KG;
+   for (int unit = blockIdx.x * WARPS + (threadIdx.x >> 5); unit < units; unit += gridDim.x * WARPS) {
+     const int it = unit / NB, cb = unit - it * NB;
+-    int e = 0, first = 16 * it, cnt = min(16, rows - 16 * it);
++    int e = 0, first = 16 * MT * it, cnt = min(16 * MT, rows - 16 * MT * it);
+     if (items) {
+       e = __ldg(items + 3 * it);
+       first = __ldg(items + 3 * it + 1);
+diff --git a/zig/kernels/cuda/fn_qmmf.cu b/zig/kernels/cuda/fn_qmmf.cu
+index b01c2e4..fef6922 100644
+--- a/zig/kernels/cuda/fn_qmmf.cu
++++ b/zig/kernels/cuda/fn_qmmf.cu
+@@ -310,3 +310,13 @@ TF_QMMF(32, true, true, false)
+ TF_QMMF(64, true, true, false)
+ TF_QMMF(64, false, false, true)
+ TF_QMMF(64, true, false, true)
++// The fused form (one block adds its tile's K slices in slice order, as the cluster does) at the decode row tiles 16
++// and 32, pipeline depths 4 and 8 (cuda_fp8.zig Mode.fuse; the per-output arithmetic and the slice order do not depend
++// on STAGES).
++#define TF_QMMF_S(BM, F32, CLUSTER, FUSE, ST) template __global__ void tf_fn_qmmf::qmmf_kernel<3, BM, 64, 1, 4, ST, \
++    F32, CLUSTER, FUSE>(const __nv_bfloat16*, const unsigned char*, const uint8_t*, float, void*, float*, int, int, \
++    int, int, int, int, int);
++#define TF_QMMF_F(ST) TF_QMMF_S(16, false, false, true, ST) TF_QMMF_S(32, false, false, true, ST) \
++    TF_QMMF_S(16, true, false, true, ST) TF_QMMF_S(32, true, false, true, ST)
++TF_QMMF_F(4)
++TF_QMMF_F(8)
+diff --git a/zig/kernels/cuda/fn_qmmf_ld.cu b/zig/kernels/cuda/fn_qmmf_ld.cu
+index 2496ef8..b3e24d8 100644
+--- a/zig/kernels/cuda/fn_qmmf_ld.cu
++++ b/zig/kernels/cuda/fn_qmmf_ld.cu
+@@ -305,3 +305,9 @@ TF_QMMF_LD(16, true, false)
+ TF_QMMF_LD(32, true, false)
+ TF_QMMF_LD(64, true, false)
+ TF_QMMF_LD(64, false, true)
++// fn_qmmf.cu's fused decode tiles 16, 32 (STAGES 4, 8), bf16 out.
++#define TF_QMMF_LD_S(BM, CLUSTER, FUSE, ST) template __global__ void tf_fn_qmmf_ld::qmmf_kernel<3, BM, 64, 1, 4, ST, \
++    false, CLUSTER, FUSE>(const __nv_bfloat16*, const unsigned char*, const uint8_t*, float, void*, float*, int, int, \
++    int, int, int, int, int, int);
++TF_QMMF_LD_S(16, false, true, 4) TF_QMMF_LD_S(32, false, true, 4) TF_QMMF_LD_S(16, false, true, 8)
++TF_QMMF_LD_S(32, false, true, 8)
+diff --git a/zig/src/cli/flashnext_cuda.zig b/zig/src/cli/flashnext_cuda.zig
+index dc7a314..a7c023e 100644
+--- a/zig/src/cli/flashnext_cuda.zig
++++ b/zig/src/cli/flashnext_cuda.zig
+@@ -47,6 +47,10 @@ const usage =
+     \\           Python's Fp8BlockLinear on tools/zig/check_fp8block.py's cases in DIR, bytes compared, timed)
+     \\  tensorfold int4-check MODEL   (no weights: the GPTQ int4 expert and head kernels (cuda_int4.zig) against a host
+     \\           reference from the GPTQ bytes, row/tile invariance, plan == dense, then their speed)
++    \\  tensorfold fp8-fused-check MODEL   (no weights: block-FP8 split-K shapes below 256 rows on the fused form
++    \\           (TF_FLASHNEXT_FP8_FUSED_SPLIT 4 and 8) against the cluster kernel, bytes compared, a mutant, timed)
++    \\  tensorfold int4-head-check MODEL   (no weights: the int4 head's 32-row items (TF_FLASHNEXT_HEAD_ROW_TILES=2)
++    \\           against 16-row items and 1-row calls, bytes compared, then both timed)
+     \\  tensorfold draft-check MODEL [--rows N,N,...]   (no weights: the batched greedy draft draw (one block a row)
+     \\           against the per-row draw it replaces, bytes compared on adversarial rows, then both timed)
+     \\  tensorfold agree MODEL CAPTURE_DIR --report OUT.json [--against REF.json] [--max-tokens N] [--only NAME,...]
+@@ -274,6 +278,22 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
+         std.debug.print("{s} int4-check: the GPTQ int4 kernels against the host order, row and tile invariance, plan == dense\n", .{if (ok) "PASS" else "FAIL"});
+         return if (ok) 0 else 1;
+     }
++    // the fused split-K block-FP8 decode tiles against the cluster kernel (bytes, then speed without L2 reuse), and
++    // the int4 head's 32-row items against 16-row ones
++    if (std.mem.eql(u8, cmd, "fp8-fused-check")) {
++        const ok = try flashnext.fp8.fusedCheck(gpa, &ctx);
++        std.debug.print("{s} fp8-fused-check: every fused split-K tile byte-equal to the cluster kernel\n", .{if (ok) "PASS" else "FAIL"});
++        return if (ok) 0 else 1;
++    }
++    if (std.mem.eql(u8, cmd, "int4-head-check")) {
++        var k = try flashnext.kernels.Kernels.load(&ctx);
++        defer k.deinit();
++        var stream = try cuda.Stream.init(ctx.d, true);
++        defer stream.deinit();
++        const ok = try flashnext.int4_check.headRowsCheck(gpa, &ctx, .{ .k = &k, .s = stream });
++        std.debug.print("{s} int4-head-check: the head at 32-row items byte-equal to 16-row items and to 1-row calls\n", .{if (ok) "PASS" else "FAIL"});
++        return if (ok) 0 else 1;
++    }
+     if (std.mem.eql(u8, cmd, "qsa-check")) return qsaCheck(gpa, init.io, &ctx, kernels);
+     if (std.mem.eql(u8, cmd, "fp4-check")) return fp4Check(gpa, init.io, &ctx, kernels, o);
+     if (std.mem.eql(u8, cmd, "glue-check")) return glueCheck(gpa, init.io, &ctx, kernels);
+diff --git a/zig/src/families/flashnext/cuda_fp8.zig b/zig/src/families/flashnext/cuda_fp8.zig
+index 427b8e0..50704ac 100644
+--- a/zig/src/families/flashnext/cuda_fp8.zig
++++ b/zig/src/families/flashnext/cuda_fp8.zig
+@@ -38,9 +38,38 @@ pub fn bucket(m: usize) usize {
+ 
+ /// qmmf.cu Tile<FP8G, BM, 64, 1, 4, 4>::SMEM: max(4 stages, the cluster partials).
+ pub fn smem(bm: usize) u32 {
++    return smemS(bm, 4);
++}
++
++/// Tile<FP8G, BM, 64, 1, 4, STAGES>::SMEM.
++pub fn smemS(bm: usize, stages: usize) u32 {
+     const stage = std.mem.alignForward(usize, bm * 128 + 64 * 64 + 64 * 4, 128);
+     const partials = (bm / 16) * 2 * 4 * 128 * 4;
+-    return @intCast(@max(4 * stage, partials));
++    return @intCast(@max(stages * stage, partials));
++}
++
++/// How split-K shapes below FUSED_ROWS run (fp8-fused-check: the same bits as the cluster kernel): `fuse` 0 on the
++/// cluster kernel (one block a K slice, the slices added in the cluster), 4 or 8 on the fused form (one block a
++/// 64-column tile walks its K slices and adds them in slice order, as the cluster does) at that pipeline depth for
++/// row tiles 16 and 32 (row tile 64 takes the prompt's fused kernel). Only shapes of at least `fuse_n` columns (n /
++/// 64 blocks walk all slices; a narrow shape such as the MTP layer's hyper-connection down, a few column tiles over
++/// K 10240, would leave the GPU nearly empty: measured 0.51 -> 1.16 ms a round). TF_FLASHNEXT_FP8_FUSED_SPLIT (0, 4,
++/// 8) and TF_FLASHNEXT_FP8_FUSED_SPLIT_N. `mutant` (fp8-fused-check only, never from the environment): the fused
++/// form told half the slices, which the check must see.
++pub const Mode = struct { fuse: u8 = 0, fuse_n: usize = 2048, mutant: bool = false };
++
++fn envInt(name: [*:0]const u8, default: usize) usize {
++    const v = std.c.getenv(name) orelse return default;
++    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch default;
++}
++
++pub fn modeFromEnv() Mode {
++    const fu = envInt("TF_FLASHNEXT_FP8_FUSED_SPLIT", 0);
++    const m: Mode = .{ .fuse = if (fu == 4 or fu == 8) @intCast(fu) else 0, .fuse_n = envInt("TF_FLASHNEXT_FP8_FUSED_SPLIT_N", 2048) };
++    if (m.fuse != 0) {
++        std.log.info("block-FP8 split-K shapes of {d}+ columns below {d} rows: one block a column tile, its K slices in slice order (TF_FLASHNEXT_FP8_FUSED_SPLIT={d})", .{ m.fuse_n, fused_rows, m.fuse });
++    } else std.log.info("block-FP8 split-K shapes below {d} rows on the cluster kernel (TF_FLASHNEXT_FP8_FUSED_SPLIT=0)", .{fused_rows});
++    return m;
+ }
+ 
+ /// qmmf.cu launch's L2 band: row tiles whose inputs fill about 12 MB.
+@@ -51,7 +80,10 @@ pub fn l2Group(rows_t: usize, bm: usize, k: usize) usize {
+ /// Mangled names of the FP8G instantiations (fn_qmmf.cu's footer): [F32][cluster][bm 16, 32, 64], and the fused [F32].
+ pub const sym = struct {
+     fn name(comptime bm: u32, comptime f32_out: bool, comptime cluster: bool, comptime fuse: bool) [:0]const u8 {
+-        return std.fmt.comptimePrint("_ZN10tf_fn_qmmf11qmmf_kernelILi3ELi{d}ELi64ELi1ELi4ELi4ELb{d}ELb{d}ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{ bm, @intFromBool(f32_out), @intFromBool(cluster), @intFromBool(fuse) });
++        return nameS(bm, f32_out, cluster, fuse, 4);
++    }
++    fn nameS(comptime bm: u32, comptime f32_out: bool, comptime cluster: bool, comptime fuse: bool, comptime st: u32) [:0]const u8 {
++        return std.fmt.comptimePrint("_ZN10tf_fn_qmmf11qmmf_kernelILi3ELi{d}ELi64ELi1ELi4ELi{d}ELb{d}ELb{d}ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{ bm, st, @intFromBool(f32_out), @intFromBool(cluster), @intFromBool(fuse) });
+     }
+     pub const tiled = blk: {
+         var out: [2][2][3][:0]const u8 = undefined;
+@@ -61,9 +93,20 @@ pub const sym = struct {
+         break :blk out;
+     };
+     pub const fused = [2][:0]const u8{ name(64, false, false, true), name(64, true, false, true) };
++    /// the fused form at the decode row tiles (Mode.fuse): [depth 4, 8][F32][bm 16, 32]
++    pub const fuse_s = blk: {
++        var out: [2][2][2][:0]const u8 = undefined;
++        for (0..2) |q| for (0..2) |f| for (0..2) |b| {
++            out[q][f][b] = nameS(16 << b, f == 1, false, true, 4 + 4 * q);
++        };
++        break :blk out;
++    };
+     /// fn_qmmf_ld.cu's (tools/zig/flashnext_qmmf_ld.py): bf16 out with a row stride, [cluster][bm 16, 32, 64] and fused
+     fn ldName(comptime bm: u32, comptime cluster: bool, comptime fuse: bool) [:0]const u8 {
+-        return std.fmt.comptimePrint("_ZN13tf_fn_qmmf_ld11qmmf_kernelILi3ELi{d}ELi64ELi1ELi4ELi4ELb0ELb{d}ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiiii", .{ bm, @intFromBool(cluster), @intFromBool(fuse) });
++        return ldNameS(bm, cluster, fuse, 4);
++    }
++    fn ldNameS(comptime bm: u32, comptime cluster: bool, comptime fuse: bool, comptime st: u32) [:0]const u8 {
++        return std.fmt.comptimePrint("_ZN13tf_fn_qmmf_ld11qmmf_kernelILi3ELi{d}ELi64ELi1ELi4ELi{d}ELb0ELb{d}ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiiii", .{ bm, st, @intFromBool(cluster), @intFromBool(fuse) });
+     }
+     pub const ld_tiled = blk: {
+         var out: [2][3][:0]const u8 = undefined;
+@@ -73,6 +116,13 @@ pub const sym = struct {
+         break :blk out;
+     };
+     pub const ld_fused = ldName(64, false, true);
++    pub const ld_fuse_s = blk: {
++        var out: [2][2][:0]const u8 = undefined;
++        for (0..2) |q| for (0..2) |b| {
++            out[q][b] = ldNameS(16 << b, false, true, 4 + 4 * q);
++        };
++        break :blk out;
++    };
+ };
+ 
+ pub const Kernels = struct {
+@@ -83,6 +133,10 @@ pub const Kernels = struct {
+     ld_module: cuda.Module,
+     ld_tiled: [2][3]cuda.Function,
+     ld_fused: cuda.Function,
++    /// the fused decode tiles (Mode.fuse): [depth 4, 8][F32][bm 16, 32], and their ld forms
++    fuse_s: [2][2][2]cuda.Function,
++    ld_fuse_s: [2][2]cuda.Function,
++    mode: Mode,
+     major: c_int,
+ 
+     pub fn load(ctx: *const cuda.Context) !Kernels {
+@@ -106,6 +160,17 @@ pub const Kernels = struct {
+         };
+         k.ld_fused = try k.ld_module.function(sym.ld_fused);
+         try k.ld_fused.allowDynamicShared(smem(64));
++        for (0..2) |q| {
++            for (0..2) |f| for (0..2) |b| {
++                k.fuse_s[q][f][b] = try k.module.function(sym.fuse_s[q][f][b]);
++                try k.fuse_s[q][f][b].allowDynamicShared(smemS(@as(usize, 16) << @intCast(b), 4 + 4 * q));
++            };
++            for (0..2) |b| {
++                k.ld_fuse_s[q][b] = try k.ld_module.function(sym.ld_fuse_s[q][b]);
++                try k.ld_fuse_s[q][b].allowDynamicShared(smemS(@as(usize, 16) << @intCast(b), 4 + 4 * q));
++            }
++        }
++        k.mode = modeFromEnv();
+         k.major = try ctx.attribute(.compute_capability_major);
+         return k;
+     }
+@@ -145,13 +210,25 @@ fn matmulAt(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linea
+     if (kk % 64 != 0 or l.npad < n) return error.Invalid;
+     const sk = splitK(n, kk);
+     const bm: usize = if (sk > 1 and m >= fused_rows) 0 else bucket(m);
+-    const fused = bm == 0;
+-    const cluster = !fused and sk > 1 and sk <= 8 and k.major >= 9;
++    const md = k.mode;
++    // Mode.fuse: a split shape below FUSED_ROWS on the fused form (its K slices added in slice order by one block):
++    // row tile 64 on the prompt's fused kernel, 16 and 32 on the decode instantiations
++    const fuse_ok = sk > 1 and md.fuse != 0 and n >= md.fuse_n;
++    const fused64 = fuse_ok and bm == 64;
++    const fused = bm == 0 or fused64;
++    const small = !fused and fuse_ok and bm <= 32;
++    const cluster = !fused and !small and sk > 1 and sk <= 8 and k.major >= 9;
+     // sm_89 and older would add slices in the reduce (part + reduce_kernel): never on GB10, not ported
+-    if (!fused and sk > 1 and !cluster) return error.SplitWithoutCluster;
++    if (!fused and !small and sk > 1 and !cluster) return error.SplitWithoutCluster;
+     const tile: usize = if (fused) 64 else bm;
+     const rows_t = (m + tile - 1) / tile;
+-    const f = if (ldo != null) (if (fused) k.ld_fused else k.ld_tiled[@intFromBool(cluster)][bucketIndex(bm)]) else if (fused) k.fused[@intFromBool(f32_out)] else k.tiled[@intFromBool(f32_out)][@intFromBool(cluster)][bucketIndex(bm)];
++    const ci = @intFromBool(cluster);
++    const fi = @intFromBool(f32_out);
++    const bi = bucketIndex(bm);
++    const stages: usize = if (small) md.fuse else 4;
++    const deep = @intFromBool(md.fuse == 8);
++    const f = if (ldo != null) (if (fused) k.ld_fused else if (small) k.ld_fuse_s[deep][bi] else k.ld_tiled[ci][bi]) else if (fused) k.fused[fi] else if (small) k.fuse_s[deep][fi][bi] else k.tiled[fi][ci][bi];
++    const sk_arg: usize = if ((small or fused64) and md.mutant) sk / 2 else sk;
+     var a: cuda.Args = .{};
+     a.add(x);
+     a.add(l.w8);
+@@ -159,13 +236,13 @@ fn matmulAt(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, l: Linea
+     a.add(@as(f32, 1.0));
+     a.add(out);
+     a.add(@as(u64, 0));
+-    for ([_]usize{ m, n, kk, sk, l.npad, if (m == 1) kk else x_stride, l2Group(rows_t, tile, kk) }) |v| a.add(@as(c_int, @intCast(v)));
++    for ([_]usize{ m, n, kk, sk_arg, l.npad, if (m == 1) kk else x_stride, l2Group(rows_t, tile, kk) }) |v| a.add(@as(c_int, @intCast(v)));
+     if (ldo) |ld| a.add(@as(c_int, @intCast(ld)));
+-    const z: u32 = if (fused) 1 else @intCast(sk);
++    const z: u32 = if (fused or small) 1 else @intCast(sk);
+     try cuda.launch.launch(f, .{
+         .grid = .{ .x = @intCast(rows_t * ((n + 63) / 64)), .y = 1, .z = z },
+         .block = .{ .x = 128 },
+-        .shared = smem(tile),
++        .shared = smemS(tile, stages),
+         .cluster = if (cluster) .{ .x = 1, .y = 1, .z = @intCast(sk) } else null,
+     }, s, &a);
+ }
+@@ -465,3 +542,164 @@ pub fn check(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir:
+     }
+     return ok;
+ }
++
++// ---- `fp8-fused-check`: the fused split-K decode tiles (Mode.fuse) against the cluster kernel ----------------------
++
++const fused_modes = [_]struct { name: []const u8, m: Mode }{
++    .{ .name = "cluster", .m = .{} },
++    .{ .name = "fused4", .m = .{ .fuse = 4 } },
++    .{ .name = "fused8", .m = .{ .fuse = 8 } },
++};
++
++/// Random block-FP8 weights at the checkpoint's decode shapes (no NaN codes, scales 2^-9..2^-4): each fused depth's
++/// outputs (bf16 and fp32; the ld form for the projections, its gaps poisoned) byte-compared with the cluster
++/// kernel's at decode row counts, the output poisoned before every call; a mutant (the fused form told half the
++/// slices) must differ; then each mode's time at 1-64 rows, the weights rotated over copies that do not fit the 24 MB
++/// L2 (the engine reads each layer's weights once a round), modes interleaved, median of 5.
++pub fn fusedCheck(gpa: std.mem.Allocator, ctx: *const cuda.Context) !bool {
++    const d = ctx.d;
++    var k = try Kernels.load(ctx);
++    defer k.deinit();
++    var stream = try cuda.Stream.init(d, true);
++    defer stream.deinit();
++    var e0 = try cuda.Event.init(d, true);
++    defer e0.deinit();
++    var e1 = try cuda.Event.init(d, true);
++    defer e1.deinit();
++    var prng = std.Random.DefaultPrng.init(808);
++    const r = prng.random();
++    var ok = true;
++    const Shape = struct { n: usize, k: usize, ld: bool };
++    const shapes = [_]Shape{
++        .{ .n = 2560, .k = 6144, .ld = false }, .{ .n = 2560, .k = 3072, .ld = false },  .{ .n = 2560, .k = 2560, .ld = false },
++        .{ .n = 2560, .k = 1280, .ld = false }, .{ .n = 16384, .k = 2560, .ld = true }, .{ .n = 13312, .k = 2560, .ld = true },
++    };
++    const rows_list = [_]usize{ 1, 2, 3, 5, 8, 13, 16, 17, 20, 31, 32, 33, 48, 64 };
++    const max_m: usize = 64;
++    for (shapes) |sh| {
++        const n = sh.n;
++        const kk = sh.k;
++        const npad = npadOf(n);
++        const sk = splitK(n, kk);
++        // the weights
++        const codes = try gpa.alloc(u8, n * kk);
++        defer gpa.free(codes);
++        r.bytes(codes);
++        for (codes) |*c| if ((c.* & 0x7F) == 0x7F) {
++            c.* ^= 0x01;
++        };
++        const inv = try gpa.alloc(f32, ((n + 127) / 128) * (kk / 128));
++        defer gpa.free(inv);
++        for (inv) |*v| v.* = std.math.ldexp(1.0 + r.float(f32), -9 + @as(i32, r.intRangeLessThan(i32, 0, 5)));
++        const cols = try gpa.alloc(f32, n * (kk / 64));
++        defer gpa.free(cols);
++        try columnScales(inv, n, kk, cols);
++        const bs = try gpa.alloc(f32, npad * (kk / 64));
++        defer gpa.free(bs);
++        try tileScales(cols, n, kk, npad, bs);
++        const w8 = try gpa.alloc(u8, npad * kk);
++        defer gpa.free(w8);
++        try fragmentOrder(codes, n, kk, npad, w8);
++        const wbytes = npad * kk + npad * (kk / 64) * 4;
++        const copies = @max(2, (96 << 20) / wbytes + 1);
++        var dws: [16]cuda.DeviceBuffer = undefined;
++        var dbs: [16]cuda.DeviceBuffer = undefined;
++        const nc = @min(copies, 16);
++        for (0..nc) |i| {
++            dws[i] = try cuda.DeviceBuffer.fromHost(d, w8);
++            dbs[i] = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(bs));
++        }
++        defer for (0..nc) |i| {
++            dws[i].free();
++            dbs[i].free();
++        };
++        const xh = try gpa.alloc(u16, max_m * kk);
++        defer gpa.free(xh);
++        for (xh) |*v| {
++            const f: f32 = r.floatNorm(f32);
++            v.* = @intCast(@as(u32, @bitCast(f)) >> 16);
++        }
++        var dx = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(xh));
++        defer dx.free();
++        const ldo = n + 72;
++        const out_len = max_m * @max(n * 4, ldo * 2);
++        var dy = try cuda.DeviceBuffer.alloc(d, out_len);
++        defer dy.free();
++        const ref = try gpa.alloc(u8, out_len);
++        defer gpa.free(ref);
++        const got = try gpa.alloc(u8, out_len);
++        defer gpa.free(got);
++        const lin: Linear = .{ .w8 = dws[0].ptr, .bs = dbs[0].ptr, .n = @intCast(n), .k = @intCast(kk), .npad = @intCast(npad) };
++        // bytes: each mode (and the mutant) against the cluster kernel; kinds 0 bf16, 1 fp32, 2 ld (bf16 rows ldo apart)
++        var calls: usize = 0;
++        var differ: usize = 0;
++        var mutant_differ: [3]usize = .{ 0, 0, 0 };
++        var mutant_calls: [3]usize = .{ 0, 0, 0 };
++        for (rows_list) |m| for (0..3) |kind| {
++            if (kind == 2 and !sh.ld) continue;
++            if (kind != 2 and sh.ld and kind == 1) continue;
++            const len = if (kind == 2) m * ldo * 2 else m * n * @as(usize, if (kind == 1) 4 else 2);
++            const run = struct {
++                fn f(kp: *const Kernels, st: cuda.Stream, y: cuda.DeviceBuffer, xp: u64, l: Linear, kd: usize, mm: usize, ld: usize, all: usize) !void {
++                    try y.fill8(0xA5, st.handle);
++                    _ = all;
++                    if (kd == 2) try matmulLd(kp, st, xp, l.k, l, y.ptr, ld, mm) else try matmul(kp, st, xp, l.k, l, y.ptr, kd == 1, mm);
++                    try st.synchronize();
++                }
++            }.f;
++            k.mode = .{};
++            try run(&k, stream, dy, dx.ptr, lin, kind, m, ldo, out_len);
++            try dy.download(0, ref[0..len]);
++            for (fused_modes[1..]) |wm| {
++                k.mode = wm.m;
++                try run(&k, stream, dy, dx.ptr, lin, kind, m, ldo, out_len);
++                try dy.download(0, got[0..len]);
++                calls += 1;
++                if (!std.mem.eql(u8, ref[0..len], got[0..len])) {
++                    differ += 1;
++                    ok = false;
++                    std.debug.print("  n {d} k {d} m {d} kind {d} mode {s}: DIFFERS from the cluster kernel\n", .{ n, kk, m, kind, wm.name });
++                }
++            }
++            if (sk > 1) {
++                k.mode = .{ .fuse = 8, .mutant = true };
++                try run(&k, stream, dy, dx.ptr, lin, kind, m, ldo, out_len);
++                try dy.download(0, got[0..len]);
++                const bi = bucketIndex(bucket(m));
++                mutant_calls[bi] += 1;
++                if (!std.mem.eql(u8, ref[0..len], got[0..len])) mutant_differ[bi] += 1;
++            }
++        };
++        // the mutant is killed when every row tile's path (16, 32: the decode fused kernels, 64: the prompt's) shows it
++        const mutant_ok = sk == 1 or (mutant_differ[0] > 0 and mutant_differ[1] > 0 and mutant_differ[2] > 0);
++        if (!mutant_ok) ok = false;
++        std.debug.print("{s} n {d} k {d} split_k {d}: {d} fused calls (rows {any}), {d} differ from the cluster kernel; mutant (fused, half the slices) differs on {d}/{d} (tile 16), {d}/{d} (32), {d}/{d} (64) calls: {s}\n", .{ if (differ == 0 and mutant_ok) "PASS" else "FAIL", n, kk, sk, calls, rows_list, differ, mutant_differ[0], mutant_calls[0], mutant_differ[1], mutant_calls[1], mutant_differ[2], mutant_calls[2], if (sk == 1) "no split" else if (mutant_ok) "KILLED" else "SURVIVED (the check cannot see a slice change)" });
++        // speed
++        for ([_]usize{ 1, 4, 16, 17, 32, 33, 64 }) |m| {
++            var t: [fused_modes.len][5]f64 = undefined;
++            const reps: usize = 48;
++            for (0..5) |rep| for (fused_modes, 0..) |wm, mi| {
++                k.mode = wm.m;
++                var l = lin;
++                if (sh.ld) try matmulLd(&k, stream, dx.ptr, kk, l, dy.ptr, ldo, m) else try matmul(&k, stream, dx.ptr, kk, l, dy.ptr, false, m);
++                try e0.record(stream);
++                for (0..reps) |i| {
++                    l.w8 = dws[(i + 1) % nc].ptr;
++                    l.bs = dbs[(i + 1) % nc].ptr;
++                    if (sh.ld) try matmulLd(&k, stream, dx.ptr, kk, l, dy.ptr, ldo, m) else try matmul(&k, stream, dx.ptr, kk, l, dy.ptr, false, m);
++                }
++                try e1.record(stream);
++                try e1.synchronize();
++                t[mi][rep] = @as(f64, try cuda.Event.elapsedMs(e0, e1)) * 1000.0 / @as(f64, @floatFromInt(reps));
++            };
++            std.debug.print("  n {d} k {d} m {d}:", .{ n, kk, m });
++            for (&t, fused_modes) |*a, wm| {
++                std.mem.sort(f64, a, {}, std.sort.asc(f64));
++                std.debug.print(" {s} {d:.1} us [{d:.1}-{d:.1}] {d:.0} GB/s;", .{ wm.name, a[2], a[0], a[4], @as(f64, @floatFromInt(wbytes)) / a[2] / 1e3 });
++            }
++            std.debug.print("\n", .{});
++        }
++    }
++    k.mode = .{};
++    return ok;
++}
+diff --git a/zig/src/families/flashnext/cuda_int4.zig b/zig/src/families/flashnext/cuda_int4.zig
+index 6fb92eb..df371de 100644
+--- a/zig/src/families/flashnext/cuda_int4.zig
++++ b/zig/src/families/flashnext/cuda_int4.zig
+@@ -128,7 +128,8 @@ const warps = 4;
+ /// [kind: gate/up SwiGLU (gs 128), down fp32 gs 128, down bf16 gs 128, fp32 gs 64, bf16 gs 64][NT: 1, 2, 4]
+ const n_kinds = 5;
+ const nts = [_]usize{ 1, 2, 4 };
+-/// row tiles of 16 a pass: 1 (decode), 2 (prompt items of up to 64 pairs: the weights read once for 32 rows)
++/// row tiles of 16 a pass: 1 (decode), 2 (prompt items of up to 64 pairs, the head's 32-row items: the weights read
++/// once for 32 rows)
+ const mts = [_]usize{ 1, 2 };
+ 
+ fn symbol(comptime gs: usize, comptime nt: usize, comptime mt: usize, comptime mats: usize, comptime epi: usize) [:0]const u8 {
+@@ -193,6 +194,9 @@ pub const Kernels = struct {
+     /// the prompt down: [gs 128, 64][fp32, bf16] and their resident blocks
+     pdown: [2][2]cuda.Function,
+     pdown_blocks: [2][2]usize,
++    /// the row tiles a pass the head (`dense`) takes for calls of more than 16 rows: 2 (TF_FLASHNEXT_HEAD_ROW_TILES=2)
++    /// reads the weights once for 32 rows, 1 takes 16-row items. The same bits either way (int4-head-check).
++    head_mt: usize = 1,
+ 
+     pub fn load(ctx: *const cuda.Context) !Kernels {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+@@ -210,6 +214,9 @@ pub const Kernels = struct {
+             try k.pdown[g][o].allowDynamicShared(sm);
+             k.pdown_blocks[g][o] = @as(usize, @max(1, try k.pdown[g][o].occupancy(prompt_threads, sm))) * sms;
+         };
++        const hm = if (std.c.getenv("TF_FLASHNEXT_HEAD_ROW_TILES")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch 1 else 1;
++        k.head_mt = if (hm == 2) 2 else 1;
++        std.log.info("int4 lm_head: {s} (TF_FLASHNEXT_HEAD_ROW_TILES={d})", .{ if (k.head_mt == 2) "calls of 17 or more rows in 32-row items" else "16-row items", k.head_mt });
+         return k;
+     }
+ 
+@@ -339,7 +346,8 @@ pub fn denseNt(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, m: Ma
+         64 => if (f32_out) 3 else 4,
+         else => return error.Invalid,
+     };
+-    try launch(k, s, kind, (rows + 15) / 16, x, if (rows == 1) m.k else x_stride, 0, m.w, m.s, m.k, m.n, null, rows, out, m.n, -1, nt, 1);
++    const mt: usize = if (rows <= 16 or k.head_mt == 1) 1 else 2;
++    try launch(k, s, kind, (rows + 16 * mt - 1) / (16 * mt), x, if (rows == 1) m.k else x_stride, 0, m.w, m.s, m.k, m.n, null, rows, out, m.n, -1, nt, mt);
+ }
+ 
+ /// `gateUp` / `down` with the n8 tiles a warp forced (checks).
+diff --git a/zig/src/families/flashnext/cuda_int4_check.zig b/zig/src/families/flashnext/cuda_int4_check.zig
+index 80910f8..ec4ac15 100644
+--- a/zig/src/families/flashnext/cuda_int4_check.zig
++++ b/zig/src/families/flashnext/cuda_int4_check.zig
+@@ -614,3 +614,107 @@ pub fn check(gpa: Allocator, ctx: *const cuda.Context, ops: kern.Ops) !bool {
+     try bench(gpa, &k, ops, ctx.d, 2);
+     return rep.ok;
+ }
++
++fn poison(d: *const cuda.Driver, ptr: u64, len: usize) !void {
++    const b: cuda.DeviceBuffer = .{ .d = d, .ptr = ptr, .len = len };
++    try b.fill8(0xA5, null);
++    try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize");
++}
++
++/// `int4-head-check`: the head's 32-row items (head_mt 2) against 16-row items: every row count's fp32 and bf16
++/// outputs byte-equal (the output poisoned before each call, so a row left unwritten fails), and each row equal to
++/// its 1-row call; then the head's speed at both, interleaved.
++pub fn headRowsCheck(gpa: Allocator, ctx: *const cuda.Context, ops: kern.Ops) !bool {
++    var k = try int4.Kernels.load(ctx);
++    defer k.deinit();
++    var dv: Dev = .{ .d = ctx.d, .gpa = gpa };
++    defer dv.deinit();
++    var prng = std.Random.DefaultPrng.init(4321);
++    const r = prng.random();
++    const s = ops.s;
++    const d = ctx.d;
++    var ok = true;
++    const rows_list = [_]usize{ 1, 15, 16, 17, 18, 20, 24, 31, 32, 33, 47, 48, 49, 64, 65, 100, 128 };
++    const most: usize = 128;
++    // [n, k_full, k0, k, gs]: the head's shape (a slice), gate/up, down at one GPU and a TP=2 rank's down (as `check`)
++    const shapes = [_][5]usize{ .{ 4096, 2560, 0, 2560, 128 }, .{ 2560, 640, 0, 640, 128 }, .{ 2560, 640, 320, 320, 64 } };
++    for (shapes) |sh| {
++        const n = sh[0];
++        const kk = sh[3];
++        const gs = sh[4];
++        var g = try Gen.init(gpa, r, n, sh[1]);
++        defer g.deinit(gpa);
++        const p = try packDev(gpa, &dv, g, .{ .n0 = 0, .n = n, .k0 = sh[2], .k = kk, .gs = gs });
++        const m: int4.Mat = .{ .w = p[0], .s = p[1], .n = @intCast(n), .k = @intCast(kk), .gs = @intCast(gs) };
++        const x = try randRows(gpa, r, most, kk);
++        defer gpa.free(x);
++        const xd = try dv.put(std.mem.sliceAsBytes(x));
++        const out = try dv.zeros(most * n * 4);
++        const ref = try gpa.alloc(u8, most * n * 4);
++        defer gpa.free(ref);
++        const got = try gpa.alloc(u8, most * n * 4);
++        defer gpa.free(got);
++        // the 1-row calls (fp32), stock
++        const solo = try gpa.alloc(u8, most * n * 4);
++        defer gpa.free(solo);
++        k.head_mt = 1;
++        for (0..most) |row| {
++            try int4.dense(&k, s, xd + row * kk * 2, kk, m, out, true, 1);
++            try s.synchronize();
++            try dv.get(out, solo[row * n * 4 ..][0 .. n * 4]);
++        }
++        var calls: usize = 0;
++        var bad: usize = 0;
++        for (rows_list) |rows| for ([_]bool{ true, false }) |f32o| {
++            const len = rows * n * @as(usize, if (f32o) 4 else 2);
++            k.head_mt = 1;
++            try poison(d, out, most * n * 4);
++            try int4.dense(&k, s, xd, kk, m, out, f32o, rows);
++            try s.synchronize();
++            try dv.get(out, ref[0..len]);
++            {
++                const mt: usize = 2;
++                k.head_mt = mt;
++                try poison(d, out, most * n * 4);
++                try int4.dense(&k, s, xd, kk, m, out, f32o, rows);
++                try s.synchronize();
++                try dv.get(out, got[0..len]);
++                calls += 1;
++                const same = std.mem.eql(u8, ref[0..len], got[0..len]);
++                const solo_ok = !f32o or std.mem.eql(u8, got[0..len], solo[0..len]);
++                if (!same or !solo_ok) {
++                    bad += 1;
++                    var diff: usize = 0;
++                    for (ref[0..len], got[0..len]) |a, b| diff += @intFromBool(a != b);
++                    std.debug.print("  head n {d} k {d} gs {d} rows {d} {s}: head_mt {d} {s} 16-row items ({d} bytes differ), {s} the 1-row calls\n", .{ n, kk, gs, rows, if (f32o) "fp32" else "bf16", mt, if (same) "equal to" else "DIFFERS from", diff, if (solo_ok) "equal to" else "DIFFERS from" });
++                }
++            }
++        };
++        if (bad > 0) ok = false;
++        std.debug.print("  head n {d} k {d} gs {d}: {d} calls (rows {any}, fp32 and bf16), {d} differ\n", .{ n, kk, gs, calls, rows_list, bad });
++    }
++    // speed: the full head [248320, 2560], random-free (zero) words: the bits do not matter for speed
++    const V: usize = 248320;
++    const D: usize = 2560;
++    const w = try dv.zeros(V * D / 2);
++    const sc = try dv.zeros(V * D / 128 * 2);
++    const hm: int4.Mat = .{ .w = w, .s = sc, .n = @intCast(V), .k = D };
++    const x = try dv.zeros(most * D * 2);
++    const out = try dv.zeros(most * V * 2);
++    const bytes: f64 = @floatFromInt(V * D / 2 + V * D / 128 * 2);
++    for ([_]usize{ 1, 8, 16, 17, 20, 24, 32, 33, 40, 48, 64 }) |rows| {
++        var t: [2][5]f64 = undefined;
++        for (0..5) |rep| for ([_]usize{ 1, 2 }, 0..) |mt, i| {
++            k.head_mt = mt;
++            const C = struct { k: *const int4.Kernels, s: cuda.Stream, x: u64, m: int4.Mat, out: u64, rows: usize };
++            t[i][rep] = try timeIt(s, d, 20, C{ .k = &k, .s = s, .x = x, .m = hm, .out = out, .rows = rows }, struct {
++                fn f(c: C) anyerror!void {
++                    try int4.dense(c.k, c.s, c.x, D, c.m, c.out, false, c.rows);
++                }
++            }.f);
++        };
++        for (&t) |*a| std.mem.sort(f64, a, {}, std.sort.asc(f64));
++        std.debug.print("  head [{d}, {d}] int4, {d} rows: 16-row items {d:.1} us [{d:.1}-{d:.1}] {d:.0} GB/s; 32-row items {d:.1} us [{d:.1}-{d:.1}]\n", .{ V, D, rows, t[0][2], t[0][0], t[0][4], bytes / t[0][2] / 1e3, t[1][2], t[1][0], t[1][4] });
++    }
++    return ok;
++}

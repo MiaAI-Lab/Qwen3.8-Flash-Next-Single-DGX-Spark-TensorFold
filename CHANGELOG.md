@@ -3,6 +3,14 @@
 Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:zig-db28187`, built by
 `scripts/prepare.sh` from TensorFold `db281878` plus `patches/`.
 
+## Unreleased
+
+- `patches/0018-flash-next-fp8-fused-split-head-rows` and `TF_FLASHNEXT_FP8_FUSED_SPLIT=4`,
+  `TF_FLASHNEXT_HEAD_ROW_TILES=2` (the defaults): block-FP8 split-K projections of 2048+ columns below 256 rows run
+  on the fused kernel (one block a column tile, its K slices in slice order, the cluster's sum), and the int4 lm_head
+  takes 32-row items. `out_proj` -9% a round; on the merged build code at 4 clients +8%, copy windows +7%; every reply
+  byte-identical (`tensorfold fp8-fused-check`, `tensorfold int4-head-check`).
+
 ## [1.0.0] - 2026-10-08
 
 TensorFold's Zig engine (`tensorfold-native`, TP=1). Engine `37763df`, merged into `zig-single` as `453439d`
