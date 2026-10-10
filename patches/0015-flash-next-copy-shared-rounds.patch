@@ -1,0 +1,163 @@
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index fa76f2b..d06c049 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -75,6 +75,10 @@ pub const Config = struct {
+     /// ... and after a round that kept every copied row: twice the width plus one (Python: 15 -> 31 -> 63), or
+     /// straight to max_copy (rows between the head's window and the widest cost about the same per round)
+     copy_ramp: CopyRamp = .double,
++    /// streams in shared rounds take the ramp too (the allocator trims their rows to batch_rows), for copies
++    /// out of the prompt only (a reply repeating its own lines keeps first_copy); false: shared rounds copy
++    /// first_copy rows at most
++    copy_shared: bool = false,
+     k: Constants = .{},
+ 
+     pub const CopyMiss = enum { first, keep };
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 1e85f4b..4d52522 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -522,7 +522,10 @@ pub const Engine = struct {
+                 s.accepted += kept;
+                 if (p.kind == .copy) {
+                     if (s.proposer) |pr| pr.observe(@intCast(rows - 1), @intCast(kept));
+-                    if (e.alone) {
++                    // a copy out of the prompt (an edit of a given text), not of the reply's own lines
++                    const from = if (s.proposer) |pr| pr.lastFrom() else null;
++                    s.copy_prompt = if (from) |x| x < s.prompt_len else false;
++                    if (e.alone or (e.cfg.copy_shared and s.copy_prompt)) {
+                         const width = s.copy_width orelse e.cfg.first_copy;
+                         s.copy_width = if (kept == rows - 1) switch (e.cfg.copy_ramp) {
+                             .double => @min(e.cfg.max_copy, 2 * width + 1),
+diff --git a/zig/src/core/lanes/engine_test.zig b/zig/src/core/lanes/engine_test.zig
+index 6177b99..ceba8e2 100644
+--- a/zig/src/core/lanes/engine_test.zig
++++ b/zig/src/core/lanes/engine_test.zig
+@@ -288,3 +288,35 @@ test "a cancelled fill ends without its stream joining" {
+     try std.testing.expectEqual(@as(usize, 0), engine.activeCount());
+     try std.testing.expectEqual(@as(u32, 0), target.lanes.count());
+ }
++
++test "shared rounds copy past the first width only with copy_shared and only out of the prompt" {
++    const win = @import("windows.zig");
++    var cfg = try Config.init(gpa, .{ .exact_width = 64, .first_copy_rows = 16, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 15, .hidden_rows = true, .batch_rows = 128, .max_streams = 8, .draft_streams = true }, 64, 63);
++    defer cfg.deinit(gpa);
++    try std.testing.expectEqual(@as(u32, 15), cfg.first_copy);
++    var target: fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: fake.FixedClock = .{};
++    var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer engine.deinit();
++    engine.alone = false; // a shared round
++    // a 100-token prompt (no repeats), and a reply that copies its first 20 tokens
++    var prompt: [100]u32 = undefined;
++    for (&prompt, 0..) |*t, i| t.* = @intCast(1000 + i);
++    var p = try SuffixLookup.init(gpa, .{ .min_match = 4 });
++    defer p.deinit();
++    var s = try sm.Stream.init(gpa, .{ .id = "s", .prompt = &prompt, .max_new = 200, .eos = &.{96}, .proposer = p.proposer() });
++    defer s.deinit(gpa);
++    try s.context.appendSlice(gpa, prompt[0..20]);
++    s.copy_width = 63;
++    s.copy_prompt = true;
++    // stock: a shared round copies first_copy rows
++    try std.testing.expectEqual(@as(usize, 15), (try win.copyProposal(&engine, &s)).len);
++    cfg.copy_shared = true;
++    try std.testing.expectEqual(@as(usize, 63), (try win.copyProposal(&engine, &s)).len);
++    // the last copy was of the reply's own lines: first_copy again
++    s.copy_prompt = false;
++    try std.testing.expectEqual(@as(usize, 15), (try win.copyProposal(&engine, &s)).len);
++    // the proposer reports where its copy came from: index 20 of the prompt
++    try std.testing.expectEqual(@as(?usize, 20), p.proposer().lastFrom());
++}
+diff --git a/zig/src/core/lanes/proposer.zig b/zig/src/core/lanes/proposer.zig
+index cb7f72a..895acf3 100644
+--- a/zig/src/core/lanes/proposer.zig
++++ b/zig/src/core/lanes/proposer.zig
+@@ -11,6 +11,8 @@ pub const Proposer = struct {
+         propose: *const fn (ptr: *anyopaque, context: []const u32, max_draft: i64) anyerror![]const u32,
+         last_match: *const fn (ptr: *anyopaque) i64,
+         observe: ?*const fn (ptr: *anyopaque, proposed: i64, accepted: i64) void = null,
++        /// the context index the last proposal copied from (null: none, or the proposer does not say)
++        last_from: ?*const fn (ptr: *anyopaque) ?usize = null,
+     };
+ 
+     /// Tokens valid until the next `propose`.
+@@ -25,6 +27,10 @@ pub const Proposer = struct {
+     pub fn observe(p: Proposer, proposed: i64, accepted: i64) void {
+         if (p.vtable.observe) |f| f(p.ptr, proposed, accepted);
+     }
++
++    pub fn lastFrom(p: Proposer) ?usize {
++        return if (p.vtable.last_from) |f| f(p.ptr) else null;
++    }
+ };
+ 
+ pub const max_ngram = 8;
+@@ -107,7 +113,12 @@ pub const SuffixLookup = struct {
+         return .{ .ptr = s, .vtable = &vtable };
+     }
+ 
+-    pub const vtable: Proposer.VTable = .{ .propose = proposeFn, .last_match = lastMatchFn, .observe = observeFn };
++    pub const vtable: Proposer.VTable = .{ .propose = proposeFn, .last_match = lastMatchFn, .observe = observeFn, .last_from = lastFromFn };
++
++    fn lastFromFn(ptr: *anyopaque) ?usize {
++        const s: *SuffixLookup = @ptrCast(@alignCast(ptr));
++        return if (s.proposals > 0) s.last_from else null;
++    }
+ 
+     fn proposeFn(ptr: *anyopaque, context: []const u32, max_draft: i64) anyerror![]const u32 {
+         const s: *SuffixLookup = @ptrCast(@alignCast(ptr));
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index 1e3c65f..223d586 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -219,6 +219,7 @@ pub const Stream = struct {
+     served: ?u64 = null,
+     granted: ?u32 = null,
+     copy_width: ?u32 = null,
++    copy_prompt: bool = false, // the last copy came from the prompt (its source before prompt_len)
+     gate: ?call_gate.Gate = null,
+ 
+     pub fn init(gpa: Allocator, spec: Spec) !Stream {
+@@ -265,6 +266,7 @@ pub const Stream = struct {
+         s.served = null;
+         s.granted = null;
+         s.copy_width = null;
++        s.copy_prompt = false;
+     }
+ 
+     pub fn dropHeld(s: *Stream, gpa: Allocator) void {
+diff --git a/zig/src/core/lanes/windows.zig b/zig/src/core/lanes/windows.zig
+index a76e4ed..71642c4 100644
+--- a/zig/src/core/lanes/windows.zig
++++ b/zig/src/core/lanes/windows.zig
+@@ -134,7 +134,7 @@ fn headTrunk(e: *Engine, s: *Stream, p: Plan, levels: usize) !?fill.Trunk {
+ pub fn copyProposal(e: *Engine, s: *Stream) ![]const u32 {
+     const p = s.proposer orelse return &.{};
+     if (e.cfg.max_copy == 0 or s.force.items.len > 0) return &.{};
+-    const width: u32 = if (e.alone) (s.copy_width orelse e.cfg.first_copy) else e.cfg.first_copy;
++    const width: u32 = if (e.alone or (e.cfg.copy_shared and s.copy_prompt)) (s.copy_width orelse e.cfg.first_copy) else e.cfg.first_copy;
+     const copied = p.propose(s.context.items, @min(@as(i64, width), s.draftRoom() - 1)) catch return &.{};
+     if (copied.len < 2 or p.lastMatch() < e.cfg.enter_match) return &.{};
+     return copied;
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 89ff691..09400a9 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -288,13 +288,15 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     // copies out of the prompt do)
+     if (std.c.getenv("TF_FLASHNEXT_COPY_MISS")) |v| h.cfg.copy_miss = std.meta.stringToEnum(lanes.Config.CopyMiss, std.mem.span(v)) orelse h.cfg.copy_miss;
+     if (std.c.getenv("TF_FLASHNEXT_COPY_RAMP")) |v| h.cfg.copy_ramp = std.meta.stringToEnum(lanes.Config.CopyRamp, std.mem.span(v)) orelse h.cfg.copy_ramp;
++    // TF_FLASHNEXT_COPY_SHARED=1: copies out of the prompt ramp in shared rounds too (Config.copy_shared)
++    if (envInt("TF_FLASHNEXT_COPY_SHARED")) |v| h.cfg.copy_shared = v != 0;
+     h.clock = .{ .io = io };
+     h.core = lanes.Engine.init(gpa, &h.cfg, h.backend(), h.clock.clock());
+     errdefer h.core.deinit();
+     h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = F.prefill_step, .call_gates = true, .media = @hasDecl(F, "media") and F.media });
+     if (envInt("TF_FLASHNEXT_COPY_RESYNC")) |v| h.host.resync = v != 0;
+     if (envInt("TF_FLASHNEXT_COPY_RESYNC_PROMPT_ONLY")) |v| h.host.resync_prompt_only = v != 0;
+-    std.log.info("copy policy: after a missed copy round {s}, after a clean one {s}, resync {s}", .{ @tagName(h.cfg.copy_miss), @tagName(h.cfg.copy_ramp), if (!h.host.resync) "off" else if (h.host.resync_prompt_only) "on (copies out of the prompt)" else "on" });
++    std.log.info("copy policy: after a missed copy round {s}, after a clean one {s}, resync {s}, shared rounds ramp {s}", .{ @tagName(h.cfg.copy_miss), @tagName(h.cfg.copy_ramp), if (!h.host.resync) "off" else if (h.host.resync_prompt_only) "on (copies out of the prompt)" else "on", if (h.cfg.copy_shared) "copies out of the prompt" else "no copies" });
+     h.store = null;
+     if (@hasField(@TypeOf(loaded), "cache")) if (loaded.cache) |c| if (c.budget > 0) {
+         // the family keeps and restores the states; the store picks them (exact reuse, core/prompt_cache.zig)
