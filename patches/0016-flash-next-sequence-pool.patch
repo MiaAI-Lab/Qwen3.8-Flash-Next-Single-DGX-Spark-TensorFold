@@ -1,0 +1,511 @@
+diff --git a/zig/src/families/flashnext/cuda_engine.zig b/zig/src/families/flashnext/cuda_engine.zig
+index 43dbd84..765b530 100644
+--- a/zig/src/families/flashnext/cuda_engine.zig
++++ b/zig/src/families/flashnext/cuda_engine.zig
+@@ -118,11 +118,15 @@ pub const Seq = fwd.Seq;
+ /// rotary table and prompt length, so its graphs are its own.
+ const GraphKey = struct { seq: usize, version: u32, mtp: bool, rows: u32, parity: u32, ctx: usize, media: u64 = 0 };
+ 
+-/// A shared round's (or shared MTP step's) graph and the sequences whose buffers it bakes in.
+-const MultiGraph = struct { exec: cuda.graph.Exec, seqs: []usize };
++/// A solo window's graph and when it last ran (TF_FLASHNEXT_SOLO_MAX: least recently used out first).
++const SoloGraph = struct { exec: cuda.graph.Exec, used: u64 = 0 };
++
++/// A shared round's (or shared MTP step's) graph, the sequences whose buffers it bakes in, and when it last ran.
++const MultiGraph = struct { exec: cuda.graph.Exec, seqs: []usize, used: u64 = 0 };
+ 
+ /// Shared-round graphs kept at most (drafted rounds vary their windows' lengths; a composition is captured
+-/// the second time it is seen).
++/// the second time it is seen). TF_FLASHNEXT_MULTI_MAX overrides; TF_FLASHNEXT_MULTI_LRU=1 evicts the least
++/// recently used graph when full instead of dropping them all.
+ const max_multi_graphs = 192;
+ 
+ /// The state of a class of captures after failures: rounds left to run eagerly, and the failures in a row.
+@@ -328,6 +332,9 @@ pub const Engine = struct {
+     product_streams: usize = std.math.maxInt(usize),
+     /// shared steps of at most this many streams are captured (TF_FLASHNEXT_MULTI_GRAPHS)
+     multi_graphs: usize = multi_graphs_default,
++    /// shared verify rounds (not MTP steps) of at most this many streams are captured
++    /// (TF_FLASHNEXT_MULTI_VERIFY; default: multi_graphs)
++    multi_verify: usize = multi_graphs_default,
+     /// the Triton variants each launch site picked (the forward's launches skip `find`'s scan)
+     memo: tri.Memo = undefined,
+     /// the rows the context caches hold (Python max_len: the window plus depth + 1 speculative rows)
+@@ -361,7 +368,7 @@ pub const Engine = struct {
+     vm: ?vmm.Vmm = null,
+     /// the fill whose chunk holds the prompt buffers between slices (one at a time; prefill waits for it)
+     pfill: ?*const Fill = null,
+-    graphs: std.AutoHashMapUnmanaged(GraphKey, cuda.graph.Exec) = .empty,
++    graphs: std.AutoHashMapUnmanaged(GraphKey, SoloGraph) = .empty,
+     captures: usize = 0,
+     /// a failed capture, instantiate or upload is not fatal: that round runs eagerly (the same bits) and captures
+     /// pause for a while (solo windows and shared rounds apart); TF_FLASHNEXT_GRAPH_LOG=1 logs the graph counts,
+@@ -374,6 +381,16 @@ pub const Engine = struct {
+     /// shared rounds' and shared MTP steps' graphs by composition (multiKey), and compositions seen once
+     multi: std.AutoHashMapUnmanaged(u64, MultiGraph) = .empty,
+     seen: std.AutoHashMapUnmanaged(u64, void) = .empty,
++    /// the graph policy: shared graphs kept (TF_FLASHNEXT_MULTI_MAX), LRU eviction (TF_FLASHNEXT_MULTI_LRU=1, else
++    /// all are dropped when full), solo graphs kept (TF_FLASHNEXT_SOLO_MAX, 0: unbounded), the LRU clock
++    multi_max: usize = max_multi_graphs,
++    multi_lru: bool = false,
++    solo_max: usize = 0,
++    use_tick: u64 = 0,
++    /// lanes' released sequences kept for the next request, reset, with their graphs (TF_FLASHNEXT_SEQ_POOL=N keeps
++    /// up to N; 0: every request frees its sequence and makes a new one)
++    pool: std.ArrayList(*Seq) = .empty,
++    pool_max: usize = 0,
+     /// TF_FLASHNEXT_PROFILE: each prompt chunk's GPU time by part (cuda_prof.zig)
+     prof: ?*profs.Prof = null,
+     /// TF_FLASHNEXT_PROMPT_EXPERTS (default on): prompt chunks' experts read weights once a call
+@@ -488,6 +505,13 @@ pub const Engine = struct {
+         e.graph_log = envGet("TF_FLASHNEXT_GRAPH_LOG") != null;
+         if (envGet("TF_FLASHNEXT_GRAPH_FAIL")) |v| e.inject_every = std.fmt.parseInt(u64, v, 10) catch 0;
+         if (envGet("TF_FLASHNEXT_MULTI_GRAPHS")) |v| e.multi_graphs = std.fmt.parseInt(usize, v, 10) catch multi_graphs_default;
++        e.multi_verify = e.multi_graphs;
++        if (envGet("TF_FLASHNEXT_MULTI_VERIFY")) |v| e.multi_verify = @min(e.multi_graphs, std.fmt.parseInt(usize, v, 10) catch e.multi_graphs);
++        if (envGet("TF_FLASHNEXT_MULTI_MAX")) |v| e.multi_max = @max(1, std.fmt.parseInt(usize, v, 10) catch max_multi_graphs);
++        e.multi_lru = if (envGet("TF_FLASHNEXT_MULTI_LRU")) |v| std.mem.eql(u8, v, "1") else false;
++        if (envGet("TF_FLASHNEXT_SOLO_MAX")) |v| e.solo_max = std.fmt.parseInt(usize, v, 10) catch 0;
++        if (envGet("TF_FLASHNEXT_SEQ_POOL")) |v| e.pool_max = std.fmt.parseInt(usize, v, 10) catch 0;
++        std.log.info("graphs: shared verify rounds of up to {d} streams captured, MTP steps of up to {d}; {d} shared graphs kept ({s}), solo graphs {s}; sequence pool {d}", .{ e.multi_verify, e.multi_graphs, e.multi_max, if (e.multi_lru) "least recently used out first" else "all dropped when full", if (e.solo_max > 0) "least recently used out past TF_FLASHNEXT_SOLO_MAX" else "unbounded", e.pool_max });
+         // shared rounds past the captured widths run their attention in one launch a kernel (attn_multi.py's
+         // kernels, aot/w6-ks1 and later; without them, a stream at a time): TF_FLASHNEXT_ATTN_MULTI=N from N
+         // streams (never at a captured width), 0 off
+@@ -620,6 +644,7 @@ pub const Engine = struct {
+             e.budget.limit = @min(both[0], both[1]);
+         }
+         e.f.budget = &e.budget;
++        e.f.reclaim = .{ .ptr = e, .run = reclaimFn };
+         e.budget.floor = @intFromFloat(@min(reserve_gib, 10) * (1 << 30));
+         std.log.info("sequence memory: {d:.2} GiB ({d:.2} GiB free, {d:.1} GiB kept free); {s} KV cache, {d} bytes a position a layer", .{ @as(f64, @floatFromInt(e.budget.limit)) / (1 << 30), @as(f64, @floatFromInt(free)) / (1 << 30), reserve_gib, @tagName(e.g.kv), e.g.kRow() + e.g.vRow() });
+         e.own = try e.newSeq(e.max_len);
+@@ -647,8 +672,10 @@ pub const Engine = struct {
+ 
+     pub fn deinit(e: *Engine) void {
+         e.stream.synchronize() catch {};
++        for (e.pool.items) |s| e.freeSeq(s);
++        e.pool.deinit(e.gpa);
+         var it = e.graphs.valueIterator();
+-        while (it.next()) |g| g.deinit();
++        while (it.next()) |g| g.exec.deinit();
+         e.graphs.deinit(e.gpa);
+         e.graphs = .empty;
+         e.dropMulti(null);
+@@ -698,7 +725,7 @@ pub const Engine = struct {
+         errdefer e.gpa.destroy(s);
+         // caches start at one growth step and grow with the stream (State.ensure), up to `limit`
+         const first = @min(limit, state.grow_step);
+-        if (!e.fits(first)) return error.NoRoom;
++        if (!e.fits(first) and !(e.trimPool() and e.fits(first))) return error.NoRoom;
+         s.* = .{ .st = try state.State.init(e.ctx.d, e.g, if (e.vm != null) 1 else first, limit) };
+         errdefer s.deinit(e.gpa);
+         s.charged = s.st.fixed.buf.len + (if (s.st.ctx) |c| c.buf.len else 0) + e.g.wide() * 2;
+@@ -759,6 +786,75 @@ pub const Engine = struct {
+         e.gpa.destroy(s);
+     }
+ 
++    /// A lane's sequence. With TF_FLASHNEXT_SEQ_POOL a released one comes back reset, its graphs still
++    /// valid (its caches sit in reserved address space that never moves); pooled sequences reserve the engine's
++    /// whole window so every request sees the same capacities (graph keys repeat). Without: newSeq(limit_rows).
++    pub fn takeSeq(e: *Engine, limit_rows: usize) !*Seq {
++        if (e.pool_max == 0 or e.vm == null) return e.newSeq(limit_rows);
++        if (e.pool.pop()) |s| {
++            errdefer e.freeSeq(s);
++            try e.f.register(s);
++            return s;
++        }
++        const s = try e.newSeq(e.max_len);
++        s.pooled = true;
++        s.pool_capacity = s.st.capacity;
++        return s;
++    }
++
++    /// A lane's (or keeper's) sequence given back: a pooled one reset into the pool, else freed.
++    pub fn retire(e: *Engine, s: *Seq) void {
++        if (!s.pooled or e.pool.items.len >= e.pool_max) return e.freeSeq(s);
++        e.pool.ensureUnusedCapacity(e.gpa, 1) catch return e.freeSeq(s);
++        e.recycle(s) catch |err| {
++            std.log.warn("sequence pool: reset failed ({s}); the sequence is freed", .{@errorName(err)});
++            return e.freeSeq(s);
++        };
++        e.pool.appendAssumeCapacity(s);
++    }
++
++    /// A pooled sequence back to exactly what newSeq gives: physical memory past the first growth step unmapped
++    /// (addresses stay reserved), every byte the caches and the fixed state hold zeroed, then Forward.reset. It
++    /// leaves the forward's registry until taken again.
++    fn recycle(e: *Engine, s: *Seq) !void {
++        try e.stream.synchronize(); // launches in flight may read its caches
++        if (e.bound == s and s != e.own) e.bound = e.own;
++        e.f.unregister(s);
++        var freed: usize = 0;
++        for (s.regions.items) |*r| {
++            if (r.ring) continue;
++            freed += r.shrinkToFirst();
++        }
++        e.budget.used -|= freed;
++        s.charged -|= freed;
++        for (s.regions.items) |r| {
++            // a ring maps one chunk over the whole range: zero the chunk once
++            const bytes = if (r.ring) (if (r.maps.items.len > 0) r.maps.items[0][1] else 0) else r.mapped;
++            try e.f.th.zero(r.base, bytes);
++        }
++        s.st.capacity = s.pool_capacity;
++        s.window.clearRetainingCapacity();
++        s.held_a0 = 0;
++        s.held_par = 0;
++        try e.f.th.zero(s.st.fixed.buf.ptr, s.st.fixed.buf.len);
++        try e.f.reset(s);
++        try e.stream.synchronize();
++    }
++
++    /// Every pooled sequence freed (memory for a new sequence or a growth); whether any was.
++    pub fn trimPool(e: *Engine) bool {
++        if (e.pool.items.len == 0) return false;
++        e.stream.synchronize() catch {};
++        for (e.pool.items) |s| e.freeSeq(s);
++        e.pool.clearRetainingCapacity();
++        return true;
++    }
++
++    fn reclaimFn(ptr: *anyopaque) bool {
++        const e: *Engine = @ptrCast(@alignCast(ptr));
++        return e.trimPool();
++    }
++
+     /// One cache layer's indexer-key ring (physical bytes): a prompt chunk's rows and the 3 before them that a pool
+     /// reads, at least `ring_min_rows`, a power of two of rows (mapSeq aligns the reservation to it) in whole granules.
+     fn ringBytes(e: *const Engine, v: *const vmm.Vmm) usize {
+@@ -1827,7 +1923,7 @@ pub const Engine = struct {
+             } else null;
+             const k = found orelse return;
+             var g = e.graphs.fetchRemove(k).?.value;
+-            g.deinit();
++            g.exec.deinit();
+         }
+     }
+ 
+@@ -1859,7 +1955,11 @@ pub const Engine = struct {
+         const key: GraphKey = .{ .seq = @intFromPtr(seq), .version = seq.st.version, .mtp = head, .rows = @intCast(rows), .parity = par, .ctx = ctx, .media = mediaKey(seq) };
+         e.f.context = ctx;
+         defer e.f.context = null;
+-        if (e.graphs.get(key)) |g| return g.launchOn(e.stream);
++        e.use_tick += 1;
++        if (e.graphs.getPtr(key)) |g| {
++            g.used = e.use_tick;
++            return g.exec.launchOn(e.stream);
++        }
+         e.dropGraphsOf(key.seq, key.version, key.media);
+         try e.body(head, rows);
+         // the eager run above is this call's result; a capture that fails from here on only costs the graph
+@@ -1868,15 +1968,45 @@ pub const Engine = struct {
+             return;
+         }
+         try e.stream.synchronize();
++        if (e.solo_max > 0 and e.graphs.count() >= e.solo_max) e.evictSolo(); // after the drain: none in flight
+         if (!e.capBegin(&e.solo_fault, "solo")) return;
+         const ok = if (e.body(head, rows)) |_| true else |err| e.capNote(&e.solo_fault, "solo", "capture", err);
+         var exec = e.capEnd(&e.solo_fault, "solo", ok) orelse return;
+         errdefer exec.deinit();
+-        try e.graphs.put(e.gpa, key, exec);
++        try e.graphs.put(e.gpa, key, .{ .exec = exec, .used = e.use_tick });
+         e.captures += 1;
+         e.capLog("solo");
+     }
+ 
++    /// The least recently run solo graph released (TF_FLASHNEXT_SOLO_MAX).
++    fn evictSolo(e: *Engine) void {
++        var it = e.graphs.iterator();
++        var old: ?GraphKey = null;
++        var t: u64 = std.math.maxInt(u64);
++        while (it.next()) |kv| if (kv.value_ptr.used < t) {
++            t = kv.value_ptr.used;
++            old = kv.key_ptr.*;
++        };
++        const k = old orelse return;
++        var g = e.graphs.fetchRemove(k).?.value;
++        g.exec.deinit();
++    }
++
++    /// The least recently run shared graph released (TF_FLASHNEXT_MULTI_LRU=1).
++    fn evictMulti(e: *Engine) void {
++        var it = e.multi.iterator();
++        var old: ?u64 = null;
++        var t: u64 = std.math.maxInt(u64);
++        while (it.next()) |kv| if (kv.value_ptr.used < t) {
++            t = kv.value_ptr.used;
++            old = kv.key_ptr.*;
++        };
++        const k = old orelse return;
++        var g = e.multi.fetchRemove(k).?.value;
++        g.exec.deinit();
++        e.gpa.free(g.seqs);
++    }
++
+     /// Starts a thread-local capture on the engine's stream; false (noted) when the driver refuses.
+     fn capBegin(e: *Engine, f: *CaptureFault, comptime class: []const u8) bool {
+         cuda.graph.beginCapture(e.stream, .thread_local) catch |err| {
+@@ -1957,6 +2087,37 @@ pub const Engine = struct {
+         return e.captures - before;
+     }
+ 
++    /// TF_FLASHNEXT_WARM_POOL=N with TF_FLASHNEXT_SEQ_POOL: N pooled sequences made at load and the served
++    /// one-stream shapes captured on each - verifyMany's one-window forward at every width and both parities, and
++    /// draftMany's one-stream MTP steps (runMulti, captured on the second sight) at every width - at the first
++    /// context bucket, then given back to the pool. Returns the graphs captured.
++    pub fn warmPool(e: *Engine, n: usize) !usize {
++        if (!e.graphs_on or e.pool_max == 0 or e.vm == null) return 0;
++        const before = e.captures;
++        const keep = e.bound;
++        defer e.bound = keep;
++        var seqs: [16]*Seq = undefined;
++        const m = @min(n, e.pool_max, seqs.len);
++        var made: usize = 0;
++        defer for (seqs[0..made]) |s| e.retire(s);
++        while (made < m) : (made += 1) seqs[made] = try e.takeSeq(e.max_len);
++        const zeros: [state.max_rows]u32 = @splat(0);
++        const rows = @min(e.depth + 1, e.buf.b.rows, state.max_rows);
++        for (seqs[0..made]) |s| {
++            e.bound = s;
++            for (1..rows + 1) |r| for (0..2) |_| try e.forward(zeros[0..r]);
++            const mb = &(e.mbuf orelse continue);
++            for (1..rows + 1) |r| for (0..2) |_| {
++                var segs: [1]fwd.Seg = undefined;
++                const in = [1]mtp.Input{.{ .seq = s, .next = zeros[0..r], .streams = e.buf.b.streams }};
++                _ = try mtp.stageMany(&e.f, &in, mb, &segs);
++                try e.runMulti(true, &segs, mb);
++            };
++        }
++        try e.stream.synchronize();
++        return e.captures - before;
++    }
++
+     /// Shared graphs released: those baking in sequence `seq`, or all (null).
+     fn dropMulti(e: *Engine, seq: ?usize) void {
+         while (true) {
+@@ -1995,19 +2156,24 @@ pub const Engine = struct {
+         const media = !e.media_graphs and for (segs) |sg| {
+             if (sg.seq.media != null) break true;
+         } else false;
+-        const key = if (e.graphs_on and e.f.dump == null and e.f.prof == null and segs.len <= e.multi_graphs and !media) e.multiKey(head, segs, ctxs[0..segs.len]) else null;
++        const widest = if (head) e.multi_graphs else e.multi_verify;
++        const key = if (e.graphs_on and e.f.dump == null and e.f.prof == null and segs.len <= widest and !media) e.multiKey(head, segs, ctxs[0..segs.len]) else null;
+         const k = key orelse {
+             if (head) _ = try mtp.computeSegs(&e.f, segs, x) else _ = try e.f.computeSegs(segs, x, true);
+             return;
+         };
+         e.f.contexts = ctxs[0..segs.len];
+         defer e.f.contexts = null;
+-        if (e.multi.get(k)) |g| return g.exec.launchOn(e.stream);
++        e.use_tick += 1;
++        if (e.multi.getPtr(k)) |g| {
++            g.used = e.use_tick;
++            return g.exec.launchOn(e.stream);
++        }
+         if (e.seen.count() > 16384) e.seen.clearRetainingCapacity();
+         const again = (try e.seen.getOrPut(e.gpa, k)).found_existing;
+         if (head) _ = try mtp.computeSegs(&e.f, segs, x) else _ = try e.f.computeSegs(segs, x, true);
+         if (!again) return;
+-        if (e.multi.count() >= max_multi_graphs) {
++        if (!e.multi_lru and e.multi.count() >= e.multi_max) {
+             e.dropMulti(null);
+             e.seen.clearRetainingCapacity();
+         }
+@@ -2016,6 +2182,7 @@ pub const Engine = struct {
+             return;
+         }
+         try e.stream.synchronize();
++        if (e.multi_lru and e.multi.count() >= e.multi_max) e.evictMulti(); // after the drain: none in flight
+         if (!e.capBegin(&e.multi_fault, "shared")) return;
+         const r = if (head) mtp.computeSegs(&e.f, segs, x) else e.f.computeSegs(segs, x, true);
+         const ok = if (r) |_| true else |err| e.capNote(&e.multi_fault, "shared", "capture", err);
+@@ -2024,7 +2191,7 @@ pub const Engine = struct {
+         const seqs = try e.gpa.alloc(usize, segs.len);
+         errdefer e.gpa.free(seqs);
+         for (segs, seqs) |sg, *q| q.* = @intFromPtr(sg.seq);
+-        try e.multi.put(e.gpa, k, .{ .exec = exec, .seqs = seqs });
++        try e.multi.put(e.gpa, k, .{ .exec = exec, .seqs = seqs, .used = e.use_tick });
+         e.captures += 1;
+         e.capLog("shared");
+     }
+diff --git a/zig/src/families/flashnext/cuda_forward.zig b/zig/src/families/flashnext/cuda_forward.zig
+index 3a9f5ce..dbca23b 100644
+--- a/zig/src/families/flashnext/cuda_forward.zig
++++ b/zig/src/families/flashnext/cuda_forward.zig
+@@ -102,6 +102,10 @@ pub const Seq = struct {
+     held_par: u1 = 0,
+     /// the prompt's images and video frames (null: text)
+     media: ?SeqMedia = null,
++    /// a lane sequence the engine keeps for the next request (Engine.takeSeq / retire), and the capacity
++    /// its first growth step gave it (a recycled one starts there again)
++    pooled: bool = false,
++    pool_capacity: usize = 0,
+ 
+     /// The sequence's rotary table, when its prompt has images or video.
+     pub fn rope(s: *const Seq) ?tri.Tri.Rope {
+@@ -142,6 +146,9 @@ pub const Budget = struct {
+     }
+ };
+ 
++/// Memory the engine can give back on demand (its idle pooled sequences); `run` says whether it freed any.
++pub const Reclaim = struct { ptr: *anyopaque, run: *const fn (*anyopaque) bool };
++
+ extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
+ extern "c" fn read(fd: c_int, buf: [*]u8, n: usize) isize;
+ extern "c" fn close(fd: c_int) c_int;
+@@ -486,6 +493,8 @@ pub const Forward = struct {
+     contexts: ?[]const usize = null,
+     /// the sequences' memory (null: unbounded)
+     budget: ?*Budget = null,
++    /// memory held by idle pooled sequences given back when a growth would not fit (Engine.trimPool)
++    reclaim: ?Reclaim = null,
+     /// decode rounds' DeltaNet scratch (initRound), the parity the last decode stage wrote, and every live
+     /// sequence (those holding rows of a round that a later one overwrites are folded first)
+     round: ?Round = null,
+@@ -1092,7 +1101,11 @@ pub const Forward = struct {
+         if (seq.regions.items.len > 0) return f.growMapped(seq, target);
+         const now = if (st.ctx) |c| c.buf.len else 0;
+         const next = state.State.cacheBytes(f.g, target) + 64 * 256;
+-        if (!try f.agree(if (f.budget) |b| b.used + next <= b.limit and b.leaves(next) else true)) return error.NoRoom;
++        var fits = if (f.budget) |b| b.used + next <= b.limit and b.leaves(next) else true;
++        if (!fits) if (f.reclaim) |r| if (r.run(r.ptr)) {
++            fits = if (f.budget) |b| b.used + next <= b.limit and b.leaves(next) else true;
++        };
++        if (!try f.agree(fits)) return error.NoRoom;
+         try f.s.synchronize();
+         _ = try st.ensure(rows);
+         const after = if (st.ctx) |c| c.buf.len else 0;
+@@ -1132,7 +1145,11 @@ pub const Forward = struct {
+             const r = seq.regions.items[4 * i ..][0..4];
+             for ([_]usize{ 0, 1, 3 }, [_]usize{ target * k_row, target * v_row, pooled }) |j, bytes| need += r[j].v.up(bytes) -| r[j].mapped;
+         }
+-        if (!try f.agree(if (f.budget) |b| b.used + need <= b.limit and b.leaves(need) else true)) return error.NoRoom;
++        var fits = if (f.budget) |b| b.used + need <= b.limit and b.leaves(need) else true;
++        if (!fits) if (f.reclaim) |r| if (r.run(r.ptr)) {
++            fits = if (f.budget) |b| b.used + need <= b.limit and b.leaves(need) else true;
++        };
++        if (!try f.agree(fits)) return error.NoRoom;
+         var added: usize = 0;
+         for (0..layers) |i| {
+             const r = seq.regions.items[4 * i ..][0..4];
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 6d69ee3..b622039 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -619,11 +619,21 @@ pub fn Lanes(comptime E: type) type {
+         fn freeKept(self: *Self, k: *Kept) void {
+             self.kept_bytes -= k.bytes;
+             if (std.mem.indexOfScalar(*Kept, self.late.items, k)) |i| _ = self.late.orderedRemove(i);
+-            if (k.keeper) |kp| self.e.freeSeq(kp);
++            if (k.keeper) |kp| self.retireSeq(kp);
+             self.e.freeSnapshot(k.snap);
+             self.gpa.destroy(k);
+         }
+ 
++        /// A lane's sequence from the engine's pool when it has one (Engine.takeSeq), else newSeq.
++        fn takeSeq(self: *Self, limit: usize) !SeqPtr {
++            return if (@hasDecl(E, "takeSeq")) self.e.takeSeq(limit) else self.e.newSeq(limit);
++        }
++
++        /// A lane's (or keeper's) sequence back to the engine's pool when it keeps them, else freed.
++        fn retireSeq(self: *Self, s: SeqPtr) void {
++            if (@hasDecl(E, "retire")) self.e.retire(s) else self.e.freeSeq(s);
++        }
++
+         /// The pass ended: rank 0 (or one rank) frees what the store did not adopt and tells rank 1 which it did;
+         /// rank 1 keeps them all until that note.
+         fn endPass(self: *Self) void {
+@@ -749,7 +759,6 @@ pub fn Lanes(comptime E: type) type {
+ 
+         /// The prefill's local steps: admission, the last round's commits, the stream's lane and a new sequence.
+         fn preparePrefill(self: *Self, s: *lanes.Stream) !*Lane {
+-            const e = self.e;
+             const ids = s.prompt();
+             if (ids.len == 0 or ids.len > self.context or s.max_new > self.context - ids.len) return error.PromptTooLong;
+             const limit = ids.len + s.max_new + self.window; // speculative rows are outside the public context
+@@ -760,7 +769,7 @@ pub fn Lanes(comptime E: type) type {
+             if (!self.overcommit and self.reserved - before + need + self.kept_bytes > self.budget()) return error.NoRoom;
+             try self.settle();
+             const l = if (self.lanes.get(s)) |old| blk: {
+-                e.freeSeq(old.seq);
++                self.retireSeq(old.seq);
+                 break :blk old;
+             } else blk: {
+                 const l = try self.gpa.create(Lane);
+@@ -769,7 +778,7 @@ pub fn Lanes(comptime E: type) type {
+                 break :blk l;
+             };
+             self.reserved -= before;
+-            l.* = .{ .seq = e.newSeq(limit) catch |err| {
++            l.* = .{ .seq = self.takeSeq(limit) catch |err| {
+                 _ = self.lanes.remove(s);
+                 self.gpa.destroy(l);
+                 return err;
+@@ -798,7 +807,7 @@ pub fn Lanes(comptime E: type) type {
+             self.stopFill(l);
+             self.reserved -= l.reserved;
+             self.forget(l);
+-            self.e.freeSeq(l.seq);
++            self.retireSeq(l.seq);
+             self.gpa.destroy(l);
+         }
+ 
+@@ -1016,7 +1025,7 @@ pub fn Lanes(comptime E: type) type {
+             }
+             self.reserved -= kv.value.reserved;
+             self.forget(kv.value);
+-            if (!kept_seq) self.e.freeSeq(kv.value.seq);
++            if (!kept_seq) self.retireSeq(kv.value.seq);
+             self.gpa.destroy(kv.value);
+         }
+ 
+diff --git a/zig/src/families/flashnext/cuda_native.zig b/zig/src/families/flashnext/cuda_native.zig
+index 6f820a7..955e73a 100644
+--- a/zig/src/families/flashnext/cuda_native.zig
++++ b/zig/src/families/flashnext/cuda_native.zig
+@@ -157,6 +157,17 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const
+     }
+     var backend = own.lanes.backend();
+     own.lanes.follower = o.tp == 2 and o.rank == 1;
++    // TF_FLASHNEXT_WARM_POOL=N pooled sequences carry the served one-stream graphs before serving (one rank)
++    if (comptime @hasDecl(M.Engine, "warmPool")) {
++        if (o.tp == 1) if (getenv("TF_FLASHNEXT_WARM_POOL")) |v| {
++            const n = std.fmt.parseInt(usize, v, 10) catch 0;
++            const got = own.e.warmPool(n) catch |err| blk: {
++                std.log.warn("graph warm-up failed ({s}); serving without it", .{@errorName(err)});
++                break :blk 0;
++            };
++            std.log.info("graph warm-up: {d} graphs on {d} pooled sequences", .{ got, n });
++        };
++    }
+     if (o.tp == 2) {
+         own.bcast = try mirror.Broadcast.init(ctx.d, &own.comm.?, streamOf(own.e));
+         own.agreement = try mirror.Agreement.init(ctx.d, &own.comm.?, streamOf(own.e), &own.watch.?);
+diff --git a/zig/src/families/flashnext/cuda_vmm.zig b/zig/src/families/flashnext/cuda_vmm.zig
+index 667e37f..5b817db 100644
+--- a/zig/src/families/flashnext/cuda_vmm.zig
++++ b/zig/src/families/flashnext/cuda_vmm.zig
+@@ -116,6 +116,23 @@ pub const Region = struct {
+         return size;
+     }
+ 
++    /// Physical memory past the first mapping given back (the addresses stay reserved, so pointers and
++    /// captured graphs stay valid); the bytes released. The caller drains every launch that may touch it first.
++    pub fn shrinkToFirst(r: *Region) usize {
++        std.debug.assert(!r.ring);
++        if (r.maps.items.len <= 1) return 0;
++        var freed: usize = 0;
++        for (r.maps.items[1..], r.handles.items[1..]) |m, h| {
++            _ = r.v.unmap(r.base + m[0], m[1]);
++            _ = r.v.release(h);
++            freed += m[1];
++        }
++        r.maps.shrinkRetainingCapacity(1);
++        r.handles.shrinkRetainingCapacity(1);
++        r.mapped = r.maps.items[0][0] + r.maps.items[0][1];
++        return freed;
++    }
++
+     /// The whole region as a ring over one chunk of `chunk` bytes (a multiple of the granularity): address
+     /// base + x reaches physical byte x mod chunk. Returns the physical bytes.
+     pub fn mapRing(r: *Region, gpa: Allocator, chunk: usize) !usize {

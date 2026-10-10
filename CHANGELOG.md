@@ -3,6 +3,14 @@
 Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:zig-db28187`, built by
 `scripts/prepare.sh` from TensorFold `db281878` plus `patches/`.
 
+## Unreleased
+
+- `patches/0016-flash-next-sequence-pool` and `TF_FLASHNEXT_SEQ_POOL=4`, `TF_FLASHNEXT_WARM_POOL=4`,
+  `TF_FLASHNEXT_MULTI_LRU=1`, `TF_FLASHNEXT_SOLO_MAX=1024`, `TF_FLASHNEXT_MULTI_VERIFY=1` (the defaults): finished
+  sequences are reset and kept with their CUDA graphs, captured at load, graph tables evict the least recently used,
+  and shared verify rounds run eagerly. Short one-client replies 9% faster, the first request after boot 14%; every
+  reply byte-identical.
+
 ## [1.0.0] - 2026-10-08
 
 TensorFold's Zig engine (`tensorfold-native`, TP=1). Engine `37763df`, merged into `zig-single` as `453439d`

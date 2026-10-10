@@ -74,6 +74,16 @@ export TF_FLASHNEXT_DEPTH="${TF_FLASHNEXT_DEPTH:-15}"
 # TF_FLASHNEXT_CONFIDENCE=0.5 forces the per-draft rule at every width.
 export TF_FLASHNEXT_PRODUCT_STREAMS="${TF_FLASHNEXT_PRODUCT_STREAMS:-2}"
 export TF_FLASHNEXT_PREFILL_TAIL="${TF_FLASHNEXT_PREFILL_TAIL:-512}"
+# CUDA graphs across requests (patches/0016, one GPU): up to 4 finished sequences are reset and kept with their
+# graphs, 4 are made and captured at load, graph tables evict the least recently run graph, and shared verify rounds
+# of 2+ streams run eagerly (their compositions rarely repeat). Idle pooled sequences are freed before a request
+# would be refused. SEQ_POOL=0 WARM_POOL=0 MULTI_LRU=0 SOLO_MAX=0 MULTI_VERIFY=4 is the engine's graph policy.
+export TF_FLASHNEXT_SEQ_POOL="${TF_FLASHNEXT_SEQ_POOL:-4}"
+export TF_FLASHNEXT_WARM_POOL="${TF_FLASHNEXT_WARM_POOL:-4}"
+export TF_FLASHNEXT_MULTI_LRU="${TF_FLASHNEXT_MULTI_LRU:-1}"
+export TF_FLASHNEXT_MULTI_MAX="${TF_FLASHNEXT_MULTI_MAX:-192}"
+export TF_FLASHNEXT_SOLO_MAX="${TF_FLASHNEXT_SOLO_MAX:-1024}"
+export TF_FLASHNEXT_MULTI_VERIFY="${TF_FLASHNEXT_MULTI_VERIFY:-1}"
 # KV cache (--kv-dtype). fp8 is the default: about 1.84x the pool of bf16, and lossy (~98.8% top-1 agreement with a
 # bf16 cache, so a free-running reply can differ). bf16 is exact: KV_DTYPE=bf16. FP8 works together with --vision.
 KV_DTYPE="${KV_DTYPE:-fp8}"
