@@ -74,6 +74,12 @@ export TF_FLASHNEXT_DEPTH="${TF_FLASHNEXT_DEPTH:-15}"
 # TF_FLASHNEXT_CONFIDENCE=0.5 forces the per-draft rule at every width.
 export TF_FLASHNEXT_PRODUCT_STREAMS="${TF_FLASHNEXT_PRODUCT_STREAMS:-2}"
 export TF_FLASHNEXT_PREFILL_TAIL="${TF_FLASHNEXT_PREFILL_TAIL:-512}"
+# At one Spark the n-gram table is read through the page cache, a row at a time (patches/0012): a 32-thread gang
+# gathers a chunk's rows, the rows the next chunks and drafts need are touched ahead, and MADV_RANDOM stops each miss
+# reading 128 KiB around it. The same rows into the same places. THREADS=0: the engine's one-thread gather.
+export TF_FLASHNEXT_NGRAM_THREADS="${TF_FLASHNEXT_NGRAM_THREADS:-32}"
+export TF_FLASHNEXT_NGRAM_PREFETCH="${TF_FLASHNEXT_NGRAM_PREFETCH:-$(( TF_FLASHNEXT_NGRAM_THREADS > 0 ))}"
+export TF_FLASHNEXT_NGRAM_RANDOM="${TF_FLASHNEXT_NGRAM_RANDOM:-1}"
 # KV cache (--kv-dtype). fp8 is the default: about 1.84x the pool of bf16, and lossy (~98.8% top-1 agreement with a
 # bf16 cache, so a free-running reply can differ). bf16 is exact: KV_DTYPE=bf16. FP8 works together with --vision.
 KV_DTYPE="${KV_DTYPE:-fp8}"

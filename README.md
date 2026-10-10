@@ -298,9 +298,11 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `TENSORFOLD_MEMORY_RESERVE_GIB` | `10` | kept free when the engine sizes the pool. `prepare.sh` and `start.sh` refuse a Spark below this |
 | `TF_FLASHNEXT_PRODUCT_STREAMS` | `2` | running-product draft stop at this many streams or fewer; confidence 0.5 above it |
 | `TF_FLASHNEXT_PREFILL_TAIL` | `512` | a short last prompt chunk joins the previous one |
+| `TF_FLASHNEXT_NGRAM_THREADS` / `_PREFETCH` / `_RANDOM` | `32` / `1` / `1` | the n-gram table's host gather (`patches/0012`): a 32-thread gang, rows touched ahead (the next 2 prompt chunks, `TF_FLASHNEXT_NGRAM_AHEAD`; each draft), `MADV_RANDOM` on the shard mappings. `0` / `0` / `0` is the engine's one-thread gather |
 | `MODEL_REVISION` | `14642741…` | the checkpoint commit this recipe serves |
 
-The Python recipe's int8 KV and SSD n-gram reader are gone. KV is fp8 (or bf16), and the n-gram table is on the GPU.
+The Python recipe's int8 KV and SSD n-gram reader are gone. KV is fp8 (or bf16). At one Spark the n-gram table
+(`ple-table/`, 48.67 GiB) stays in its files and is read through the page cache (`patches/0012`).
 
 ### Thinking and sampling
 
@@ -330,9 +332,15 @@ the model was still thinking.
 
 ## What the patches are
 
-`patches/*.patch` is the Zig Flash Next CUDA engine against TensorFold `db281878` (the `zig-flashnext` pin), applied
-with `git apply` in the checkout root. They are the engine, not speed patches on a Python package. Drafts are still
-checked: a drafted reply matches `"draft": false`.
+`patches/0001`-`0009` are the Zig Flash Next CUDA engine against TensorFold `db281878` (the `zig-flashnext` pin),
+applied with `git apply` in the checkout root. They are the engine, not speed patches on a Python package. Drafts are
+still checked: a drafted reply matches `"draft": false`.
+
+Speed patches on top of the engine (each keeps every reply byte-identical):
+
+| Patch | What it changes |
+| --- | --- |
+| `0012-flash-next-ngram-host-gather` | at one GPU the n-gram table's rows are gathered by a thread gang, rows the next chunks and drafts need are touched ahead, and the shard mappings are `MADV_RANDOM`: cold pages fault in parallel, one 4 KiB page each, instead of one at a time with 128 KiB read-around. The same rows into the same places |
 
 ## Checks
 
