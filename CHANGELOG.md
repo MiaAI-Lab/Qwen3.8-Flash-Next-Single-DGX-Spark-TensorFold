@@ -3,6 +3,13 @@
 Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:zig-db28187`, built by
 `scripts/prepare.sh` from TensorFold `db281878` plus `patches/`.
 
+## Unreleased
+
+- `patches/0014-flash-next-copy-resync` and `TF_FLASHNEXT_COPY_RESYNC=1`, `_RAMP=jump`, `_MISS=keep` (the
+  defaults): a copy out of the prompt that misses re-proposes the source past the edit, a clean copy round jumps to
+  the widest window, a missed one keeps its width. One client: one-word rewrites +31%, four-word rewrites 2x, one-line
+  edits +9% over `0013` alone; prose and code decode rounds unchanged; every reply byte-identical.
+
 ## [1.0.0] - 2026-10-08
 
 TensorFold's Zig engine (`tensorfold-native`, TP=1). Engine `37763df`, merged into `zig-single` as `453439d`
