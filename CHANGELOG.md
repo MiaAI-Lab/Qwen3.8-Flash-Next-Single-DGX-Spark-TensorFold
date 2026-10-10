@@ -3,6 +3,13 @@
 Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:zig-db28187`, built by
 `scripts/prepare.sh` from TensorFold `db281878` plus `patches/`.
 
+## Unreleased
+
+- `patches/0019-flash-next-decode-readout-fusion` (on by default; `TF_FLASHNEXT_UPMIX_DECODE=0`,
+  `TF_FLASHNEXT_REDUCE_ACT=0` keep the separate launches): decode read-outs run the up projection and the mix as one
+  `_hc_up_mix` launch, and bf16 `_reduce` + `_hc_act` as one CUDA kernel with Triton's operations. Decode +0.5 to
+  +1.2% at 1-4 clients; every reply byte-identical (`glue-check`).
+
 ## [1.0.0] - 2026-10-08
 
 TensorFold's Zig engine (`tensorfold-native`, TP=1). Engine `37763df`, merged into `zig-single` as `453439d`
