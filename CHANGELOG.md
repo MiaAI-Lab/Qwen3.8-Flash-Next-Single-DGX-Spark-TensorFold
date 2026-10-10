@@ -3,6 +3,12 @@
 Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:zig-db28187`, built by
 `scripts/prepare.sh` from TensorFold `db281878` plus `patches/`.
 
+## Unreleased
+
+- `patches/0015-flash-next-copy-shared-rounds` and `TF_FLASHNEXT_COPY_SHARED=1` (the default): copies out of the
+  prompt take the lone stream's window ramp in shared rounds too. Two concurrent file edits +55% a stream, a file edit
+  beside a prose reply 1.9x with the prose stream unchanged; decode unchanged; every reply byte-identical.
+
 ## [1.0.0] - 2026-10-08
 
 TensorFold's Zig engine (`tensorfold-native`, TP=1). Engine `37763df`, merged into `zig-single` as `453439d`
