@@ -298,6 +298,7 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `TENSORFOLD_MEMORY_RESERVE_GIB` | `10` | kept free when the engine sizes the pool. `prepare.sh` and `start.sh` refuse a Spark below this |
 | `TF_FLASHNEXT_PRODUCT_STREAMS` | `2` | running-product draft stop at this many streams or fewer; confidence 0.5 above it |
 | `TF_FLASHNEXT_PREFILL_TAIL` | `512` | a short last prompt chunk joins the previous one |
+| `TF_FLASHNEXT_WINDOW` | `64` | a lone stream's verify window in rows (`patches/0013`): copies grow to it, the MTP chain stays at `TF_FLASHNEXT_DEPTH`. `16` is the window without wide copies |
 | `MODEL_REVISION` | `14642741…` | the checkpoint commit this recipe serves |
 
 The Python recipe's int8 KV and SSD n-gram reader are gone. KV is fp8 (or bf16), and the n-gram table is on the GPU.
@@ -330,9 +331,15 @@ the model was still thinking.
 
 ## What the patches are
 
-`patches/*.patch` is the Zig Flash Next CUDA engine against TensorFold `db281878` (the `zig-flashnext` pin), applied
-with `git apply` in the checkout root. They are the engine, not speed patches on a Python package. Drafts are still
-checked: a drafted reply matches `"draft": false`.
+`patches/0001`-`0009` are the Zig Flash Next CUDA engine against TensorFold `db281878` (the `zig-flashnext` pin),
+applied with `git apply` in the checkout root. They are the engine, not speed patches on a Python package. Drafts are
+still checked: a drafted reply matches `"draft": false`.
+
+Speed patches on top of the engine (each keeps every reply byte-identical):
+
+| Patch | What it changes |
+| --- | --- |
+| `0013-flash-next-copy-window` | a lone stream's verify window grows to `TF_FLASHNEXT_WINDOW` rows (64; was 16): copied continuations (file edits, repeats) ramp 15 -> 31 -> 63 rows while the MTP chain stays at `TF_FLASHNEXT_DEPTH`. Every row kernel is row-invariant |
 
 ## Checks
 
