@@ -298,6 +298,9 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `TENSORFOLD_MEMORY_RESERVE_GIB` | `10` | kept free when the engine sizes the pool. `prepare.sh` and `start.sh` refuse a Spark below this |
 | `TF_FLASHNEXT_PRODUCT_STREAMS` | `2` | running-product draft stop at this many streams or fewer; confidence 0.5 above it |
 | `TF_FLASHNEXT_PREFILL_TAIL` | `512` | a short last prompt chunk joins the previous one |
+| `TF_FLASHNEXT_DRAFT_INT4` | `1` | the draft head on the int4 lm_head's own columns (`patches/0020`); `0`: the lm_head's draft rows quantized to 4 bits at load |
+| `TF_FLASHNEXT_DRAFT_PROPOSE` / `_CONTINUE` | `0.05` / `0.20` | the running-product stop as two lines: a draft is proposed while the product is >= 0.05, the head runs another level while it is >= 0.20. They replace `-TF_FLASHNEXT_CONFIDENCE`'s one line wherever the product rule applies; `0` / `0`: the one line |
+| `TF_FLASHNEXT_DRAFT_DEPTH_SHARED` | `7` | drafts a stream at most while 2+ streams draft together; `0`: `TF_FLASHNEXT_DEPTH` |
 | `MODEL_REVISION` | `14642741…` | the checkpoint commit this recipe serves |
 
 The Python recipe's int8 KV and SSD n-gram reader are gone. KV is fp8 (or bf16), and the n-gram table is on the GPU.
@@ -330,9 +333,15 @@ the model was still thinking.
 
 ## What the patches are
 
-`patches/*.patch` is the Zig Flash Next CUDA engine against TensorFold `db281878` (the `zig-flashnext` pin), applied
-with `git apply` in the checkout root. They are the engine, not speed patches on a Python package. Drafts are still
-checked: a drafted reply matches `"draft": false`.
+`patches/0001`-`0009` are the Zig Flash Next CUDA engine against TensorFold `db281878` (the `zig-flashnext` pin),
+applied with `git apply` in the checkout root. They are the engine, not speed patches on a Python package. Drafts are
+still checked: a drafted reply matches `"draft": false`.
+
+Speed patches on top of the engine (each keeps every reply byte-identical):
+
+| Patch | What it changes |
+| --- | --- |
+| `0020-flash-next-draft-stop-lines` | the draft head on the int4 lm_head's own columns (`TF_FLASHNEXT_DRAFT_INT4`, 105 MB a step, was 127.5 MB), the running-product stop split into a propose line and a continue line (`TF_FLASHNEXT_DRAFT_PROPOSE` / `_CONTINUE`), and 7 drafts at most while 2+ streams draft (`TF_FLASHNEXT_DRAFT_DEPTH_SHARED`). Drafts only |
 
 ## Checks
 

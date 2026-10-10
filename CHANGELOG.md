@@ -3,6 +3,14 @@
 Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:zig-db28187`, built by
 `scripts/prepare.sh` from TensorFold `db281878` plus `patches/`.
 
+## Unreleased
+
+- `patches/0020-flash-next-draft-stop-lines` and `TF_FLASHNEXT_DRAFT_INT4=1`, `TF_FLASHNEXT_DRAFT_PROPOSE=0.05`,
+  `TF_FLASHNEXT_DRAFT_CONTINUE=0.20`, `TF_FLASHNEXT_DRAFT_DEPTH_SHARED=7` (the defaults): the running-product draft
+  stop is split into a propose line and a continue line, the draft head reads the int4 lm_head's own columns (105 MB a
+  step instead of 127.5 MB), and drafts are capped at 7 a stream while 2+ streams draft together. Decode +1.4 to +7%
+  at 1-2 clients; every reply byte-identical.
+
 ## [1.0.0] - 2026-10-08
 
 TensorFold's Zig engine (`tensorfold-native`, TP=1). Engine `37763df`, merged into `zig-single` as `453439d`

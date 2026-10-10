@@ -74,6 +74,14 @@ export TF_FLASHNEXT_DEPTH="${TF_FLASHNEXT_DEPTH:-15}"
 # TF_FLASHNEXT_CONFIDENCE=0.5 forces the per-draft rule at every width.
 export TF_FLASHNEXT_PRODUCT_STREAMS="${TF_FLASHNEXT_PRODUCT_STREAMS:-2}"
 export TF_FLASHNEXT_PREFILL_TAIL="${TF_FLASHNEXT_PREFILL_TAIL:-512}"
+# Drafting (patches/0020): the draft head on the int4 lm_head's own columns; the running product's stop as two lines
+# (a draft proposed while the product is >= PROPOSE, another head level while it is >= CONTINUE) in place of
+# -TF_FLASHNEXT_CONFIDENCE's one; at most 7 drafts a stream while 2+ streams draft together. Drafts only: replies
+# match. DRAFT_INT4=0 DRAFT_PROPOSE=0 DRAFT_DEPTH_SHARED=0: the engine's drafting.
+export TF_FLASHNEXT_DRAFT_INT4="${TF_FLASHNEXT_DRAFT_INT4:-1}"
+export TF_FLASHNEXT_DRAFT_PROPOSE="${TF_FLASHNEXT_DRAFT_PROPOSE:-0.05}"
+export TF_FLASHNEXT_DRAFT_CONTINUE="${TF_FLASHNEXT_DRAFT_CONTINUE:-0.20}"
+export TF_FLASHNEXT_DRAFT_DEPTH_SHARED="${TF_FLASHNEXT_DRAFT_DEPTH_SHARED:-7}"
 # KV cache (--kv-dtype). fp8 is the default: about 1.84x the pool of bf16, and lossy (~98.8% top-1 agreement with a
 # bf16 cache, so a free-running reply can differ). bf16 is exact: KV_DTYPE=bf16. FP8 works together with --vision.
 KV_DTYPE="${KV_DTYPE:-fp8}"
