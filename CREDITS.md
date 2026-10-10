@@ -91,6 +91,7 @@ This recipe no longer applies those patches (the serving path is the Zig engine)
   [GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold);
   `exact.py` is from MiaAI-Lab's Flash Next two-Spark TensorFold recipe. Developed with
   [Claude Code](https://claude.com/claude-code).
+- `patches/0014-flash-next-copy-resync`: by [BadAd84](https://github.com/BadAd84).
 
 ## Runtime stack
 

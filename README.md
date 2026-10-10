@@ -298,6 +298,7 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `TENSORFOLD_MEMORY_RESERVE_GIB` | `10` | kept free when the engine sizes the pool. `prepare.sh` and `start.sh` refuse a Spark below this |
 | `TF_FLASHNEXT_PRODUCT_STREAMS` | `2` | running-product draft stop at this many streams or fewer; confidence 0.5 above it |
 | `TF_FLASHNEXT_PREFILL_TAIL` | `512` | a short last prompt chunk joins the previous one |
+| `TF_FLASHNEXT_COPY_RESYNC` / `_RAMP` / `_MISS` | `1` / `jump` / `keep` | the copy policy (`patches/0014`): re-propose the source past an edit (only copies out of the prompt; `TF_FLASHNEXT_COPY_RESYNC_PROMPT_ONLY=0` lifts that), the widest window after a clean copy round, the same width after a miss. `0` / `double` / `first` is the engine's policy |
 | `MODEL_REVISION` | `14642741…` | the checkpoint commit this recipe serves |
 
 The Python recipe's int8 KV and SSD n-gram reader are gone. KV is fp8 (or bf16), and the n-gram table is on the GPU.
@@ -330,9 +331,15 @@ the model was still thinking.
 
 ## What the patches are
 
-`patches/*.patch` is the Zig Flash Next CUDA engine against TensorFold `db281878` (the `zig-flashnext` pin), applied
-with `git apply` in the checkout root. They are the engine, not speed patches on a Python package. Drafts are still
-checked: a drafted reply matches `"draft": false`.
+`patches/0001`-`0009` are the Zig Flash Next CUDA engine against TensorFold `db281878` (the `zig-flashnext` pin),
+applied with `git apply` in the checkout root. They are the engine, not speed patches on a Python package. Drafts are
+still checked: a drafted reply matches `"draft": false`.
+
+Speed patches on top of the engine (each keeps every reply byte-identical):
+
+| Patch | What it changes |
+| --- | --- |
+| `0014-flash-next-copy-resync` | the copy policy (`TF_FLASHNEXT_COPY_*`): a copy out of the prompt that misses re-proposes the source right past the edit (re-sync), a clean copy round jumps to the widest window, a missed one keeps its width. Drafts only |
 
 ## Checks
 
