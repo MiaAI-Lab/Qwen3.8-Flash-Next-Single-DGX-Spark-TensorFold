@@ -74,6 +74,10 @@ export TF_FLASHNEXT_DEPTH="${TF_FLASHNEXT_DEPTH:-15}"
 # TF_FLASHNEXT_CONFIDENCE=0.5 forces the per-draft rule at every width.
 export TF_FLASHNEXT_PRODUCT_STREAMS="${TF_FLASHNEXT_PRODUCT_STREAMS:-2}"
 export TF_FLASHNEXT_PREFILL_TAIL="${TF_FLASHNEXT_PREFILL_TAIL:-512}"
+# Greedy draws batched at one rank (patches/0017): a draft level's over every stream in one kernel and one read, a
+# shared round's windows in one argmax and one read; each row's bytes as its own draw's. 0 / 0: one at a time.
+export TF_FLASHNEXT_BATCH_DRAWS="${TF_FLASHNEXT_BATCH_DRAWS:-1}"
+export TF_FLASHNEXT_BATCH_WINDOWS="${TF_FLASHNEXT_BATCH_WINDOWS:-1}"
 # KV cache (--kv-dtype). fp8 is the default: about 1.84x the pool of bf16, and lossy (~98.8% top-1 agreement with a
 # bf16 cache, so a free-running reply can differ). bf16 is exact: KV_DTYPE=bf16. FP8 works together with --vision.
 KV_DTYPE="${KV_DTYPE:-fp8}"
