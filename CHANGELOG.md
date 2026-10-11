@@ -3,6 +3,12 @@
 Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:zig-db28187`, built by
 `scripts/prepare.sh` from TensorFold `db281878` plus `patches/`.
 
+## Unreleased
+
+- `patches/0022-flash-next-readout-12bit-weights` and `TF_FLASHNEXT_HC_Q12=1` (the default; `0`: the bf16 kernels):
+  decode read-outs read a lossless 12-bit copy of their weights (0.77 of the bf16 bytes, built at load, +0.97 GB).
+  Decode +2.6% code and +3.7% prose at 1 client, +2.3% prose at 2; every reply byte-identical (`hc-check`).
+
 ## [1.0.0] - 2026-10-08
 
 TensorFold's Zig engine (`tensorfold-native`, TP=1). Engine `37763df`, merged into `zig-single` as `453439d`

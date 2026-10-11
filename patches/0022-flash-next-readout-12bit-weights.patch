@@ -1,0 +1,1049 @@
+diff --git a/zig/kernels/cuda/torch_ops/fn_ops.cu b/zig/kernels/cuda/torch_ops/fn_ops.cu
+index 14484f0..a52a597 100644
+--- a/zig/kernels/cuda/torch_ops/fn_ops.cu
++++ b/zig/kernels/cuda/torch_ops/fn_ops.cu
+@@ -287,3 +287,359 @@ extern "C" cudaError_t tf_fn_nucleus_mass(const void* logits, uint64_t ld, uint6
+         static_cast<int64_t*>(mass), static_cast<unsigned long long*>(sums));
+     return cudaGetLastError();
+ }
++
++// The hyper-connection read-outs' bf16 matrices at decode widths from a lossless 12-bit copy (q12), with
++// the Triton kernels' bits (tf_fn_hc_down_q12_kernel = bf16._b16mm's split-K partials then
++// tf_fn_hc_reduce_act_kernel; tf_fn_hc_upmix_q12_kernel = prompt_mm._hc_up_mix = _b16mm (SK 1) + glue._hc_mix).
++// An output's partial is the same mma.m16n8k16 chain Triton issues (the slice's k16 chunks ascending from a zero
++// accumulator), so tiles and warps are free; the slice sums and the epilogues are tf_fn_hc_reduce_act_kernel's.
++// q12 block = one n8 tile x 64 k (512 weights, 32 lanes x 16): lane l = 4 g + q holds row 8 t + g and, for chunk c,
++// k = 16 c + {2q, 2q+1, 2q+8, 2q+9} (weight j = 4 c + i). sm: the 16 sign|mantissa bytes; ex: 4-bit codes, weight
++// j = 2 p + h at word h, byte p & 3, nibble p >> 2, the exponent = base - code; code 15 = escape (exact bits in the
++// block's list esc[escoff[blk] ..], entries pos << 16 | bits with pos = 16 lane + j, sorted); base: the (row, 64 k)
++// maximum exponent. tf_fn_hc_q12_pack_kernel writes it (hc-check: an exact round trip).
++namespace tf_hcq {
++
++__device__ __forceinline__ uint32_t smem_u32(const void* p) {
++    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
++}
++
++struct Q12 {
++    const uint4* sm;
++    const uint2* ex;
++    const uint8_t* base;
++    const uint32_t* escoff;
++    const uint32_t* esc;
++};
++
++struct Raw {
++    uint4 sm;
++    uint2 ex;
++    uint32_t base;
++};
++
++__device__ __forceinline__ void load_block(Raw& r, const Q12& w, uint32_t blk, int lane) {
++    const size_t i = size_t(blk) * 32 + lane;
++    r.sm = __ldg(w.sm + i);
++    r.ex = __ldg(w.ex + i);
++    r.base = __ldg(w.base + size_t(blk) * 8 + (lane >> 2));
++}
++
++__device__ __noinline__ uint32_t escape_bits(const uint32_t* esc, uint32_t e0, uint32_t e1, uint32_t pos) {
++    for (uint32_t e = e0; e < e1; ++e) {
++        const uint32_t v = __ldg(esc + e);
++        if ((v >> 16) == pos) return v & 0xFFFFu;
++    }
++    return 0;
++}
++
++// The lane's 16 weights as 8 bf16 pairs (b0, b1 of chunk c = o[2c], o[2c + 1]).
++__device__ __forceinline__ void decode(uint32_t (&o)[8], const Raw& r, const Q12& w, uint32_t blk, int lane) {
++    const uint32_t sw[4] = {r.sm.x, r.sm.y, r.sm.z, r.sm.w};
++    // base << 7 in both halves, a guard bit above each so a borrow never crosses halves
++    const uint32_t bwd = (r.base * 0x00800080u) | 0x80008000u;
++#pragma unroll
++    for (int p = 0; p < 8; ++p) {
++        const uint32_t sa = 2u * (p & 1), sb = sa + 1u;
++        // the stored s|m7 bytes into bytes 0 and 2, their signs replicated into bytes 1 and 3
++        const uint32_t x = __byte_perm(sw[p >> 1], 0u, sa | ((sa | 8u) << 4) | (sb << 8) | ((sb | 8u) << 12));
++        const uint32_t z = __byte_perm(r.ex.x, r.ex.y, uint32_t(p & 3) | (uint32_t(4 + (p & 3)) << 8));
++        const uint32_t off = p < 4 ? (z & 0x000F000Fu) * 128u : (z & 0x00F000F0u) * 8u;
++        o[p] = (x & 0x807F807Fu) | ((bwd - off) & 0x7F807F80u);
++    }
++    const uint32_t mx = r.ex.x & (r.ex.x >> 1) & (r.ex.x >> 2) & (r.ex.x >> 3) & 0x11111111u;
++    const uint32_t my = r.ex.y & (r.ex.y >> 1) & (r.ex.y >> 2) & (r.ex.y >> 3) & 0x11111111u;
++    if (mx | my) {
++        const uint32_t e0 = __ldg(w.escoff + blk), e1 = __ldg(w.escoff + blk + 1);
++#pragma unroll 1
++        for (int k = 0; k < 16; ++k) {
++            const uint32_t h = k >> 3, nib = k & 7;
++            if (!(((h ? my : mx) >> (4 * nib)) & 1)) continue;
++            const int p = (nib >> 1) + 4 * (nib & 1), j = 2 * p + h;
++            const uint32_t bits = escape_bits(w.esc, e0, e1, uint32_t(16 * lane + j));
++            const uint32_t sh = 16u * h, keep = ~(0xFFFFu << sh);
++#pragma unroll
++            for (int pp = 0; pp < 8; ++pp) o[pp] = pp == p ? ((o[pp] & keep) | (bits << sh)) : o[pp];
++        }
++    }
++}
++
++__device__ __forceinline__ void mma(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++    asm volatile(
++        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
++        "{%0, %1, %2, %3};\n"
++        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
++        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++}
++
++// A fragment of chunk kc (ldmatrix x4: lane l addresses row l & 15 at k 16 kc + 8 (l >> 4)).
++__device__ __forceinline__ void a_frag(uint32_t (&a)[4], const uint8_t* xs, int pitch, int kc, int lane) {
++    const uint8_t* p = xs + (lane & 15) * pitch + (16 * kc + 8 * (lane >> 4)) * 2;
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
++                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
++                 : "r"(smem_u32(p)));
++}
++
++// Rows [r0, r0 + 16 RT) x k [k0, k0 + KW) of x (rows `stride` elements apart) into xs, rows >= M zero (Triton's
++// other=0.0).
++template <int KW, int RT>
++__device__ __forceinline__ void stage(uint8_t* xs, const __nv_bfloat16* x, size_t stride, int M, int r0, int k0) {
++    constexpr int CH = KW * 2 / 16, PITCH = KW * 2 + 16;
++    for (int i = threadIdx.x; i < 16 * RT * CH; i += blockDim.x) {
++        const int r = i / CH, c = i - r * CH;
++        const bool ok = r0 + r < M;
++        const __nv_bfloat16* src = x + (ok ? size_t(r0 + r) * stride + k0 + c * 8 : 0);
++        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_u32(xs + r * PITCH + c * 16)),
++                     "l"(src), "r"(ok ? 16 : 0));
++    }
++    asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n" ::);
++    __syncthreads();
++}
++
++// NB blocks of tile t from block blk0 for RT row tiles (xs + 16 rows a tile), chunks in order (MUT: reversed inside
++// each block, hc-check's mutant); each output's chain is its own accumulator, so the row tiles only interleave.
++template <int NB, int RT, bool MUT>
++__device__ __forceinline__ void chain_t(float (&d)[RT][4], const Raw (&raw)[NB], const Q12& w, uint32_t blk0,
++                                        const uint8_t* xs, int pitch, int lane) {
++#pragma unroll
++    for (int i = 0; i < NB; ++i) {
++        uint32_t bw[8];
++        decode(bw, raw[i], w, blk0 + i, lane);
++#pragma unroll
++        for (int c0 = 0; c0 < 4; ++c0) {
++            const int c = MUT ? 3 - c0 : c0;
++#pragma unroll
++            for (int rt = 0; rt < RT; ++rt) {
++                uint32_t a[4];
++                a_frag(a, xs + rt * 16 * pitch, pitch, 4 * i + c, lane);
++                mma(d[rt], a, bw[2 * c], bw[2 * c + 1]);
++            }
++        }
++    }
++}
++
++template <int NB, int RT>
++__device__ __forceinline__ void chain(float (&d)[RT][4], const Raw (&raw)[NB], const Q12& w, uint32_t blk0,
++                                      const uint8_t* xs, int pitch, int lane, int mut) {
++    if (mut == 1)
++        chain_t<NB, RT, true>(d, raw, w, blk0, xs, pitch, lane);
++    else
++        chain_t<NB, RT, false>(d, raw, w, blk0, xs, pitch, lane);
++}
++
++}  // namespace tf_hcq
++
++// Down + reduce + act: x [M, K] (rows x_stride apart) @ W [N, K].T from q12, K slices of 320 (SK = K / 320 =
++// gridDim.y), the slices' fp32 partials to part [SK, M, N] (the split _b16mm's layout). With counters (else partials
++// only, for tf_fn_hc_reduce_act_kernel) the CTA arriving last at its column group (counters[blockIdx.x], reset by it)
++// sums them in slice order into act [M, low] / inj [M, N - low] as tf_fn_hc_reduce_act_kernel does. Grid
++// (ceil(ceil(N / 8) / 4), SK, ceil(M / (16 RT))), 128 threads; warp w: tile 4 blockIdx.x + w, rows 16 RT blockIdx.z ...
++// (RT 1 to 16 rows, else 2: the weights decoded once for 32 rows).
++template <int RT>
++__device__ __forceinline__ void hc_down_q12(const __nv_bfloat16* __restrict__ x, uint32_t x_stride, uint32_t M,
++                                            const tf_hcq::Q12& w, float* __restrict__ part, uint32_t N, uint32_t K,
++                                            __nv_bfloat16* act, __nv_bfloat16* inj, uint32_t low, float inv_s,
++                                            uint32_t* counters, int mut) {
++    using namespace tf_hcq;
++    constexpr int KS = 320, NB = KS / 64, PITCH = KS * 2 + 16;
++    __shared__ __align__(16) uint8_t xs[16 * RT * PITCH];
++    __shared__ int last;
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, q = lane & 3;
++    const uint32_t tiles = (N + 7) / 8, NBK = K / 64, SK = gridDim.y, s = blockIdx.y, r0 = 16 * RT * blockIdx.z;
++    const uint32_t t = blockIdx.x * 4 + warp;
++    const bool live = t < tiles;
++    const uint32_t blk0 = t * NBK + s * NB;
++    Raw raw[NB];
++    if (live) {
++#pragma unroll
++        for (int i = 0; i < NB; ++i) load_block(raw[i], w, blk0 + i, lane);
++    }
++    stage<KS, RT>(xs, x, x_stride, int(M), int(r0), int(s * KS));
++    if (live) {
++        float d[RT][4] = {};
++        chain<NB, RT>(d, raw, w, blk0, xs, PITCH, lane, mut);
++        const uint32_t n = 8 * t + 2 * q;
++        float* p = part + size_t(s) * M * N;
++#pragma unroll
++        for (int rt = 0; rt < RT; ++rt) {
++            const uint32_t ra = r0 + 16 * rt + g, rb = ra + 8;
++            if (ra < M) {
++                if (n < N) p[size_t(ra) * N + n] = d[rt][0];
++                if (n + 1 < N) p[size_t(ra) * N + n + 1] = d[rt][1];
++            }
++            if (rb < M) {
++                if (n < N) p[size_t(rb) * N + n] = d[rt][2];
++                if (n + 1 < N) p[size_t(rb) * N + n + 1] = d[rt][3];
++            }
++        }
++    }
++    if (counters == nullptr) return;
++    __threadfence();
++    __syncthreads();
++    if (threadIdx.x == 0) last = atomicAdd(counters + blockIdx.x, 1u) == SK * gridDim.z - 1;
++    __syncthreads();
++    if (!last) return;
++    __threadfence();
++    const uint32_t c0 = 32 * blockIdx.x, cols = min(N, c0 + 32) - c0;
++    const size_t total = size_t(M) * N;
++    for (uint32_t e = threadIdx.x; e < M * cols; e += blockDim.x) {
++        const uint32_t r = e / cols, i = c0 + e - r * cols;
++        const float* pp = part + size_t(r) * N + i;
++        // all slices' partials in flight at once, then added in slice order (SK <= 32, the launcher's bound)
++        float pv[32];
++#pragma unroll
++        for (uint32_t ss = 0; ss < 32; ++ss) pv[ss] = ss < SK ? __ldcg(pp + ss * total) : 0.0f;
++        float acc = pv[0];
++#pragma unroll
++        for (uint32_t ss = 1; ss < 32; ++ss)
++            if (ss < SK) acc = __fadd_rn(acc, pv[ss]);
++        const float v = tf_bf16_round(__fmul_rn(acc, inv_s));
++        if (i < low) {
++            act[size_t(r) * low + i] = __float2bfloat16_rn(tf_div_full(v, __fadd_rn(tf_exp_neg(v), 1.0f)));
++        } else {
++            const float gt = tf_bf16_round(tf_div_full(1.0f, __fadd_rn(tf_exp_neg(v), 1.0f)));
++            inj[size_t(r) * (N - low) + (i - low)] = __float2bfloat16_rn(__fmul_rn(2.0f, gt));
++        }
++    }
++    if (threadIdx.x == 0) counters[blockIdx.x] = 0;
++}
++
++extern "C" __global__ void __launch_bounds__(128) tf_fn_hc_down_q12_kernel(
++    const __nv_bfloat16* __restrict__ x, uint32_t x_stride, uint32_t M, const uint4* sm, const uint2* ex,
++    const uint8_t* base, const uint32_t* escoff, const uint32_t* esc, float* __restrict__ part, uint32_t N, uint32_t K,
++    __nv_bfloat16* act, __nv_bfloat16* inj, uint32_t low, float inv_s, uint32_t* counters, int mut) {
++    hc_down_q12<1>(x, x_stride, M, tf_hcq::Q12{sm, ex, base, escoff, esc}, part, N, K, act, inj, low, inv_s, counters, mut);
++}
++
++extern "C" __global__ void __launch_bounds__(128) tf_fn_hc_down_q12_r32_kernel(
++    const __nv_bfloat16* __restrict__ x, uint32_t x_stride, uint32_t M, const uint4* sm, const uint2* ex,
++    const uint8_t* base, const uint32_t* escoff, const uint32_t* esc, float* __restrict__ part, uint32_t N, uint32_t K,
++    __nv_bfloat16* act, __nv_bfloat16* inj, uint32_t low, float inv_s, uint32_t* counters, int mut) {
++    hc_down_q12<2>(x, x_stride, M, tf_hcq::Q12{sm, ex, base, escoff, esc}, part, N, K, act, inj, low, inv_s, counters, mut);
++}
++
++// Up + mix: act [M, 320] contiguous, W [S D, 320] from q12, normed [M, S D] -> mixed [M, D] =
++// bf16((sum_s in order bf16(bsig(bf16(u_s)) * normed_s)) * (1 / S)), S = 4. Grid (D / 8, ceil(M / (16 RT))), 128
++// threads (warp = stream), rows 16 RT blockIdx.y ...
++template <int RT>
++__device__ __forceinline__ void hc_upmix_q12(const __nv_bfloat16* __restrict__ actv, const tf_hcq::Q12& w,
++                                             const __nv_bfloat16* __restrict__ normed,
++                                             __nv_bfloat16* __restrict__ mixed, uint32_t M, uint32_t D, int mut) {
++    using namespace tf_hcq;
++    constexpr int KW = 320, S = 4, NB = KW / 64, PITCH = KW * 2 + 16;
++    __shared__ __align__(16) uint8_t xs[16 * RT * PITCH];
++    __shared__ float term[S][16 * RT][8];
++    const int lane = threadIdx.x & 31, s = threadIdx.x >> 5, g = lane >> 2, q = lane & 3;
++    const uint32_t d0 = blockIdx.x * 8, t = (s * D + d0) / 8, blk0 = t * NB, r0 = 16 * RT * blockIdx.y;
++    Raw raw[NB];
++#pragma unroll
++    for (int i = 0; i < NB; ++i) load_block(raw[i], w, blk0 + i, lane);
++    // this lane's normed values, loaded before the chain (they do not depend on it)
++    float nv[RT][4];
++#pragma unroll
++    for (int rt = 0; rt < RT; ++rt)
++#pragma unroll
++        for (int h = 0; h < 4; ++h) {
++            const uint32_t r = r0 + 16 * rt + g + 8 * (h >> 1), c = 2 * q + (h & 1);
++            nv[rt][h] = r < M ? __bfloat162float(normed[size_t(r) * (S * D) + size_t(s) * D + d0 + c]) : 0.0f;
++        }
++    stage<KW, RT>(xs, actv, KW, int(M), int(r0), 0);
++    float d[RT][4] = {};
++    chain<NB, RT>(d, raw, w, blk0, xs, PITCH, lane, mut);
++#pragma unroll
++    for (int rt = 0; rt < RT; ++rt)
++#pragma unroll
++        for (int h = 0; h < 4; ++h) {
++            const uint32_t r = 16 * rt + g + 8 * (h >> 1), c = 2 * q + (h & 1);
++            float v = 0.f;
++            if (r0 + r < M) {
++                // glue._bsig(u) * n: bf16(1 / (1 + exp(-u))), the product rounded to bf16
++                const float u = tf_bf16_round(d[rt][h]);
++                const float sg = tf_bf16_round(tf_div_full(1.0f, __fadd_rn(1.0f, tf_exp_neg(u))));
++                v = tf_bf16_round(__fmul_rn(sg, nv[rt][h]));
++            }
++            term[s][r][c] = v;
++        }
++    __syncthreads();
++    for (uint32_t e = threadIdx.x; e < 16 * RT * 8; e += blockDim.x) {
++        const uint32_t r = e >> 3, c = e & 7;
++        if (r0 + r < M) {
++            float total = 0.0f;
++#pragma unroll
++            for (int ss = 0; ss < S; ++ss) total = __fadd_rn(total, term[ss][r][c]);
++            mixed[size_t(r0 + r) * D + d0 + c] = __float2bfloat16_rn(__fmul_rn(total, 1.0f / S));
++        }
++    }
++}
++
++extern "C" __global__ void __launch_bounds__(128) tf_fn_hc_upmix_q12_kernel(
++    const __nv_bfloat16* __restrict__ actv, const uint4* sm, const uint2* ex, const uint8_t* base,
++    const uint32_t* escoff, const uint32_t* esc, const __nv_bfloat16* __restrict__ normed,
++    __nv_bfloat16* __restrict__ mixed, uint32_t M, uint32_t D, int mut) {
++    hc_upmix_q12<1>(actv, tf_hcq::Q12{sm, ex, base, escoff, esc}, normed, mixed, M, D, mut);
++}
++
++extern "C" __global__ void __launch_bounds__(128) tf_fn_hc_upmix_q12_r32_kernel(
++    const __nv_bfloat16* __restrict__ actv, const uint4* sm, const uint2* ex, const uint8_t* base,
++    const uint32_t* escoff, const uint32_t* esc, const __nv_bfloat16* __restrict__ normed,
++    __nv_bfloat16* __restrict__ mixed, uint32_t M, uint32_t D, int mut) {
++    hc_upmix_q12<2>(actv, tf_hcq::Q12{sm, ex, base, escoff, esc}, normed, mixed, M, D, mut);
++}
++
++// The q12 packer: grid (tiles, K / 64), one warp a block. pack 0 writes each block's escape count to counts; pack 1
++// the codes, bases and escapes (at escoff[blk], position order). Rows >= n (the last tile's padding) are zeros.
++extern "C" __global__ void __launch_bounds__(32) tf_fn_hc_q12_pack_kernel(
++    const uint16_t* __restrict__ w, uint32_t n, uint32_t k, uint32_t* counts, uint4* sm, uint2* ex, uint8_t* base,
++    const uint32_t* escoff, uint32_t* esc, int pack) {
++    const uint32_t t = blockIdx.x, b = blockIdx.y, nbk = k / 64, lane = threadIdx.x, g = lane >> 2, q = lane & 3;
++    const uint32_t blk = t * nbk + b, row = 8 * t + g;
++    uint32_t v[16];
++#pragma unroll
++    for (int c = 0; c < 4; ++c) {
++        uint32_t lo = 0, hi = 0;
++        if (row < n) {
++            const uint32_t* p = reinterpret_cast<const uint32_t*>(w + size_t(row) * k + 64 * b + 16 * c + 2 * q);
++            lo = p[0];
++            hi = p[4];
++        }
++        v[4 * c] = lo & 0xFFFFu;
++        v[4 * c + 1] = lo >> 16;
++        v[4 * c + 2] = hi & 0xFFFFu;
++        v[4 * c + 3] = hi >> 16;
++    }
++    uint32_t mx = 0;
++#pragma unroll
++    for (int j = 0; j < 16; ++j) mx = max(mx, (v[j] >> 7) & 0xFFu);
++    mx = max(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, 1));
++    mx = max(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, 2));
++    uint32_t flags = 0, smw[4] = {0, 0, 0, 0}, exw[2] = {0, 0};
++#pragma unroll
++    for (int j = 0; j < 16; ++j) {
++        const uint32_t off = mx - ((v[j] >> 7) & 0xFFu);
++        const uint32_t code = off > 14 ? 15u : off;
++        if (code == 15) flags |= 1u << j;
++        smw[j >> 2] |= (((v[j] >> 8) & 0x80u) | (v[j] & 0x7Fu)) << (8 * (j & 3));
++        const int h = j & 1, p = j >> 1;
++        exw[h] |= code << (8 * (p & 3) + 4 * (p >> 2));
++    }
++    const uint32_t cnt = __popc(flags);
++    if (!pack) {
++        uint32_t s = cnt;
++        for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xFFFFFFFFu, s, o);
++        if (lane == 0) counts[blk] = s;
++        return;
++    }
++    const size_t i = size_t(blk) * 32 + lane;
++    sm[i] = make_uint4(smw[0], smw[1], smw[2], smw[3]);
++    ex[i] = make_uint2(exw[0], exw[1]);
++    if (q == 0) base[size_t(blk) * 8 + g] = uint8_t(mx);
++    uint32_t pre = cnt;
++    for (int o = 1; o < 32; o <<= 1) {
++        const uint32_t y = __shfl_up_sync(0xFFFFFFFFu, pre, o);
++        if (lane >= uint32_t(o)) pre += y;
++    }
++    uint32_t at = escoff[blk] + pre - cnt;
++#pragma unroll
++    for (int j = 0; j < 16; ++j)
++        if (flags >> j & 1) esc[at++] = ((16u * lane + j) << 16) | v[j];
++}
+diff --git a/zig/src/cli/flashnext_cuda.zig b/zig/src/cli/flashnext_cuda.zig
+index 730e4c5..38f9e7b 100644
+--- a/zig/src/cli/flashnext_cuda.zig
++++ b/zig/src/cli/flashnext_cuda.zig
+@@ -53,6 +53,8 @@ const usage =
+     \\           against 16-row items and 1-row calls, bytes compared, then both timed)
+     \\  tensorfold draft-check MODEL [--rows N,N,...]   (no weights: the batched greedy draft draw (one block a row)
+     \\           against the per-row draw it replaces, bytes compared on adversarial rows, then both timed)
++    \\  tensorfold hc-check MODEL   (no weights: the read-outs' 12-bit-weight down/up kernels (cuda_hc_q12.zig)
++    \\           against the kernel set's _b16mm + reduce-act and _hc_up_mix, bytes compared, then both timed)
+     \\  tensorfold agree MODEL CAPTURE_DIR --report OUT.json [--against REF.json] [--max-tokens N] [--only NAME,...]
+     \\           (each captured prompt's greedy serial reply written to OUT.json; with REF.json, another run's replies
+     \\           teacher-forced: the top-1 agreement of this engine's greedy draws with them, and where the free
+@@ -297,6 +299,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
+     if (std.mem.eql(u8, cmd, "qsa-check")) return qsaCheck(gpa, init.io, &ctx, kernels);
+     if (std.mem.eql(u8, cmd, "fp4-check")) return fp4Check(gpa, init.io, &ctx, kernels, o);
+     if (std.mem.eql(u8, cmd, "glue-check")) return glueCheck(gpa, init.io, &ctx, kernels);
++    if (std.mem.eql(u8, cmd, "hc-check")) return hcCheck(gpa, init.io, &ctx, kernels);
+     if (std.mem.eql(u8, cmd, "draft-check")) return draftCheck(gpa, &ctx, o);
+     const mtp = !std.mem.eql(u8, cmd, "check-weights-nomtp");
+     // two ranks: both run the same command (every engine call in the same order), rank 0 listening on --master
+@@ -1669,6 +1672,21 @@ fn benchMany(gpa: Allocator, io: std.Io, e: *Engine, o: Options) !u8 {
+     return 0;
+ }
+ 
++/// `hc-check`: no checkpoint; the read-outs' q12 kernels (cuda_hc_q12.zig) against the kernel set's split
++/// `_b16mm` + tf_fn_hc_reduce_act_kernel and `_hc_up_mix` / `_b16mm` + `_hc_mix`, bytes, then timed.
++fn hcCheck(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, kernels: []const u8) !u8 {
++    var set = try cuda.aot.Set.load(gpa, io, ctx.d, ctx.device, kernels);
++    defer set.deinit();
++    var stream = try cuda.Stream.init(ctx.d, true);
++    defer stream.deinit();
++    const t: flashnext.triton.Tri = .{ .set = &set, .s = stream };
++    var ops = try flashnext.torch_ops.Ops.load(ctx);
++    defer ops.deinit();
++    const ok = try flashnext.hc_q12.check(gpa, ctx.d, t, ops.on(stream));
++    std.debug.print("{s} hc-check\n", .{if (ok) "PASS" else "FAIL"});
++    return if (ok) 0 else 1;
++}
++
+ /// `glue-check`: no checkpoint; the fused hyper-connection up projection + mix against _b16mm + _hc_mix, and the fused write-back + norm against _hc_writeback + _hc_normed.
+ fn glueCheck(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, kernels: []const u8) !u8 {
+     var set = try cuda.aot.Set.load(gpa, io, ctx.d, ctx.device, kernels);
+diff --git a/zig/src/families/flashnext/cuda.zig b/zig/src/families/flashnext/cuda.zig
+index 4d6a764..21a5b36 100644
+--- a/zig/src/families/flashnext/cuda.zig
++++ b/zig/src/families/flashnext/cuda.zig
+@@ -22,6 +22,7 @@ pub const vmm = @import("cuda_vmm.zig");
+ pub const nucleus = @import("cuda_nucleus.zig");
+ pub const mtp = @import("cuda_mtp.zig");
+ pub const mtp_q4 = @import("cuda_mtp_q4.zig");
++pub const hc_q12 = @import("cuda_hc_q12.zig");
+ pub const engine = @import("cuda_engine.zig");
+ pub const prompt = @import("cuda_prompt.zig");
+ pub const fp4_serial = @import("cuda_fp4_serial.zig");
+diff --git a/zig/src/families/flashnext/cuda_engine.zig b/zig/src/families/flashnext/cuda_engine.zig
+index 4cceb3f..98c1e6b 100644
+--- a/zig/src/families/flashnext/cuda_engine.zig
++++ b/zig/src/families/flashnext/cuda_engine.zig
+@@ -332,6 +332,8 @@ pub const Engine = struct {
+     draws: ?mtp.Draws = null,
+     /// decode D5: the MTP head's matrices in 4-bit (TF_FLASHNEXT_MTP_Q4=1), drafts only
+     mtpq: ?@import("cuda_mtp_q4.zig").Table = null,
++    /// the read-out matrices' lossless 12-bit copies (TF_FLASHNEXT_HC_Q12=1)
++    hcq: ?@import("cuda_hc_q12.zig").Table = null,
+     /// host copy of the draft ids (this rank's), column -> token
+     draft_host: []u32 = &.{},
+     /// sampling scratch, the prompt's last logits and gathered candidates, the draft read-back
+@@ -636,6 +638,14 @@ pub const Engine = struct {
+             std.log.info("MTP head in 4-bit for the drafts: {d} matrices, {d:.1} -> {d:.1} MB", .{ e.mtpq.?.n, @as(f64, @floatFromInt(e.mtpq.?.bytes_bf16)) / 1e6, @as(f64, @floatFromInt(e.mtpq.?.bytes_q4)) / 1e6 });
+         };
+         errdefer if (e.mtpq) |*t| t.deinit();
++        // decode read-outs' down/up matrices from a lossless 12-bit copy (cuda_hc_q12.zig; the Triton kernels'
++        // bytes, hc-check), built from the loaded bf16 rows
++        if (envGet("TF_FLASHNEXT_HC_Q12")) |v| if (!std.mem.eql(u8, v, "0") and o.comm == null) {
++            e.hcq = try @import("cuda_hc_q12.zig").Table.build(gpa, d, e.torch.on(e.stream), &e.w);
++            e.f.hc_q12 = &e.hcq.?;
++            std.log.info("hc q12: decode read-outs from 12-bit copies: {d} matrices, {d:.1} -> {d:.1} MB, {d} escapes", .{ e.hcq.?.map.count(), @as(f64, @floatFromInt(e.hcq.?.bytes_bf16)) / 1e6, @as(f64, @floatFromInt(e.hcq.?.bytes_q12)) / 1e6, e.hcq.?.escapes });
++        };
++        errdefer if (e.hcq) |*t| t.deinit(gpa);
+         // sampling scratch: the main head's rows and the draft head's one row
+         const draft_n: usize = if (e.w.draft_head) |q| q.n else e.g.head_n;
+         const main_sz = try sampleSizes(&e.torch.f, &.{ .{ state.max_rows, e.g.head_n, max_k }, .{ 1, e.g.head_n, max_k }, .{ rows, e.g.head_n, state.cand }, .{ 1, draft_n, state.cand }, .{ rows, draft_n, state.cand } });
+@@ -740,6 +750,7 @@ pub const Engine = struct {
+         if (e.k8) |*q| q.deinit();
+         if (e.k4) |*q| q.deinit();
+         if (e.mtpq) |*t| t.deinit();
++        if (e.hcq) |*t| t.deinit(e.gpa);
+         if (e.qsa_fast) |*q| q.deinit();
+         if (e.f.cs) |*cs| {
+             cs.synchronize() catch {};
+diff --git a/zig/src/families/flashnext/cuda_forward.zig b/zig/src/families/flashnext/cuda_forward.zig
+index 8dc5135..bde5aa0 100644
+--- a/zig/src/families/flashnext/cuda_forward.zig
++++ b/zig/src/families/flashnext/cuda_forward.zig
+@@ -552,6 +552,9 @@ pub const Forward = struct {
+     /// on unless TF_FLASHNEXT_REDUCE_ACT=0: decode read-outs' `_reduce` + `_hc_act` as one fn_ops kernel
+     /// (`reduceActTakes`)
+     reduce_act: bool = false,
++    /// TF_FLASHNEXT_HC_Q12=1: the layers' read-out matrices' lossless 12-bit copies; decode windows run
++    /// their down (+ reduce + act) and up (+ mix) from them (`q12Down` / `q12Up`), with the Triton kernels' bytes
++    hc_q12: ?*const @import("cuda_hc_q12.zig").Table = null,
+     /// on unless TF_FLASHNEXT_WB_NORM=0: prompt chunks' write-back and norm in one pass (`_hc_wb_norm`)
+     wb_norm: bool = false,
+     /// two ranks, split prompt glue: the exchanges run on this stream beside the next rows' work (TF_FLASHNEXT_OVERLAP)
+@@ -1391,6 +1394,38 @@ pub const Forward = struct {
+         return if (inject != null) ndn == g.low + g.streams else ndn == g.low;
+     }
+ 
++    /// decode windows of up to this many rows run the q12 down projection's reduce + act in the same launch;
++    /// the q12 down and up take windows of up to q12_down_rows / q12_up_rows rows (past them the kernel set's, which
++    /// read the weights once for 32 rows a program, were faster when timed)
++    const q12_fuse_rows = 8;
++    const q12_down_rows = 32;
++    const q12_up_rows = 16;
++
++    /// the down matrix's q12 copy when a read-out's down projection runs from it (tops.Torch.hcDownQ12: the
++    /// split `_b16mm` + tf_fn_hc_reduce_act_kernel's bytes): one GPU, a decode window of <= q12_down_rows rows, slices of 320 K,
++    /// no 4-bit MTP matrices (readers of act's 32-group sums), inject rows exactly when the caller asks for the gates,
++    /// no launch recorder.
++    fn q12Down(f: *const Forward, hc: *const W.Hc, b: *const state.Buffers, R: usize, inject: ?u64) ?tops.Q12 {
++        const t = f.hc_q12 orelse return null;
++        if (b.prefill or f.comm != null or f.mtp_q4 != null or f.t.rec != null or R > q12_down_rows or hc.down8 != null) return null;
++        const g = f.g;
++        const ndn: usize = hc.down.n;
++        if (!std.math.isPowerOfTwo(g.streams) or tri.b16SplitK(ndn, hc.down.k) * 320 != hc.down.k) return null;
++        if (if (inject != null) ndn != g.low + g.streams else ndn != g.low) return null;
++        return t.find(hc.down.weight);
++    }
++
++    /// the up matrix's q12 copy when a layer read-out's up projection and mix run from it
++    /// (tops.Torch.hcUpMixQ12: `_hc_up_mix`'s bytes, no 32-group sums of mixed): `upMix`'s decode conditions from one
++    /// row to q12_up_rows, four streams, K 320.
++    fn q12Up(f: *const Forward, hc: *const W.Hc, b: *const state.Buffers, R: usize) ?tops.Q12 {
++        const t = f.hc_q12 orelse return null;
++        if (!f.layer_ro or b.prefill or f.comm != null or f.t.rec != null or f.mtp_q4 != null or hc.up8 != null or R > q12_up_rows) return null;
++        const g = f.g;
++        if (g.streams != 4 or hc.up.n != g.wide() or hc.up.k != 320 or g.low != 320) return null;
++        return t.find(hc.up.weight);
++    }
++
+     /// Whether this write-back also makes the read-out's normed rows (`_hc_wb_norm`): prompt chunks, no 4-bit MTP
+     /// matrices (the only readers of normed's 32-group sums), and a branch the kernel set has an entry for.
+     fn fusesNorm(f: *const Forward, hc: *const W.Hc, b: *const state.Buffers, pending: ?Pending) bool {
+@@ -1427,6 +1462,16 @@ pub const Forward = struct {
+                 try f.th.slotCopy(f.sc.pb, hc.down.n * 4, f.sc.dn + d8.n * 4, dn_n * 4, hc.down.n * 4, R);
+             }
+             try f.mark(.hc_down);
++        } else if (f.q12Down(hc, b, R, inject)) |q| {
++            // the down projection from the q12 copy; to 8 rows `_reduce` and `_hc_act` in the same launch (the
++            // last CTA of a column group), past that tf_fn_hc_reduce_act_kernel (the fused tail grows with rows)
++            const fuse = R <= q12_fuse_rows;
++            try f.th.hcDownQ12(b.normed, Wd, R, q, f.sc.part, b.act, inject orelse b.act, g.low, g.streams, if (fuse) f.hc_q12.?.counters.ptr else 0, 0);
++            try f.mark(.hc_down);
++            if (!fuse) {
++                try f.th.hcReduceAct(f.sc.part, b.act, inject orelse b.act, R, tri.b16SplitK(hc.down.n, hc.down.k), dn_n, g.low, g.streams);
++                try f.mark(.hc_act);
++            }
+         } else if (f.reduceActTakes(hc, b, R, inject)) {
+             // a decode window's down projection as its K slices, then `_reduce` and `_hc_act` in one launch
+             // (fn_ops.cu tf_fn_hc_reduce_act_kernel: their bits; no 32-group sums of act, read only by mtp_q4)
+@@ -1446,6 +1491,11 @@ pub const Forward = struct {
+         // prompt chunks, and with `upmix_decode` a decode window's layer read-outs past one row (the kernel set has
+         // no M == 1 variant: Triton folds a 1): the up projection and the mix in one pass (cuda_prompt.zig upMix, the
+         // same mixed bytes; no 32-group sums of mixed, which only the 4-bit MTP draft matrices read)
++        if (f.q12Up(hc, b, R)) |q| {
++            try f.th.hcUpMixQ12(b.act, q, b.normed, mixed, R, g.hidden, 0);
++            try f.mark(.hc_mix);
++            return;
++        }
+         const decode_ok = f.upmix_decode and f.layer_ro and !b.prefill and R > 1 and f.comm == null and f.t.rec == null;
+         if (f.up_mix and ((b.prefill and R >= 16) or decode_ok) and hc.up8 == null and f.mtp_q4 == null and hc.up.n == g.wide() and hc.up.k == g.low and g.low % 64 == 0) {
+             try prompt.upMix(f.t, b.act, hc.up.weight, b.normed, mixed, R, g.hidden, g.streams, g.low, if (b.prefill) 64 else 32);
+diff --git a/zig/src/families/flashnext/cuda_hc_q12.zig b/zig/src/families/flashnext/cuda_hc_q12.zig
+new file mode 100644
+index 0000000..1f005ab
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_hc_q12.zig
+@@ -0,0 +1,374 @@
++//! The main layers' hyper-connection read-out matrices (each layer's attention and MLP `down` [low (+ the
++//! streams' inject rows), wide] and `up` [wide, low], bf16 in the checkpoint) in a lossless 12-bit copy for decode
++//! windows (TF_FLASHNEXT_HC_Q12=1). Per (row, 64 k) the maximum exponent `base`; per weight its sign|mantissa byte
++//! and a 4-bit exponent offset below `base`, offset 15 escaping to the block's list of exact bits (fn_ops.cu, the
++//! format comment above tf_fn_hc_down_q12_kernel). On the checkpoint 0.01-0.03% of weights escape: 77% of the bf16
++//! bytes. Built at load on the GPU from the loaded bf16 rows (tf_fn_hc_q12_pack_kernel: escape counts, the host's
++//! prefix sums, then the arrays); the bf16 rows stay for prompt chunks and every path the copy does not take.
++//! Forward.readoutAt runs a matrix found here through tops.Torch.hcDownQ12 / hcUpMixQ12, with `_b16mm` +
++//! `_hc_reduce_act` / `_hc_up_mix`'s bytes (`hc-check`).
++const std = @import("std");
++const cuda = @import("cuda");
++const W = @import("cuda_weights.zig");
++const tops = @import("cuda_torch_ops.zig");
++const tri = @import("cuda_triton.zig");
++const prompt = @import("cuda_prompt.zig");
++const lay = @import("cuda_layouts.zig");
++
++const Allocator = std.mem.Allocator;
++
++/// The down kernel's column groups (4 tiles of 8 columns) for the widest down matrix it takes, with room.
++pub const max_groups = 64;
++
++fn alignUp(v: usize) usize {
++    return (v + 255) / 256 * 256;
++}
++
++pub const Table = struct {
++    map: std.AutoHashMapUnmanaged(u64, tops.Q12) = .empty,
++    bufs: std.ArrayList(cuda.DeviceBuffer) = .empty,
++    /// max_groups zeroed words: the down kernel's last-CTA counters (each launch leaves them zeroed)
++    counters: cuda.DeviceBuffer = undefined,
++    have_counters: bool = false,
++    bytes_bf16: usize = 0,
++    bytes_q12: usize = 0,
++    escapes: usize = 0,
++
++    pub fn deinit(t: *Table, gpa: Allocator) void {
++        for (t.bufs.items) |*b| b.free();
++        t.bufs.deinit(gpa);
++        t.map.deinit(gpa);
++        if (t.have_counters) t.counters.free();
++        t.have_counters = false;
++    }
++
++    /// The q12 copy of the bf16 matrix at `weight`.
++    pub fn find(t: *const Table, weight: u64) ?tops.Q12 {
++        return t.map.get(weight);
++    }
++
++    /// Every main layer's attention and MLP read-out down and up matrices of `w` (the MTP layer and the final
++    /// mixer keep bf16: the head's 4-bit draft matrices read the mixer's 32-group sums, the copy writes none).
++    pub fn build(gpa: Allocator, d: *const cuda.Driver, th: tops.Torch, w: *const W.Weights) !Table {
++        var t: Table = .{};
++        errdefer t.deinit(gpa);
++        t.counters = try cuda.DeviceBuffer.alloc(d, max_groups * 4);
++        t.have_counters = true;
++        try t.counters.fill8(0, null);
++        var counts = try cuda.DeviceBuffer.alloc(d, 4);
++        defer counts.free();
++        var host: std.ArrayList(u32) = .empty;
++        defer host.deinit(gpa);
++        for (w.layers) |l| for ([_]*const W.Hc{ &l.attn_hc, &l.mlp_hc }) |hc| {
++            if (hc.down8 == null) try t.add(gpa, d, th, hc.down, &counts, &host);
++            if (hc.up8 == null) try t.add(gpa, d, th, hc.up, &counts, &host);
++        };
++        return t;
++    }
++
++    pub fn add(t: *Table, gpa: Allocator, d: *const cuda.Driver, th: tops.Torch, r: W.Rows, counts: *cuda.DeviceBuffer, host: *std.ArrayList(u32)) !void {
++        if (r.weight == 0 or r.n == 0 or t.map.contains(r.weight)) return;
++        const n: usize = r.n;
++        const k: usize = r.k;
++        if (k % 64 != 0) return error.HcQ12Shape;
++        const blocks = (n + 7) / 8 * (k / 64);
++        if (counts.len < blocks * 4) {
++            counts.free();
++            counts.* = try cuda.DeviceBuffer.alloc(d, blocks * 4);
++        }
++        var q: tops.Q12 = .{ .n = n, .k = k };
++        try th.hcQ12Pack(r.weight, counts.ptr, q, false);
++        try th.s.synchronize();
++        try host.resize(gpa, blocks + 1);
++        try counts.download(0, std.mem.sliceAsBytes(host.items[1..]));
++        host.items[0] = 0;
++        var sum: usize = 0;
++        for (host.items[1..]) |*c| {
++            sum += c.*;
++            c.* = @intCast(sum);
++        }
++        // one buffer: sm, ex, base, escoff, esc (256-byte aligned parts)
++        const sm_b = alignUp(blocks * 32 * 16);
++        const ex_b = alignUp(blocks * 32 * 8);
++        const base_b = alignUp(blocks * 8);
++        const off_b = alignUp((blocks + 1) * 4);
++        const esc_b = alignUp(@max(sum, 1) * 4);
++        var buf = try cuda.DeviceBuffer.alloc(d, sm_b + ex_b + base_b + off_b + esc_b);
++        errdefer buf.free();
++        q.sm = buf.ptr;
++        q.ex = buf.ptr + sm_b;
++        q.base = q.ex + ex_b;
++        q.escoff = q.base + base_b;
++        q.esc = q.escoff + off_b;
++        try buf.upload(sm_b + ex_b + base_b, std.mem.sliceAsBytes(host.items));
++        try th.hcQ12Pack(r.weight, counts.ptr, q, true);
++        try th.s.synchronize();
++        try t.bufs.append(gpa, buf);
++        try t.map.put(gpa, r.weight, q);
++        t.bytes_bf16 += n * k * 2;
++        t.bytes_q12 += blocks * (32 * 16 + 32 * 8 + 8 + 4) + sum * 4;
++        t.escapes += sum;
++    }
++};
++
++const Fill = enum { normal, wide, cancel, bits };
++
++/// bf16 samples for `fill` (weights: normal, wide exponents 2^-40..2^3 with exact zeros, every bit pattern; inputs:
++/// normal, wide, +-pairs with small residues).
++fn fillBf16(gpa: Allocator, buf: cuda.DeviceBuffer, count: usize, r: std.Random, fill: Fill) !void {
++    const h = try gpa.alloc(u16, count);
++    defer gpa.free(h);
++    var prev: f32 = 0;
++    for (h, 0..) |*v, i| {
++        const x: f32 = switch (fill) {
++            .normal => r.floatNorm(f32),
++            .wide => if (r.uintLessThan(u32, 100) == 0) 0.0 else std.math.ldexp(r.floatNorm(f32), r.intRangeAtMost(i32, -40, 3)),
++            .cancel => blk: {
++                if (i % 2 == 0) {
++                    prev = std.math.ldexp(r.floatNorm(f32), r.intRangeAtMost(i32, 0, 12));
++                    break :blk prev;
++                }
++                break :blk -prev + r.floatNorm(f32) * 1e-3;
++            },
++            .bits => 0,
++        };
++        v.* = if (fill == .bits) r.int(u16) else lay.bf16Rne(x);
++    }
++    try buf.upload(0, std.mem.sliceAsBytes(h));
++}
++
++fn same(gpa: Allocator, a: cuda.DeviceBuffer, b: cuda.DeviceBuffer, bytes: usize) !bool {
++    const ha = try gpa.alloc(u8, bytes);
++    defer gpa.free(ha);
++    const hb = try gpa.alloc(u8, bytes);
++    defer gpa.free(hb);
++    try a.download(0, ha);
++    try b.download(0, hb);
++    return std.mem.eql(u8, ha, hb);
++}
++
++/// `hc-check` (no checkpoint): the q12 down (+ reduce + act) and up (+ mix) against the kernel set's split `_b16mm`
++/// + tf_fn_hc_reduce_act_kernel and `_hc_up_mix` (rows > 1) / `_b16mm` + `_hc_mix` (one row): partial, act, inject
++/// and mixed bytes at 1-128 rows, inject rows and none, on weights with exponents over 44 binades (escapes) and on
++/// every bf16 bit pattern; the reversed-chunk mutant must differ; then both timed at decode widths over rotating
++/// weight copies (no L2 reuse), eager, back to back.
++pub fn check(gpa: Allocator, d: *const cuda.Driver, t: tri.Tri, th0: tops.Torch) !bool {
++    const S: usize = 4;
++    const LOW: usize = 320;
++    const K: usize = 10240;
++    const D: usize = 2560;
++    const WIDE: usize = S * D;
++    const NDN: usize = LOW + S;
++    const SK: usize = tri.b16SplitK(NDN, K);
++    const max_m: usize = 128;
++    const XS: usize = K + 64; // a strided x, as the engine's normed rows
++    var th = th0;
++    th.s = t.s;
++    var prng = std.Random.DefaultPrng.init(0x12b_0c12);
++    const r = prng.random();
++    var x = try cuda.DeviceBuffer.alloc(d, max_m * XS * 2);
++    defer x.free();
++    var wd = try cuda.DeviceBuffer.alloc(d, NDN * K * 2);
++    defer wd.free();
++    var wd2 = try cuda.DeviceBuffer.alloc(d, LOW * K * 2);
++    defer wd2.free();
++    var wu = try cuda.DeviceBuffer.alloc(d, WIDE * LOW * 2);
++    defer wu.free();
++    var act = try cuda.DeviceBuffer.alloc(d, max_m * LOW * 2);
++    defer act.free();
++    var normed = try cuda.DeviceBuffer.alloc(d, max_m * WIDE * 2);
++    defer normed.free();
++    var up = try cuda.DeviceBuffer.alloc(d, max_m * WIDE * 2);
++    defer up.free();
++    var xsum = try cuda.DeviceBuffer.alloc(d, max_m * (D / 32) * 4);
++    defer xsum.free();
++    var bufs: [8]cuda.DeviceBuffer = undefined;
++    const sizes = [8]usize{ SK * max_m * NDN * 4, SK * max_m * NDN * 4, max_m * LOW * 2, max_m * LOW * 2, max_m * S * 2, max_m * S * 2, max_m * D * 2, max_m * D * 2 };
++    for (&bufs, sizes) |*b, n| b.* = try cuda.DeviceBuffer.alloc(d, n);
++    defer for (&bufs) |*b| b.free();
++    const p1, const p2, const a1, const a2, const g1, const g2, const m1, const m2 = bufs;
++    var all = true;
++    var cases: usize = 0;
++    var killed: usize = 0;
++    var mut_cases: usize = 0;
++    for ([_]Fill{ .normal, .wide, .bits }) |wf| {
++        try fillBf16(gpa, wd, NDN * K, r, wf);
++        // wd2: the first LOW rows of wd at its own address (the no-inject matrix: the table is keyed by address)
++        try d.check(d.api.cuMemcpyDtoD_v2(wd2.ptr, wd.ptr, LOW * K * 2), "cuMemcpyDtoD");
++        try fillBf16(gpa, wu, WIDE * LOW, r, wf);
++        var tab: Table = .{};
++        defer tab.deinit(gpa);
++        tab.counters = try cuda.DeviceBuffer.alloc(d, max_groups * 4);
++        tab.have_counters = true;
++        try tab.counters.fill8(0, null);
++        {
++            var counts = try cuda.DeviceBuffer.alloc(d, 4);
++            defer counts.free();
++            var host: std.ArrayList(u32) = .empty;
++            defer host.deinit(gpa);
++            for ([_]W.Rows{ .{ .weight = wd.ptr, .n = NDN, .k = K }, .{ .weight = wd2.ptr, .n = LOW, .k = K }, .{ .weight = wu.ptr, .n = WIDE, .k = LOW } }) |rows| try tab.add(gpa, d, th, rows, &counts, &host);
++        }
++        const qd = tab.find(wd.ptr).?;
++        const qd2 = tab.find(wd2.ptr).?;
++        const qu = tab.find(wu.ptr).?;
++        for ([_]Fill{ .normal, .wide, .cancel }) |xf| {
++            try fillBf16(gpa, x, max_m * XS, r, xf);
++            try fillBf16(gpa, act, max_m * LOW, r, xf);
++            try fillBf16(gpa, normed, max_m * WIDE, r, xf);
++            for ([_]usize{ 1, 2, 3, 4, 5, 7, 8, 11, 15, 16, 17, 31, 33, 64, 128 }) |m| {
++                for ([_]bool{ true, false }) |inj| {
++                    const n: usize = if (inj) NDN else LOW;
++                    const w = if (inj) wd.ptr else wd2.ptr;
++                    const q = if (inj) qd else qd2;
++                    try p1.fill8(0xA5, t.s.handle);
++                    for ([_]cuda.DeviceBuffer{ a1, g1 }) |b| try b.fill8(0xA5, t.s.handle);
++                    try prompt.b16Slices(t, x.ptr, XS, w, p1.ptr, true, m, n, K);
++                    try th.hcReduceAct(p1.ptr, a1.ptr, if (inj) g1.ptr else a1.ptr, m, SK, n, LOW, S);
++                    // fused (the last CTA's reduce + act) and partials + tf_fn_hc_reduce_act_kernel
++                    for ([_]bool{ true, false }) |fused| {
++                        for ([_]cuda.DeviceBuffer{ p2, a2, g2 }) |b| try b.fill8(0x5A, t.s.handle);
++                        try th.hcDownQ12(x.ptr, XS, m, q, p2.ptr, a2.ptr, if (inj) g2.ptr else a2.ptr, LOW, S, if (fused) tab.counters.ptr else 0, 0);
++                        if (!fused) try th.hcReduceAct(p2.ptr, a2.ptr, if (inj) g2.ptr else a2.ptr, m, SK, n, LOW, S);
++                        try t.s.synchronize();
++                        var ok = try same(gpa, p1, p2, SK * m * n * 4);
++                        ok = ok and try same(gpa, a1, a2, m * LOW * 2);
++                        if (inj) ok = ok and try same(gpa, g1, g2, m * S * 2);
++                        cases += 1;
++                        if (!ok) {
++                            all = false;
++                            std.debug.print("DIFFER hc q12 down rows {d} ndn {d} weights {s} inputs {s} fused {}\n", .{ m, n, @tagName(wf), @tagName(xf), fused });
++                        }
++                    }
++                    if (wf != .bits and (m == 3 or m == 33)) {
++                        try th.hcDownQ12(x.ptr, XS, m, q, p2.ptr, a2.ptr, if (inj) g2.ptr else a2.ptr, LOW, S, tab.counters.ptr, 1);
++                        try t.s.synchronize();
++                        mut_cases += 1;
++                        if (!try same(gpa, p1, p2, SK * m * n * 4)) killed += 1;
++                    }
++                }
++                try m1.fill8(0xA5, t.s.handle);
++                try m2.fill8(0x5A, t.s.handle);
++                if (m > 1) {
++                    try prompt.upMix(t, act.ptr, wu.ptr, normed.ptr, m1.ptr, m, D, S, LOW, 32);
++                } else {
++                    try t.b16mm(act.ptr, LOW, wu.ptr, up.ptr, false, 0, m, WIDE, LOW);
++                    try t.hcMix(up.ptr, normed.ptr, m1.ptr, xsum.ptr, m, D, S);
++                }
++                try th.hcUpMixQ12(act.ptr, qu, normed.ptr, m2.ptr, m, D, 0);
++                try t.s.synchronize();
++                cases += 1;
++                if (!try same(gpa, m1, m2, m * D * 2)) {
++                    all = false;
++                    std.debug.print("DIFFER hc q12 upmix rows {d} weights {s} inputs {s}\n", .{ m, @tagName(wf), @tagName(xf) });
++                }
++                if (wf != .bits and (m == 3 or m == 33)) {
++                    try th.hcUpMixQ12(act.ptr, qu, normed.ptr, m2.ptr, m, D, 1);
++                    try t.s.synchronize();
++                    mut_cases += 1;
++                    if (!try same(gpa, m1, m2, m * D * 2)) killed += 1;
++                }
++            }
++        }
++        std.debug.print("weights {s}: q12 {d} escapes, {d:.4} of the bf16 bytes\n", .{ @tagName(wf), tab.escapes, @as(f64, @floatFromInt(tab.bytes_q12)) / @as(f64, @floatFromInt(tab.bytes_bf16)) });
++    }
++    std.debug.print("{s} hc q12: {d} cases (down + reduce + act against the split _b16mm + tf_fn_hc_reduce_act_kernel; up + mix against _hc_up_mix / _b16mm + _hc_mix), mutant killed {d} of {d}\n", .{ if (all) "EQUAL" else "DIFFER", cases, killed, mut_cases });
++    if (killed == 0) all = false;
++    try timing(gpa, d, t, th);
++    return all;
++}
++
++/// Decode-width timing: NC read-outs over distinct weight copies (> 3x L2), the kernel set's down + reduce-act +
++/// up-mix against the q12 pair; eager, back to back, best of 3 passes of 4 rounds.
++fn timing(gpa: Allocator, d: *const cuda.Driver, t: tri.Tri, th: tops.Torch) !void {
++    const NC = 24;
++    const S: usize = 4;
++    const LOW: usize = 320;
++    const K: usize = 10240;
++    const D: usize = 2560;
++    const WIDE: usize = S * D;
++    const NDN: usize = LOW + S;
++    const SK: usize = tri.b16SplitK(NDN, K);
++    var prng = std.Random.DefaultPrng.init(0x71_3e);
++    const r = prng.random();
++    var wd: [NC]cuda.DeviceBuffer = undefined;
++    var wu: [NC]cuda.DeviceBuffer = undefined;
++    for (&wd, &wu) |*a, *b| {
++        a.* = try cuda.DeviceBuffer.alloc(d, NDN * K * 2);
++        b.* = try cuda.DeviceBuffer.alloc(d, WIDE * LOW * 2);
++        try fillBf16(gpa, a.*, NDN * K, r, .normal);
++        try fillBf16(gpa, b.*, WIDE * LOW, r, .normal);
++    }
++    defer for (&wd, &wu) |*a, *b| {
++        a.free();
++        b.free();
++    };
++    var tab: Table = .{};
++    defer tab.deinit(gpa);
++    tab.counters = try cuda.DeviceBuffer.alloc(d, max_groups * 4);
++    tab.have_counters = true;
++    try tab.counters.fill8(0, null);
++    {
++        var counts = try cuda.DeviceBuffer.alloc(d, 4);
++        defer counts.free();
++        var host: std.ArrayList(u32) = .empty;
++        defer host.deinit(gpa);
++        for (wd, wu) |a, b| {
++            try tab.add(gpa, d, th, .{ .weight = a.ptr, .n = NDN, .k = K }, &counts, &host);
++            try tab.add(gpa, d, th, .{ .weight = b.ptr, .n = WIDE, .k = LOW }, &counts, &host);
++        }
++    }
++    const max_m = 16;
++    var x = try cuda.DeviceBuffer.alloc(d, max_m * K * 2);
++    defer x.free();
++    var part = try cuda.DeviceBuffer.alloc(d, SK * max_m * NDN * 4);
++    defer part.free();
++    var act = try cuda.DeviceBuffer.alloc(d, max_m * LOW * 2);
++    defer act.free();
++    var inj = try cuda.DeviceBuffer.alloc(d, max_m * S * 2);
++    defer inj.free();
++    var normed = try cuda.DeviceBuffer.alloc(d, max_m * WIDE * 2);
++    defer normed.free();
++    var up = try cuda.DeviceBuffer.alloc(d, max_m * WIDE * 2);
++    defer up.free();
++    var mixed = try cuda.DeviceBuffer.alloc(d, max_m * D * 2);
++    defer mixed.free();
++    var xsum = try cuda.DeviceBuffer.alloc(d, max_m * (D / 32) * 4);
++    defer xsum.free();
++    try fillBf16(gpa, x, max_m * K, r, .normal);
++    try fillBf16(gpa, act, max_m * LOW, r, .normal);
++    try fillBf16(gpa, normed, max_m * WIDE, r, .normal);
++    var e0 = try cuda.Event.init(d, true);
++    defer e0.deinit();
++    var e1 = try cuda.Event.init(d, true);
++    defer e1.deinit();
++    var e2 = try cuda.Event.init(d, true);
++    defer e2.deinit();
++    for ([_]usize{ 1, 2, 4, 5, 8, 12, 16 }) |m| {
++        var best = [2]f32{ 1e9, 1e9 };
++        for (0..3) |_| {
++            try e0.record(t.s);
++            for (0..4) |_| for (wd, wu) |a, b| {
++                try prompt.b16Slices(t, x.ptr, K, a.ptr, part.ptr, true, m, NDN, K);
++                try th.hcReduceAct(part.ptr, act.ptr, inj.ptr, m, SK, NDN, LOW, S);
++                if (m > 1) {
++                    try prompt.upMix(t, act.ptr, b.ptr, normed.ptr, mixed.ptr, m, D, S, LOW, 32);
++                } else {
++                    try t.b16mm(act.ptr, LOW, b.ptr, up.ptr, false, 0, m, WIDE, LOW);
++                    try t.hcMix(up.ptr, normed.ptr, mixed.ptr, xsum.ptr, m, D, S);
++                }
++            };
++            try e1.record(t.s);
++            for (0..4) |_| for (wd, wu) |a, b| {
++                // the forward's choices: reduce + act fused to 8 rows, the q12 up to 16 rows
++                try th.hcDownQ12(x.ptr, K, m, tab.find(a.ptr).?, part.ptr, act.ptr, inj.ptr, LOW, S, if (m <= 8) tab.counters.ptr else 0, 0);
++                if (m > 8) try th.hcReduceAct(part.ptr, act.ptr, inj.ptr, m, SK, NDN, LOW, S);
++                try th.hcUpMixQ12(act.ptr, tab.find(b.ptr).?, normed.ptr, mixed.ptr, m, D, 0);
++            };
++            try e2.record(t.s);
++            try e2.synchronize();
++            best[0] = @min(best[0], try cuda.Event.elapsedMs(e0, e1) / (4 * NC));
++            best[1] = @min(best[1], try cuda.Event.elapsedMs(e1, e2) / (4 * NC));
++        }
++        std.debug.print("bench hc read-out {d} rows: kernel set {d:.2} us, q12 {d:.2} us ({d:.3}x); x97 a round: {d:.3} -> {d:.3} ms\n", .{ m, best[0] * 1000, best[1] * 1000, best[0] / best[1], best[0] * 97, best[1] * 97 });
++    }
++}
+diff --git a/zig/src/families/flashnext/cuda_torch_ops.zig b/zig/src/families/flashnext/cuda_torch_ops.zig
+index 3ea3baa..942058c 100644
+--- a/zig/src/families/flashnext/cuda_torch_ops.zig
++++ b/zig/src/families/flashnext/cuda_torch_ops.zig
+@@ -65,6 +65,11 @@ pub const Functions = struct {
+     nucleus_mass: cuda.Function,
+     fp4_serial: cuda.Function,
+     hc_reduce_act: cuda.Function,
++    hc_down_q12: cuda.Function,
++    hc_upmix_q12: cuda.Function,
++    hc_down_q12_r32: cuda.Function,
++    hc_upmix_q12_r32: cuda.Function,
++    hc_q12_pack: cuda.Function,
+     lse: Lse,
+ 
+     pub fn resolve(m: []const cuda.Module) !Functions {
+@@ -91,11 +96,35 @@ pub const Functions = struct {
+             .nucleus_mass = try m[i(.ops)].function("tf_fn_nucleus_mass_kernel"),
+             .fp4_serial = try m[i(.ops)].function("tf_fn_fp4_serial_kernel"),
+             .hc_reduce_act = try m[i(.ops)].function("tf_fn_hc_reduce_act_kernel"),
++            .hc_down_q12 = try m[i(.ops)].function("tf_fn_hc_down_q12_kernel"),
++            .hc_upmix_q12 = try m[i(.ops)].function("tf_fn_hc_upmix_q12_kernel"),
++            .hc_down_q12_r32 = try m[i(.ops)].function("tf_fn_hc_down_q12_r32_kernel"),
++            .hc_upmix_q12_r32 = try m[i(.ops)].function("tf_fn_hc_upmix_q12_r32_kernel"),
++            .hc_q12_pack = try m[i(.ops)].function("tf_fn_hc_q12_pack_kernel"),
+             .lse = try Lse.resolve(m[i(.lse)]),
+         };
+     }
+ };
+ 
++/// a bf16 matrix [n, k]'s lossless 12-bit copy (fn_ops.cu, cuda_hc_q12.zig): device addresses of its arrays.
++pub const Q12 = struct {
++    sm: u64 = 0,
++    ex: u64 = 0,
++    base: u64 = 0,
++    escoff: u64 = 0,
++    esc: u64 = 0,
++    n: usize = 0,
++    k: usize = 0,
++
++    fn addArgs(q: Q12, a: *cuda.Args) void {
++        a.add(q.sm);
++        a.add(q.ex);
++        a.add(q.base);
++        a.add(q.escoff);
++        a.add(q.esc);
++    }
++};
++
+ /// fn_logsumexp.cu: torch.logsumexp(x, dim=-1, keepdim=True) on contiguous fp32 rows in ATen's reduction order:
+ /// the row maxima (|max| == inf -> 0), the exp(x - max) sum by ATen's reduce config for (rows, n) on this device,
+ /// its per-CTA partials folded, then log(sum) + max. The config needs n >= 128 and rows <= 65535.
+@@ -225,6 +254,10 @@ pub const Torch = struct {
+         try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]) }, .block = .{ .x = block } }, t.s, args);
+     }
+ 
++    fn go3(t: Torch, f: cuda.Function, grid: [3]usize, block: u32, args: *cuda.Args) !void {
++        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = block } }, t.s, args);
++    }
++
+     fn check(t: Torch, rc: anytype, what: []const u8) !void {
+         try t.s.d.check(rc, what);
+     }
+@@ -312,6 +345,68 @@ pub const Torch = struct {
+         try t.go(t.f.hc_reduce_act, .{ (ndn + 127) / 128, rows }, 128, &a);
+     }
+ 
++    /// a read-out's down projection from its q12 copy (cuda_hc_q12.zig) as `_b16mm`'s split-K partials into
++    /// `part` [SK, rows, ndn] (SK = k / 320 <= 32), one CTA a (4 tiles, slice, 16 rows; past 16 rows 32 rows, the
++    /// weights decoded once for both row tiles); with `counters` (else 0:
++    /// partials only, for `hcReduceAct`) `hcReduceAct`'s act / inject bytes by the CTA arriving last at a column group
++    /// (fn_ops.cu tf_fn_hc_down_q12_kernel). `counters`: ceil(ceil(ndn / 8) / 4) zeroed words, left zeroed.
++    /// `mut` 1 (hc-check only): the k16 chunks reversed in each block, wrong bits; 0 otherwise.
++    pub fn hcDownQ12(t: Torch, x: u64, x_stride: usize, rows: usize, q: Q12, part: u64, act: u64, inj: u64, low: usize, streams: usize, counters: u64, mut: i32) !void {
++        if (rows == 0) return;
++        if (q.k % 320 != 0 or q.k / 320 > 32 or !std.math.isPowerOfTwo(streams) or q.n < low) return error.HcQ12Shape;
++        var a: cuda.Args = .{};
++        a.add(x);
++        a.add(@as(u32, @intCast(x_stride)));
++        a.add(@as(u32, @intCast(rows)));
++        q.addArgs(&a);
++        a.add(part);
++        a.add(@as(u32, @intCast(q.n)));
++        a.add(@as(u32, @intCast(q.k)));
++        a.add(act);
++        a.add(inj);
++        a.add(@as(u32, @intCast(low)));
++        a.add(1.0 / @as(f32, @floatFromInt(streams)));
++        a.add(counters);
++        a.add(mut);
++        const rt: usize = if (rows > 16) 32 else 16;
++        try t.go3(if (rows > 16) t.f.hc_down_q12_r32 else t.f.hc_down_q12, .{ ((q.n + 7) / 8 + 3) / 4, q.k / 320, (rows + rt - 1) / rt }, 128, &a);
++    }
++
++    /// a read-out's up projection and mix from the up matrix's q12 copy: mixed [rows, d] with
++    /// `_hc_up_mix`'s bytes (= `_b16mm` + `_hc_mix`; no 32-group sums), K 320, 4 streams, one CTA a (8 columns, 16
++    /// rows; past 16 rows 32) (tf_fn_hc_upmix_q12_kernel / _r32_kernel).
++    pub fn hcUpMixQ12(t: Torch, act: u64, q: Q12, normed: u64, mixed: u64, rows: usize, d: usize, mut: i32) !void {
++        if (rows == 0) return;
++        if (q.k != 320 or q.n != 4 * d or d % 8 != 0) return error.HcQ12Shape;
++        var a: cuda.Args = .{};
++        a.add(act);
++        q.addArgs(&a);
++        a.add(normed);
++        a.add(mixed);
++        a.add(@as(u32, @intCast(rows)));
++        a.add(@as(u32, @intCast(d)));
++        a.add(mut);
++        const rt: usize = if (rows > 16) 32 else 16;
++        try t.go(if (rows > 16) t.f.hc_upmix_q12_r32 else t.f.hc_upmix_q12, .{ d / 8, (rows + rt - 1) / rt }, 128, &a);
++    }
++
++    /// tf_fn_hc_q12_pack_kernel over bf16 `w` [n, k]: `pack` false writes each block's escape count to
++    /// `counts`, true the q12 arrays of `q` (q.escoff already the counts' exclusive sums).
++    pub fn hcQ12Pack(t: Torch, w: u64, counts: u64, q: Q12, pack: bool) !void {
++        var a: cuda.Args = .{};
++        a.add(w);
++        a.add(@as(u32, @intCast(q.n)));
++        a.add(@as(u32, @intCast(q.k)));
++        a.add(counts);
++        a.add(q.sm);
++        a.add(q.ex);
++        a.add(q.base);
++        a.add(q.escoff);
++        a.add(q.esc);
++        a.add(@as(i32, @intFromBool(pack)));
++        try t.go(t.f.hc_q12_pack, .{ (q.n + 7) / 8, q.k / 64 }, 32, &a);
++    }
++
+     // -- sampling ------------------------------------------------------------------------------------------
+ 
+     /// `.float()` of `count` bf16 values (exact).

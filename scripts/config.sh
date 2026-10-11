@@ -74,6 +74,9 @@ export TF_FLASHNEXT_DEPTH="${TF_FLASHNEXT_DEPTH:-15}"
 # TF_FLASHNEXT_CONFIDENCE=0.5 forces the per-draft rule at every width.
 export TF_FLASHNEXT_PRODUCT_STREAMS="${TF_FLASHNEXT_PRODUCT_STREAMS:-2}"
 export TF_FLASHNEXT_PREFILL_TAIL="${TF_FLASHNEXT_PREFILL_TAIL:-512}"
+# Decode read-outs from a lossless 12-bit copy of their weights (patches/0022): built at load, +0.97 GB, the same
+# bits. 0: the bf16 kernels.
+export TF_FLASHNEXT_HC_Q12="${TF_FLASHNEXT_HC_Q12:-1}"
 # KV cache (--kv-dtype). fp8 is the default: about 1.84x the pool of bf16, and lossy (~98.8% top-1 agreement with a
 # bf16 cache, so a free-running reply can differ). bf16 is exact: KV_DTYPE=bf16. FP8 works together with --vision.
 KV_DTYPE="${KV_DTYPE:-fp8}"
