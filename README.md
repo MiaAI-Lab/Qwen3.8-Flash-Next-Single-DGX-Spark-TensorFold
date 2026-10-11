@@ -332,6 +332,8 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `TENSORFOLD_MEMORY_RESERVE_GIB` | `10` | kept free when the engine sizes the pool. `prepare.sh` and `start.sh` refuse a Spark below this |
 | `TF_FLASHNEXT_PRODUCT_STREAMS` | `2` | running-product draft stop at this many streams or fewer; confidence 0.5 above it |
 | `TF_FLASHNEXT_PREFILL_TAIL` | `512` | a short last prompt chunk joins the previous one |
+| `TF_FLASHNEXT_SHARED_EARLY_ROWS` | `6` | one GPU: a decode window of at most this many rows forks its shared expert before the router (`0`: never; needs `TF_FLASHNEXT_SHARED_SIDE`) |
+| `TF_FLASHNEXT_SHARED_SLOT_LD` | `1` | the shared expert's down stored straight into its slot of the MoE output (no scratch, no strided copy) |
 | `MODEL_REVISION` | `14642741…` | the checkpoint commit this recipe serves |
 
 The Python recipe's int8 KV and SSD n-gram reader are gone. KV is fp8 (or bf16), and the n-gram table is on the GPU.
@@ -364,9 +366,15 @@ the model was still thinking.
 
 ## What the patches are
 
-`patches/*.patch` is the Zig Flash Next CUDA engine against TensorFold `db281878` (the `zig-flashnext` pin), applied
-with `git apply` in the checkout root. They are the engine, not speed patches on a Python package. Drafts are still
-checked: a drafted reply matches `"draft": false`.
+`patches/0001`-`0009` are the Zig Flash Next CUDA engine against TensorFold `db281878` (the `zig-flashnext` pin),
+applied with `git apply` in the checkout root. They are the engine, not speed patches on a Python package. Drafts are
+still checked: a drafted reply matches `"draft": false`.
+
+Speed patches on top of the engine (each keeps every reply byte-identical):
+
+| Patch | What it changes |
+| --- | --- |
+| `0028-flash-next-shared-expert-early-fork-slot-store` | the shared expert forked before the router in small decode windows (`TF_FLASHNEXT_SHARED_EARLY_ROWS`), its down stored straight into its slot of the MoE output (`TF_FLASHNEXT_SHARED_SLOT_LD`); the same bytes (`slot-ld-check`) |
 
 ## Checks
 

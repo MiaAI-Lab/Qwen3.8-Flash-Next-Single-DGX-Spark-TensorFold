@@ -1,0 +1,335 @@
+diff --git a/zig/src/cli/flashnext_cuda.zig b/zig/src/cli/flashnext_cuda.zig
+index 654f2a2..4e9befb 100644
+--- a/zig/src/cli/flashnext_cuda.zig
++++ b/zig/src/cli/flashnext_cuda.zig
+@@ -63,6 +63,8 @@ const usage =
+     \\           against 16-row items and 1-row calls, bytes compared, then both timed)
+     \\  tensorfold fp8-tiles-check MODEL   (no weights: the block-FP8 prompt tiles (TF_FLASHNEXT_FP8_PROMPT_TILES)
+     \\           against the stock kernel at prompt row counts, bytes compared, mutants, then their speed)
++    \\  tensorfold slot-ld-check MODEL   (no weights: the shared expert's down stored straight into its moe_y slot
++    \\           (TF_FLASHNEXT_SHARED_SLOT_LD) against matmul + the strided copy, bytes compared, a mutant)
+     \\  tensorfold draft-check MODEL [--rows N,N,...]   (no weights: the batched greedy draft draw (one block a row)
+     \\           against the per-row draw it replaces, bytes compared on adversarial rows, then both timed)
+     \\  tensorfold hc-check MODEL   (no weights: the read-outs' 12-bit-weight down/up kernels (cuda_hc_q12.zig)
+@@ -299,6 +301,12 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
+         std.debug.print("{s} fp8-fused-check: every fused split-K tile byte-equal to the cluster kernel\n", .{if (ok) "PASS" else "FAIL"});
+         return if (ok) 0 else 1;
+     }
++    // the shared expert's down stored straight into its moe_y slot against matmul + the strided copy (bytes, mutant)
++    if (std.mem.eql(u8, cmd, "slot-ld-check")) {
++        const ok = try flashnext.fp8.slotCheck(gpa, &ctx);
++        std.debug.print("{s} slot-ld-check: the shared down's slot store byte-equal to matmul + copy in every mode, mutant killed\n", .{if (ok) "PASS" else "FAIL"});
++        return if (ok) 0 else 1;
++    }
+     // the block-FP8 prompt tiles against the stock kernels at prompt row counts (bytes, mutants, then speed without
+     // L2 reuse)
+     if (std.mem.eql(u8, cmd, "fp8-tiles-check")) {
+diff --git a/zig/src/families/flashnext/cuda_engine.zig b/zig/src/families/flashnext/cuda_engine.zig
+index a90bc79..9c78022 100644
+--- a/zig/src/families/flashnext/cuda_engine.zig
++++ b/zig/src/families/flashnext/cuda_engine.zig
+@@ -385,6 +385,34 @@ test "on/off settings (TF_FLASHNEXT_EARLY_DRAW, ...) take 0 or 1 only, never rea
+     _ = c.unsetenv(name);
+ }
+ 
++/// TF_FLASHNEXT_SHARED_EARLY_ROWS (`v`, envCount's value): unset 0 (never), else the largest decode window that forks
++/// its shared expert before the router, at most state.max_rows. The fork needs the shared expert's side stream:
++/// a value above 0 with TF_FLASHNEXT_SHARED_SIDE=0 (`side` false) is refused, as is one past max_rows (both logged
++/// with the setting's name), never read as 0 or clamped.
++pub fn sharedEarlyRows(v: ?usize, side: bool) !usize {
++    const n = v orelse 0;
++    if (n > state.max_rows) {
++        std.log.warn("TF_FLASHNEXT_SHARED_EARLY_ROWS={d} refused: decode window rows 0..{d} (0: never)", .{ n, state.max_rows });
++        return error.BadSetting;
++    }
++    if (n > 0 and !side) {
++        std.log.warn("TF_FLASHNEXT_SHARED_EARLY_ROWS={d} refused: the early fork runs on the shared expert's side stream, which TF_FLASHNEXT_SHARED_SIDE=0 turns off", .{n});
++        return error.BadSetting;
++    }
++    return n;
++}
++
++test "TF_FLASHNEXT_SHARED_EARLY_ROWS is 0..64 rows and needs the side stream; anything else refused" {
++    try std.testing.expectEqual(@as(usize, 0), try sharedEarlyRows(null, true));
++    try std.testing.expectEqual(@as(usize, 0), try sharedEarlyRows(null, false));
++    try std.testing.expectEqual(@as(usize, 0), try sharedEarlyRows(0, false));
++    try std.testing.expectEqual(@as(usize, 6), try sharedEarlyRows(6, true));
++    try std.testing.expectEqual(@as(usize, state.max_rows), try sharedEarlyRows(state.max_rows, true));
++    try std.testing.expectError(error.BadSetting, sharedEarlyRows(state.max_rows + 1, true));
++    try std.testing.expectError(error.BadSetting, sharedEarlyRows(6, false));
++    try std.testing.expectError(error.BadSetting, sharedEarlyRows(1, false));
++}
++
+ /// TF_FLASHNEXT_PREFILL_ROWS: the prompt chunk's rows (both ranks the same; any chunking gives the same bits), else
+ /// the caller's.
+ /// Two ranks' prompt chunk rows: with the in-program K slices and the prompt expert kernel 4096 rows a call are
+@@ -631,6 +659,11 @@ pub const Engine = struct {
+         }
+         // the shared expert beside the routed experts on a second stream (TF_FLASHNEXT_SHARED_SIDE=0: in line)
+         if (!envOff("TF_FLASHNEXT_SHARED_SIDE")) try e.f.initSide();
++        // the shared expert forked before the router in decode windows of at most N rows (TF_FLASHNEXT_SHARED_EARLY_ROWS,
++        // unset or 0: never), and its down stored straight into its slot of moe_y (TF_FLASHNEXT_SHARED_SLOT_LD=1)
++        e.f.shared_early_rows = try sharedEarlyRows(try envCount("TF_FLASHNEXT_SHARED_EARLY_ROWS"), e.f.side != null);
++        e.f.slot_ld = try envSwitch("TF_FLASHNEXT_SHARED_SLOT_LD", false);
++        if (e.f.shared_early_rows > 0 or e.f.slot_ld) std.log.info("shared expert: forked before the router in decode windows of at most {d} rows (0: never); down stored straight into its moe_y slot: {}", .{ e.f.shared_early_rows, e.f.slot_ld });
+         // INT4-AutoRound's projections: block-FP8 columns stored in place (TF_FLASHNEXT_FP8_LD=0: scratch + copy)
+         e.f.fp8_ld = !envOff("TF_FLASHNEXT_FP8_LD");
+         // the shared expert's single-slice gate/up on fn_ops' K-serial kernel where it is faster (the same bits,
+diff --git a/zig/src/families/flashnext/cuda_forward.zig b/zig/src/families/flashnext/cuda_forward.zig
+index a5c7be8..e929a48 100644
+--- a/zig/src/families/flashnext/cuda_forward.zig
++++ b/zig/src/families/flashnext/cuda_forward.zig
+@@ -519,6 +519,15 @@ pub const Forward = struct {
+     count_experts: bool = false,
+     /// the shared expert's stream (initSide): it runs beside the routed experts, joined before their sum
+     side: ?Side = null,
++    /// TF_FLASHNEXT_SHARED_EARLY_ROWS (0: never): one GPU, a decode window of at most this many rows forks its
++    /// block-FP8 shared expert onto `side` before the router instead of after the plan (moeBlock; earlyFork), so the
++    /// shared gate|up overlaps the router, top-k and plan; `shared_forked`: this MoE block's already is (moeRowsInt4)
++    shared_early_rows: usize = 0,
++    shared_forked: bool = false,
++    /// TF_FLASHNEXT_SHARED_SLOT_LD=1: the shared expert's down stores its rows straight into its slot of a bf16
++    /// moe_y (fp8.matmulLd, rows slots * D apart: the same kernel family and values, only the store address) instead
++    /// of into `shared_y` and a strided copy; an fp32 moe_y (the MTP head's) keeps the copy (slotLd)
++    slot_ld: bool = false,
+     /// `_fp4mm` SK 1 launches of 9 to fp4SerialRows(n) rows on fn_ops' K-serial kernel (fp4Serial)
+     fp4_serial: bool = false,
+     /// a shared round of at least this many streams runs its attention in one launch a kernel (attn_multi; 0 off,
+@@ -1914,6 +1923,13 @@ pub const Forward = struct {
+         const top = g.topKFor(mtp);
+         const slots = top + 1;
+         const es: usize = if (x.y_f32) 4 else 2;
++        // TF_FLASHNEXT_SHARED_EARLY_ROWS: one GPU, a small decode window's block-FP8 shared expert forked onto the side
++        // stream before the router (moeRowsInt4's kernels on the same inputs into the same slot; only the order moves)
++        f.shared_forked = false;
++        if (earlyFork(f.shared_early_rows, b.prefill, R) and f.comm == null and f.splitOf(x, R) == null and m.int4 != null) if (f.side) |sd| if (m.shared8) |sh| {
++            try f.sharedSide(sd, sh, b.mixed, b.moe_y, x.y_f32, R, slots, top);
++            f.shared_forked = true;
++        };
+         try f.t.router(b.mixed, D, m.router, b.moe_logits, R, D, E + 1);
+         try f.mark(.router);
+         try f.t.topkRows(b.moe_logits, b.moe_pick, b.moe_wts, R, E, top);
+@@ -2064,16 +2080,9 @@ pub const Forward = struct {
+         const sh = m.shared8 orelse return error.NoSharedExpert;
+         if (f.side) |sd| {
+             // the block-FP8 shared expert on the side stream (its own scratch and its slot of moe_y, which the routed
+-            // kernels skip): the same kernels on the same inputs, so the same bits, beside the routed experts
+-            try sd.fork.record(f.s);
+-            try sd.s.wait(sd.fork);
+-            var th2 = f.th;
+-            th2.s = sd.s;
+-            try fp8.matmul(k8, sd.s, xin, D, sh.gu, f.sc.sh_g, false, R);
+-            try th2.sharedSwiglu(f.sc.sh_g, f.sc.sh_a, R, sh.width, sh.width);
+-            try fp8.matmul(k8, sd.s, f.sc.sh_a, sh.width, sh.down, f.sc.shared_y, x.y_f32, R);
+-            try th2.slotCopy(f.sc.shared_y, D * es, y + top * D * es, slots * D * es, D * es, R);
+-            try sd.join.record(sd.s);
++            // kernels skip): the same kernels on the same inputs, so the same bits, beside the routed experts; already
++            // forked before the router when `shared_forked` (moeBlock, TF_FLASHNEXT_SHARED_EARLY_ROWS)
++            if (!f.shared_forked) try f.sharedSide(sd, sh, xin, y, x.y_f32, R, slots, top);
+             if (pgu) try int4.gateUpPrompt(k4, f.s, xin, D, ex4, plan, slots, E + 1, act, R, skip) else try int4.gateUp(k4, f.s, xin, D, ex4, plan, slots, E + 1, act, R, skip, tile);
+             try f.mark(.experts_gate_up);
+             try f.int4Down(k4, pick, act, ex4, plan, slots, E, y, x.y_f32, R, skip, tile);
+@@ -2089,12 +2098,52 @@ pub const Forward = struct {
+         try f.mark(.shared_swiglu);
+         try f.int4Down(k4, pick, act, ex4, plan, slots, E, y, x.y_f32, R, skip, tile);
+         try f.mark(.experts_down);
++        if (f.slotLd(x.y_f32)) {
++            try f.sharedDownLd(f.s, sh, y, R, slots, top);
++            try f.mark(.shared_down);
++            return;
++        }
+         try fp8.matmul(k8, f.s, f.sc.sh_a, sh.width, sh.down, f.sc.shared_y, x.y_f32, R);
+         try f.mark(.shared_down);
+         try f.th.slotCopy(f.sc.shared_y, D * es, y + top * D * es, slots * D * es, D * es, R);
+         try f.mark(.slot_copy);
+     }
+ 
++    /// The block-FP8 shared expert of R rows on the side stream `sd`, forked from the main stream here: gate|up,
++    /// SwiGLU, down, its slot `top` of `y` (rows slots * D apart); `sd.join` recorded after it.
++    fn sharedSide(f: *Forward, sd: Side, sh: W.Shared8, xin: u64, y: u64, y_f32: bool, R: usize, slots: usize, top: usize) !void {
++        const k8 = f.k8 orelse return error.NoFp8Kernels;
++        const D = f.g.hidden;
++        const es: usize = if (y_f32) 4 else 2;
++        try sd.fork.record(f.s);
++        try sd.s.wait(sd.fork);
++        var th2 = f.th;
++        th2.s = sd.s;
++        try fp8.matmul(k8, sd.s, xin, D, sh.gu, f.sc.sh_g, false, R);
++        try th2.sharedSwiglu(f.sc.sh_g, f.sc.sh_a, R, sh.width, sh.width);
++        if (f.slotLd(y_f32)) {
++            try f.sharedDownLd(sd.s, sh, y, R, slots, top);
++        } else {
++            try fp8.matmul(k8, sd.s, f.sc.sh_a, sh.width, sh.down, f.sc.shared_y, y_f32, R);
++            try th2.slotCopy(f.sc.shared_y, D * es, y + top * D * es, slots * D * es, D * es, R);
++        }
++        try sd.join.record(sd.s);
++    }
++
++    /// TF_FLASHNEXT_SHARED_SLOT_LD on a bf16 moe_y (an fp32 one, the MTP head's, keeps matmul + the strided copy).
++    fn slotLd(f: *const Forward, y_f32: bool) bool {
++        return f.slot_ld and !y_f32;
++    }
++
++    /// The shared expert's down of R rows on stream `s` stored straight into slot `top` of a bf16 `y` (rows slots * D
++    /// apart): matmul's kernels with a row stride (fp8.matmulLd), so the slot holds the bytes matmul + slotCopy write
++    /// (slot-ld-check).
++    fn sharedDownLd(f: *Forward, s: cuda.Stream, sh: W.Shared8, y: u64, R: usize, slots: usize, top: usize) !void {
++        const k8 = f.k8 orelse return error.NoFp8Kernels;
++        const D = f.g.hidden;
++        try fp8.matmulLd(k8, s, f.sc.sh_a, sh.width, sh.down, y + top * D * 2, slots * D, R);
++    }
++
+     /// The routed int4 down of rows' pairs: prompt calls on int4_prompt_kernel from a plan of 64-pair items (made
+     /// again after gate/up read the 16-pair one; the same bytes as int4_kernel's, int4-check), else int4_kernel.
+     fn int4Down(f: *Forward, k4: *const int4.Kernels, pick: u64, act: u64, ex4: int4.Experts, plan: kern.Plan, slots: usize, E: usize, y: u64, y_f32: bool, R: usize, skip: c_int, tile: usize) !void {
+@@ -2259,6 +2308,24 @@ test "QSA_SELECT=0: the decode indexer's launches are the calls from before the
+     };
+ }
+ 
++/// TF_FLASHNEXT_SHARED_EARLY_ROWS: whether an R-row forward forks its shared expert before the router (moeBlock adds
++/// the one-GPU, int4 and side-stream conditions): decode only, and only windows of at most `cap` rows (0: never). The
++/// early fork saves 5-17 us a MoE block at 2-6 rows and costs up to 11 us at 8-10 (the router, on the routed experts'
++/// critical path, slows beside the shared gate|up).
++pub fn earlyFork(cap: usize, prefill: bool, R: usize) bool {
++    return cap != 0 and !prefill and R <= cap;
++}
++
++test "TF_FLASHNEXT_SHARED_EARLY_ROWS forks decode windows of at most that many rows, never a prompt pass, never at 0" {
++    for ([_]usize{ 0, 1, 2, 6, 7, 64 }) |R| try std.testing.expect(!earlyFork(0, false, R)); // 0 is never, at any R
++    for ([_]usize{ 1, 2, 5, 6 }) |R| try std.testing.expect(earlyFork(6, false, R));
++    for ([_]usize{ 7, 8, 32, 64 }) |R| try std.testing.expect(!earlyFork(6, false, R));
++    for ([_]usize{ 1, 6, 4096 }) |R| try std.testing.expect(!earlyFork(6, true, R));
++    try std.testing.expect(earlyFork(64, false, 64));
++    try std.testing.expect(earlyFork(1, false, 1));
++    try std.testing.expect(!earlyFork(1, false, 2));
++}
++
+ test {
+     std.testing.refAllDecls(@This());
+     std.testing.refAllDecls(Forward);
+diff --git a/zig/src/families/flashnext/cuda_fp8.zig b/zig/src/families/flashnext/cuda_fp8.zig
+index d4fe964..1a64ead 100644
+--- a/zig/src/families/flashnext/cuda_fp8.zig
++++ b/zig/src/families/flashnext/cuda_fp8.zig
+@@ -807,6 +807,121 @@ pub fn fusedCheck(gpa: std.mem.Allocator, ctx: *const cuda.Context) !bool {
+     return ok;
+ }
+ 
++// ---- `slot-ld-check`: the shared expert's down stored straight into its moe_y slot (TF_FLASHNEXT_SHARED_SLOT_LD) ----
++
++/// Random block-FP8 weights at the shared expert's down shape (n = hidden 2560, K = its width 1280; K 2560 too), as
++/// fusedCheck: in each tile mode (the engine's from the environment first) the old path's bytes (`matmul` into a
++/// contiguous buffer, its rows then moved into slot 5 of 6-slot rows on the host, which is what the strided copy does)
++/// against `matmulLd` storing slot 5 of a poisoned moe_y directly (rows slots * 2560 apart), at decode and prompt row
++/// counts (1 to 4608): every byte of the slot's rows and of the other slots must agree. A mutant (`matmulLd` into
++/// slot 4) must differ at every row count.
++pub fn slotCheck(gpa: std.mem.Allocator, ctx: *const cuda.Context) !bool {
++    const d = ctx.d;
++    var k = try Kernels.load(ctx);
++    defer k.deinit();
++    var stream = try cuda.Stream.init(d, true);
++    defer stream.deinit();
++    var prng = std.Random.DefaultPrng.init(3030);
++    const r = prng.random();
++    var ok = true;
++    const modes = [_]struct { name: []const u8, m: Mode }{
++        .{ .name = "env", .m = k.mode },
++        .{ .name = "stock", .m = .{} },
++        .{ .name = "fuse4+tiles", .m = .{ .fuse = 4, .wide = true, .pfuse = true } },
++        .{ .name = "fuse8", .m = .{ .fuse = 8 } },
++    };
++    const n: usize = 2560;
++    const slots: usize = 6;
++    const top: usize = 5;
++    const ldo = slots * n;
++    const rows_list = [_]usize{ 1, 2, 3, 4, 5, 7, 8, 13, 16, 17, 20, 31, 32, 33, 48, 63, 64, 65, 100, 255, 256, 257, 300, 1000, 2048, 4096, 4608 };
++    const max_m: usize = 4608;
++    for ([_]usize{ 1280, 2560 }) |kk| {
++        const npad = npadOf(n);
++        const sk = splitK(n, kk);
++        const codes = try gpa.alloc(u8, n * kk);
++        defer gpa.free(codes);
++        r.bytes(codes);
++        for (codes) |*c| if ((c.* & 0x7F) == 0x7F) {
++            c.* ^= 0x01;
++        };
++        const inv = try gpa.alloc(f32, ((n + 127) / 128) * (kk / 128));
++        defer gpa.free(inv);
++        for (inv) |*v| v.* = std.math.ldexp(1.0 + r.float(f32), -9 + @as(i32, r.intRangeLessThan(i32, 0, 5)));
++        const cols = try gpa.alloc(f32, n * (kk / 64));
++        defer gpa.free(cols);
++        try columnScales(inv, n, kk, cols);
++        const bs = try gpa.alloc(f32, npad * (kk / 64));
++        defer gpa.free(bs);
++        try tileScales(cols, n, kk, npad, bs);
++        const w8 = try gpa.alloc(u8, npad * kk);
++        defer gpa.free(w8);
++        try fragmentOrder(codes, n, kk, npad, w8);
++        var dw = try cuda.DeviceBuffer.fromHost(d, w8);
++        defer dw.free();
++        var dbs = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(bs));
++        defer dbs.free();
++        const xh = try gpa.alloc(u16, max_m * kk);
++        defer gpa.free(xh);
++        for (xh) |*v| {
++            const f: f32 = r.floatNorm(f32);
++            v.* = @intCast(@as(u32, @bitCast(f)) >> 16);
++        }
++        var dx = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(xh));
++        defer dx.free();
++        var dy = try cuda.DeviceBuffer.alloc(d, max_m * n * 2);
++        defer dy.free();
++        var ds = try cuda.DeviceBuffer.alloc(d, max_m * ldo * 2);
++        defer ds.free();
++        const ref = try gpa.alloc(u8, max_m * n * 2);
++        defer gpa.free(ref);
++        const img = try gpa.alloc(u8, max_m * ldo * 2);
++        defer gpa.free(img);
++        const got = try gpa.alloc(u8, max_m * ldo * 2);
++        defer gpa.free(got);
++        const lin: Linear = .{ .w8 = dw.ptr, .bs = dbs.ptr, .n = @intCast(n), .k = @intCast(kk), .npad = @intCast(npad) };
++        var calls: usize = 0;
++        var differ: usize = 0;
++        var mutant_calls: usize = 0;
++        var mutant_differ: usize = 0;
++        for (modes, 0..) |md, mi| for (rows_list) |m| {
++            // the old path: contiguous rows, moved into slot `top` of a poisoned moe_y image on the host
++            k.mode = md.m;
++            try dy.fill8(0x5A, stream.handle);
++            try matmul(&k, stream, dx.ptr, kk, lin, dy.ptr, false, m);
++            try stream.synchronize();
++            try dy.download(0, ref[0 .. m * n * 2]);
++            @memset(img[0 .. m * ldo * 2], 0xA5);
++            for (0..m) |row| @memcpy(img[row * ldo * 2 + top * n * 2 ..][0 .. n * 2], ref[row * n * 2 ..][0 .. n * 2]);
++            // the new path: matmulLd straight into slot `top` of the poisoned device moe_y
++            try ds.fill8(0xA5, stream.handle);
++            try matmulLd(&k, stream, dx.ptr, kk, lin, ds.ptr + top * n * 2, ldo, m);
++            try stream.synchronize();
++            try ds.download(0, got[0 .. m * ldo * 2]);
++            calls += 1;
++            if (!std.mem.eql(u8, img[0 .. m * ldo * 2], got[0 .. m * ldo * 2])) {
++                differ += 1;
++                ok = false;
++                std.debug.print("  k {d} m {d} mode {s}: matmulLd's slot DIFFERS from matmul + copy\n", .{ kk, m, md.name });
++            }
++            // the mutant, once a row count: the env mode's matmulLd into slot top - 1
++            if (mi == 0) {
++                try ds.fill8(0xA5, stream.handle);
++                try matmulLd(&k, stream, dx.ptr, kk, lin, ds.ptr + (top - 1) * n * 2, ldo, m);
++                try stream.synchronize();
++                try ds.download(0, got[0 .. m * ldo * 2]);
++                mutant_calls += 1;
++                if (!std.mem.eql(u8, img[0 .. m * ldo * 2], got[0 .. m * ldo * 2])) mutant_differ += 1;
++            }
++        };
++        const mutant_ok = mutant_differ == mutant_calls;
++        if (!mutant_ok) ok = false;
++        std.debug.print("{s} slot-ld n {d} k {d} split_k {d}: {d} calls ({d} modes x {d} row counts, 1-{d}), {d} differ; mutant (slot top - 1) differs on {d}/{d}: {s}\n", .{ if (differ == 0 and mutant_ok) "PASS" else "FAIL", n, kk, sk, calls, modes.len, rows_list.len, max_m, differ, mutant_differ, mutant_calls, if (mutant_ok) "KILLED" else "SURVIVED" });
++    }
++    k.mode = .{};
++    return ok;
++}
++
+ // ---- `fp8-tiles-check`: the prompt tiles (Mode.wide, Mode.pfuse) against the stock kernels ---------------------------
+ 
+ const tile_modes = [_]struct { name: []const u8, m: Mode }{

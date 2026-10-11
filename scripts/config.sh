@@ -74,6 +74,11 @@ export TF_FLASHNEXT_DEPTH="${TF_FLASHNEXT_DEPTH:-15}"
 # TF_FLASHNEXT_CONFIDENCE=0.5 forces the per-draft rule at every width.
 export TF_FLASHNEXT_PRODUCT_STREAMS="${TF_FLASHNEXT_PRODUCT_STREAMS:-2}"
 export TF_FLASHNEXT_PREFILL_TAIL="${TF_FLASHNEXT_PREFILL_TAIL:-512}"
+# The shared expert (one GPU): forked onto its side stream before the router in decode windows of at most
+# SHARED_EARLY_ROWS rows (0: never; 0..64; needs TF_FLASHNEXT_SHARED_SIDE on), and its down stored straight into its
+# slot of the MoE output (SHARED_SLOT_LD, 0 or 1). The same bytes either way (tensorfold slot-ld-check).
+export TF_FLASHNEXT_SHARED_EARLY_ROWS="${TF_FLASHNEXT_SHARED_EARLY_ROWS:-6}"
+export TF_FLASHNEXT_SHARED_SLOT_LD="${TF_FLASHNEXT_SHARED_SLOT_LD:-1}"
 # KV cache (--kv-dtype). fp8 is the default: about 1.84x the pool of bf16, and lossy (~98.8% top-1 agreement with a
 # bf16 cache, so a free-running reply can differ). bf16 is exact: KV_DTYPE=bf16. FP8 works together with --vision.
 KV_DTYPE="${KV_DTYPE:-fp8}"

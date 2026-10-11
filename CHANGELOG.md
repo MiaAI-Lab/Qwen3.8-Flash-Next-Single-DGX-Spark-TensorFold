@@ -17,6 +17,10 @@ Script and tool fixes only; the image and `patches/` are unchanged.
   [naeemakhtar110](https://github.com/naeemakhtar110) (#38). Test: `tools/test_bench_stats.py`.
 - The ready summary of `start.sh` names the KV cache type in use (it always said `bf16 KV`). Authored by
   [mcclanahanaman](https://github.com/mcclanahanaman) (#51).
+- `patches/0028-flash-next-shared-expert-early-fork-slot-store`, `TF_FLASHNEXT_SHARED_EARLY_ROWS=6` and
+  `TF_FLASHNEXT_SHARED_SLOT_LD=1`: on one GPU a decode window of at most 6 rows forks its shared expert before the router,
+  and the shared down stores straight into its slot of the MoE output (no scratch, no strided copy). Decode MoE block
+  -3 to -5% in the GPU trace, serve-level decode inside the noise; replies byte-identical (`tensorfold slot-ld-check`).
 
 ## [1.0.0] - 2026-10-08
 
