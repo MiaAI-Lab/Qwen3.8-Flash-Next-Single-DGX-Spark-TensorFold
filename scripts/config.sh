@@ -74,6 +74,12 @@ export TF_FLASHNEXT_DEPTH="${TF_FLASHNEXT_DEPTH:-15}"
 # TF_FLASHNEXT_CONFIDENCE=0.5 forces the per-draft rule at every width.
 export TF_FLASHNEXT_PRODUCT_STREAMS="${TF_FLASHNEXT_PRODUCT_STREAMS:-2}"
 export TF_FLASHNEXT_PREFILL_TAIL="${TF_FLASHNEXT_PREFILL_TAIL:-512}"
+# A prompt's first token: drawn before the last chunk's MTP absorb and commit (EARLY_DRAW); a one-prompt pass's MTP
+# head stops after its layer (PROMPT_HEAD_SKIP); the host n-gram gather beside the first layers (NGRAM_LATE). Each 0
+# or 1; 0: as before. The same tokens and drafts either way (tensorfold first-token-check).
+export TF_FLASHNEXT_EARLY_DRAW="${TF_FLASHNEXT_EARLY_DRAW:-1}"
+export TF_FLASHNEXT_PROMPT_HEAD_SKIP="${TF_FLASHNEXT_PROMPT_HEAD_SKIP:-1}"
+export TF_FLASHNEXT_NGRAM_LATE="${TF_FLASHNEXT_NGRAM_LATE:-1}"
 # KV cache (--kv-dtype). fp8 is the default: about 1.84x the pool of bf16, and lossy (~98.8% top-1 agreement with a
 # bf16 cache, so a free-running reply can differ). bf16 is exact: KV_DTYPE=bf16. FP8 works together with --vision.
 KV_DTYPE="${KV_DTYPE:-fp8}"

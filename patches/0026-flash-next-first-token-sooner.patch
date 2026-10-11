@@ -1,0 +1,426 @@
+diff --git a/zig/src/cli/flashnext_cuda.zig b/zig/src/cli/flashnext_cuda.zig
+index 9b71af6..da46195 100644
+--- a/zig/src/cli/flashnext_cuda.zig
++++ b/zig/src/cli/flashnext_cuda.zig
+@@ -41,6 +41,9 @@ const usage =
+     \\  tensorfold fill-check MODEL --tokens-file PATH [--max-tokens N]   (sliced fills on the real engine: a second
+     \\           fill waits while one holds the prompt buffers, a cancel releases them, a resumed fill's deferred MTP
+     \\           absorb; each reply equal to a fresh prefill's)
++    \\  tensorfold first-token-check MODEL --tokens-file PATH [--max-tokens N]   (a prompt pass's first-token settings,
++    \\           TF_FLASHNEXT_EARLY_DRAW / PROMPT_HEAD_SKIP / NGRAM_LATE, each and all on against all off: first tokens,
++    \\           drafted replies and draft counts of prompts of 7-9,000 tokens, a resume and a burst)
+     \\  tensorfold bench MODEL --tokens-file PATH[,PATH...] [--reps N] [--max-tokens N] [--no-drafts]   (each
+     \\           prompt N times in one load: prefill seconds and tok/s, the reply's first token and sha)
+     \\  tensorfold mm-check MODEL [--rows N,N,...]   (no weights: the prompt matmuls' in-program K
+@@ -367,6 +370,7 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
+     if (std.mem.eql(u8, cmd, "pool-check")) return poolCheck(gpa, init.io, e, o);
+     if (std.mem.eql(u8, cmd, "window-check")) return windowCheck(gpa, e, o);
+     if (std.mem.eql(u8, cmd, "fill-check")) return fillCheck(gpa, init.io, e, o);
++    if (std.mem.eql(u8, cmd, "first-token-check")) return firstTokenCheck(gpa, e, o);
+     if (std.mem.eql(u8, cmd, "agree") and rest.len == 1) return agree(gpa, init.io, e, rest[0], o);
+     std.debug.print("{s}", .{usage});
+     return 2;
+@@ -1389,6 +1393,128 @@ fn fillCheck(gpa: Allocator, io: std.Io, e: *Engine, o: Options) !u8 {
+     return if (bad == 0) 0 else 1;
+ }
+ 
++/// `first-token-check` (one GPU): the first-token settings of a prompt pass (Engine.early_draw, Forward.prompt_head_skip,
++/// Forward.ngram_late: TF_FLASHNEXT_EARLY_DRAW, TF_FLASHNEXT_PROMPT_HEAD_SKIP, TF_FLASHNEXT_NGRAM_LATE) each on, and
++/// all three, against all three off, on the real engine: prompts of 7 to 9,000 tokens of the tokens file, greedy and
++/// sampled (the recipe's sampling, seed 1234), a prompt resumed from a state kept at its half, and a burst of three
++/// prompts in one pass (prefillMany). Every run's first token, its drafted reply and its rounds, drafts and accepted
++/// drafts must equal the reference's: the drafts read the MTP head's cache, so a head that skipped writing it shows.
++/// The solo prompts run every length greedy, then every length sampled, so each pass follows another prompt's (a
++/// first token drawn from the previous pass's logits row differs); a tokens file whose prompts all draw the same
++/// first token (a chat header with the user turn left open draws its end) cannot show that, and fails the check.
++fn firstTokenCheck(gpa: Allocator, e: *Engine, o: Options) !u8 {
++    const p = o.tokens;
++    if (p.len < 1200) {
++        std.debug.print("first-token-check: --tokens or --tokens-file (1,200 tokens or more)\n", .{});
++        return 2;
++    }
++    const Mode = struct { name: []const u8, early: bool = false, skip: bool = false, late: bool = false };
++    const modes = [_]Mode{ .{ .name = "off" }, .{ .name = "early-draw", .early = true }, .{ .name = "head-skip", .skip = true }, .{ .name = "ngram-late", .late = true }, .{ .name = "all", .early = true, .skip = true, .late = true } };
++    const Run = struct {
++        r: decode.Result,
++        fn same(a: *const @This(), b: *const @This()) bool {
++            return std.mem.eql(u32, a.r.tokens.items, b.r.tokens.items) and a.r.rounds == b.r.rounds and a.r.drafted == b.r.drafted and a.r.accepted == b.r.accepted;
++        }
++    };
++    const sampled: lanes.Sampling = .{ .seed = 1234, .temperature = 1.0, .top_k = 20, .top_p = 0.95, .min_p = 0.0 };
++    const was: Mode = .{ .name = "engine", .early = e.early_draw, .skip = e.f.prompt_head_skip, .late = e.f.ngram_late };
++    defer {
++        e.early_draw = was.early;
++        e.f.prompt_head_skip = was.skip;
++        e.f.ngram_late = was.late;
++    }
++    const own = e.bound;
++    defer e.bind(own);
++    e.absorbing = true;
++    const opts: decode.Options = .{ .count = o.max_tokens, .depth = e.depth, .confidence = flashnext.engine.confidenceSetting(), .stop_eos = false };
++    var lens: std.ArrayList(usize) = .empty;
++    defer lens.deinit(gpa);
++    for ([_]usize{ 7, 300, 1100, 3000, 5200, 9000 }) |n| if (n <= p.len and n + o.max_tokens + e.depth + 1 < e.max_len) try lens.append(gpa, n);
++    const solo = 2 * lens.items.len;
++    const cases = solo + 1 + 3; // solo prompts greedy and sampled, the resume, the burst's three
++    const refs = try gpa.alloc(Run, cases);
++    defer gpa.free(refs);
++    var have: usize = 0;
++    defer for (refs[0..have]) |*x| x.r.deinit(gpa);
++    const seq = try e.newSeq(e.max_len);
++    defer e.freeSeq(seq);
++    const rs = try e.newSeq(e.max_len);
++    defer e.freeSeq(rs);
++    var bs: [3]@TypeOf(seq) = undefined;
++    var nbs: usize = 0;
++    defer for (bs[0..nbs]) |q| e.freeSeq(q);
++    for (&bs) |*q| {
++        q.* = try e.newSeq(e.max_len);
++        nbs += 1;
++    }
++    // the resumed prompt's state, kept at its half with every setting off (a resume's restore runs no prompt pass)
++    const rp = p[0..lens.items[lens.items.len - 1]];
++    e.early_draw = false;
++    e.f.prompt_head_skip = false;
++    e.f.ngram_late = false;
++    e.bind(rs);
++    const kept = try e.prefillWith(rp, null, .{ .keep_at = rp.len / 2 });
++    const snap = kept.kept.?;
++    defer e.freeSnapshot(snap);
++    const burst = [3][]const u32{ p[0..7], p[0..300], p[0..1100] };
++    var bad: usize = 0;
++    var total: usize = 0;
++    for (modes, 0..) |m, mi| {
++        e.early_draw = m.early;
++        e.f.prompt_head_skip = m.skip;
++        e.f.ngram_late = m.late;
++        var c: usize = 0;
++        for ([_]?lanes.Sampling{ null, sampled }) |smp| for (lens.items) |n| {
++            e.bind(seq);
++            const f0 = (try e.prefillWith(p[0..n], smp, .{})).first;
++            var got: Run = .{ .r = try decode.drafted(Engine, e, gpa, f0, opts) };
++            bad += try firstTokenCompare(gpa, mi, &refs[c], &have, &got, m.name, n, if (smp == null) "greedy" else "sampled", Run.same);
++            c += 1;
++            total += 1;
++        };
++        e.bind(rs);
++        const fr = (try e.prefillWith(rp, null, .{ .resume_from = snap })).first;
++        var gr: Run = .{ .r = try decode.drafted(Engine, e, gpa, fr, opts) };
++        bad += try firstTokenCompare(gpa, mi, &refs[c], &have, &gr, m.name, rp.len, "resumed at its half", Run.same);
++        c += 1;
++        total += 1;
++        var mp: [3]Engine.ManyPrompt = undefined;
++        for (&mp, burst, bs) |*x, t, q| x.* = .{ .seq = q, .prompt = t, .sampling = null };
++        var firsts: [3]u32 = undefined;
++        try e.prefillMany(&mp, &firsts);
++        for (bs, burst, firsts) |q, t, f1| {
++            e.bind(q);
++            var gb: Run = .{ .r = try decode.drafted(Engine, e, gpa, f1, opts) };
++            bad += try firstTokenCompare(gpa, mi, &refs[c], &have, &gb, m.name, t.len, "in a burst of three", Run.same);
++            c += 1;
++            total += 1;
++        }
++    }
++    // the reference's solo first tokens must differ somewhere, or a stale row's draw could equal the right one
++    var distinct = false;
++    for (refs[1..solo]) |x| distinct = distinct or x.r.tokens.items[0] != refs[0].r.tokens.items[0];
++    if (!distinct) {
++        std.debug.print("FAIL first-token-check: every solo prompt draws first token {d}: these prompts cannot tell a first token drawn from the wrong row (use a tokens file of plain text, no open chat turn)\n", .{refs[0].r.tokens.items[0]});
++        bad += 1;
++    }
++    std.debug.print("{s} first-token-check: {d} modes x {d} runs ({d} compared with every setting off), {d}-token replies; {d} differ\n", .{ if (bad == 0) "PASS" else "FAIL", modes.len, cases, total - cases, o.max_tokens, bad });
++    return if (bad == 0) 0 else 1;
++}
++
++/// firstTokenCheck's comparison: mode 0's run becomes the reference `ref` (owned from then on), a later mode's run
++/// is compared with it and freed. Returns 1 when they differ.
++fn firstTokenCompare(gpa: Allocator, mode: usize, ref: anytype, have: *usize, got: anytype, name: []const u8, len: usize, what: []const u8, same: anytype) !usize {
++    if (mode == 0) {
++        ref.* = got.*;
++        have.* += 1;
++        return 0;
++    }
++    defer got.r.deinit(gpa);
++    if (same(ref, got)) return 0;
++    std.debug.print("  DIFFER {s}: {d}-token prompt {s}: first {d} vs {d}, {d} rounds / {d} drafted / {d} accepted vs {d} / {d} / {d}, reply sha {s} vs {s}\n", .{ name, len, what, got.r.tokens.items[0], ref.r.tokens.items[0], got.r.rounds, got.r.drafted, got.r.accepted, ref.r.rounds, ref.r.drafted, ref.r.accepted, &(try sha12(gpa, got.r.tokens.items)), &(try sha12(gpa, ref.r.tokens.items)) });
++    return 1;
++}
++
+ fn deviceZero(gpa: Allocator, e: *Engine, ptr: u64, len: usize) !bool {
+     const host = try gpa.alloc(u8, len);
+     defer gpa.free(host);
+diff --git a/zig/src/families/flashnext/cuda_engine.zig b/zig/src/families/flashnext/cuda_engine.zig
+index c5a7681..7005892 100644
+--- a/zig/src/families/flashnext/cuda_engine.zig
++++ b/zig/src/families/flashnext/cuda_engine.zig
+@@ -355,6 +355,36 @@ test "count settings (TF_FLASHNEXT_SEQ_POOL, WARM_POOL, ...) refuse a value that
+     _ = c.unsetenv(name);
+ }
+ 
++/// An on/off setting: unset `default`, "0" off, "1" on; any other value is refused (error.BadSetting, logged with
++/// its name), never read as on or off.
++pub fn envSwitch(name: [:0]const u8, default: bool) !bool {
++    const v = envGet(name) orelse return default;
++    if (std.mem.eql(u8, v, "0")) return false;
++    if (std.mem.eql(u8, v, "1")) return true;
++    std.log.warn("{s}={s} refused: 0 (off) or 1 (on)", .{ name, v });
++    return error.BadSetting;
++}
++
++test "on/off settings (TF_FLASHNEXT_EARLY_DRAW, ...) take 0 or 1 only, never read another value as either" {
++    const c = struct {
++        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
++        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
++    };
++    const name = "TF_FLASHNEXT_TEST_SWITCH";
++    _ = c.unsetenv(name);
++    try std.testing.expectEqual(false, try envSwitch(name, false));
++    try std.testing.expectEqual(true, try envSwitch(name, true));
++    _ = c.setenv(name, "0", 1);
++    try std.testing.expectEqual(false, try envSwitch(name, true));
++    _ = c.setenv(name, "1", 1);
++    try std.testing.expectEqual(true, try envSwitch(name, false));
++    for ([_][:0]const u8{ "", "on", "off", "2", "01", "1 ", "true", "-1" }) |bad| {
++        _ = c.setenv(name, bad, 1);
++        try std.testing.expectError(error.BadSetting, envSwitch(name, false));
++    }
++    _ = c.unsetenv(name);
++}
++
+ /// TF_FLASHNEXT_PREFILL_ROWS: the prompt chunk's rows (both ranks the same; any chunking gives the same bits), else
+ /// the caller's.
+ /// Two ranks' prompt chunk rows: with the in-program K slices and the prompt expert kernel 4096 rows a call are
+@@ -494,6 +524,10 @@ pub const Engine = struct {
+     poison: bool = false,
+     /// TF_FLASHNEXT_PASS_TIMES=1: prefillWith logs its parts' wall times (the stream drained at each edge)
+     pass_times: bool = false,
++    /// TF_FLASHNEXT_EARLY_DRAW=1: a prompt's first token drawn as soon as its last chunk's logits row is copied out,
++    /// before that chunk's MTP absorb and commit (prefillWith, prefillMany): the same draw on the same row, so the
++    /// host has the token while those kernels are still to come. 0: the draw after them, as it always ran.
++    early_draw: bool = false,
+     /// TF_FLASHNEXT_QSA_FAST (default on): fn_qsa_scores for the prompt indexer's scores
+     qsa_fast: ?prompt_mm.QsaScores = null,
+     /// TF_FLASHNEXT_QSA_SELECT=1: fn_qsa_stream for the indexer's block lists
+@@ -650,6 +684,12 @@ pub const Engine = struct {
+         if (!envOff("TF_FLASHNEXT_DROP_PAGES")) weights.dropPages(gpa, io, dir);
+         e.poison = envGet("TF_FLASHNEXT_POISON_PADS") != null;
+         e.pass_times = envGet("TF_FLASHNEXT_PASS_TIMES") != null;
++        // a prompt's time to first token (first-token-check: the same tokens, drafts and draws either way):
++        // TF_FLASHNEXT_EARLY_DRAW, TF_FLASHNEXT_PROMPT_HEAD_SKIP and TF_FLASHNEXT_NGRAM_LATE (0, unset: as before)
++        e.early_draw = try envSwitch("TF_FLASHNEXT_EARLY_DRAW", false);
++        e.f.prompt_head_skip = try envSwitch("TF_FLASHNEXT_PROMPT_HEAD_SKIP", false);
++        e.f.ngram_late = try envSwitch("TF_FLASHNEXT_NGRAM_LATE", false);
++        if (e.early_draw or e.f.prompt_head_skip or e.f.ngram_late) std.log.info("first token: drawn {s} the last chunk's MTP absorb; the MTP head of a one-prompt pass {s}; the host n-gram gather {s}", .{ if (e.early_draw) "before" else "after", if (e.f.prompt_head_skip) "stops after its layer" else "runs to its logits", if (e.f.ngram_late) "beside the layers before the first n-gram layer" else "before the chunk's embedding" });
+         e.f.up_mix = !envOff("TF_FLASHNEXT_GLUE_FUSE") and prompt_mm.upMixAvailable(&e.set);
+         // decode windows' layer read-outs on `_hc_up_mix` too (rows > 1; glue-check: the same mixed bytes as
+         // `_b16mm` + `_hc_mix` at 2-16 rows); TF_FLASHNEXT_UPMIX_DECODE=0 keeps the two launches
+@@ -1199,6 +1239,8 @@ pub const Engine = struct {
+         errdefer if (kept) |k| e.freeSnapshot(k);
+         errdefer if (e.f.ngh) |h| h.dropTouches(); // a pass that failed leaves no rows queued for the next one
+         var chunk: usize = 0;
++        var first: [1]u32 = undefined;
++        var drawn = false;
+         // the prompt's n-gram rows touched ahead of their chunks (cuda_ngram_host.zig): chunk 0 is gathered at once
+         // by the gang, the next `ahead` chunks are queued now, each later chunk when it is `ahead` chunks away
+         var queued: usize = start;
+@@ -1234,6 +1276,12 @@ pub const Engine = struct {
+             if (final) {
+                 try e.f.th.copy(e.last_logits, lg.?, e.g.head_n * 2);
+                 if (e.world > 1) try e.f.th.copy(e.last_cand, pb.b.cand_all, e.world * (2 * state.cand + 1) * 4);
++                // TF_FLASHNEXT_EARLY_DRAW: the first token now, ahead of this chunk's MTP absorb and commit
++                if (e.early_draw) {
++                    try e.draw(e.last_logits, e.last_cand, 1, prompt.len, &first);
++                    drawn = true;
++                    if (e.pass_times) pw[3] = try e.passLap(&t_pw);
++                }
+             }
+             try e.f.th.copy(seq.last_streams.?.ptr, pb.b.streams + (R - 1) * Wd * 2, Wd * 2);
+             if (e.digest) try e.chunkDigest(chunk, R, if (final) lg.? else null);
+@@ -1268,10 +1316,11 @@ pub const Engine = struct {
+         if (e.prof) |p| p.summary(e.rank, "prefill");
+         if (e.f.dump) |dm| dm.setChunk(null);
+         e.f.finishMedia(seq);
+-        var first: [1]u32 = undefined;
+-        try e.draw(e.last_logits, e.last_cand, 1, prompt.len, &first);
++        if (!drawn) {
++            try e.draw(e.last_logits, e.last_cand, 1, prompt.len, &first);
++            if (e.pass_times) pw[3] = try e.passLap(&t_pw);
++        }
+         if (e.pass_times) {
+-            pw[3] = try e.passLap(&t_pw);
+             if (e.rank == 0) std.log.info("prefillWith {d} tokens{s}{s}: restore {d:.1} ms, {d} forwards {d:.1} ms, absorbs + commits {d:.1} ms, draw {d:.1} ms", .{ prompt.len, if (o.resume_from != null) " (resumed)" else "", if (o.keep_at != null) " (kept)" else "", pw[0], pw_chunks, pw[1], pw[2], pw[3] });
+         }
+         return .{ .first = first[0], .kept = kept };
+@@ -1330,8 +1379,13 @@ pub const Engine = struct {
+             try e.f.reset(p.seq);
+             windows[i] = .{ .seq = p.seq, .tokens = p.prompt };
+         }
++        e.f.ngram_late_ok = e.f.ngram_late;
++        defer e.f.endNgramLate();
+         _ = try e.f.stageMany(windows[0..n], pb, &segs);
+         const lg = (try e.f.computeSegs(segs[0..n], pb, true)).?;
++        e.f.endNgramLate();
++        // TF_FLASHNEXT_EARLY_DRAW: each prompt's first token now, ahead of the burst's MTP absorb and commits
++        if (e.early_draw) try e.drawBurst(prompts, lg, firsts);
+         for (prompts, segs[0..n]) |p, sg| try e.f.th.copy(p.seq.last_streams.?.ptr, pb.b.streams + (sg.a1 - 1) * Wd * 2, Wd * 2);
+         if (use_mtp) {
+             // each prompt's MTP rows: its next tokens over the main model's streams of its rows (a prompt of one row has none)
+@@ -1350,9 +1404,14 @@ pub const Engine = struct {
+             }
+         }
+         for (prompts, segs[0..n]) |p, sg| try e.f.commitAt(p.seq, pb, sg.a1 - sg.a0, sg.a1 - sg.a0, sg.a0);
++        if (!e.early_draw) try e.drawBurst(prompts, lg, firsts);
++    }
++
++    /// prefillMany's draws: each prompt's first token from its row of the burst's logits `lg`, with its sampling.
++    fn drawBurst(e: *Engine, prompts: []const ManyPrompt, lg: u64, firsts: []u32) !void {
+         for (prompts, 0..) |p, i| {
+             const s: ?lanes.Sampling = if (p.sampling) |x| (if (x.temperature > 0) x else null) else null;
+-            try e.drawRows(lg, pb.b.cand_all, n, i, 1, p.prompt.len, s, firsts[i .. i + 1]);
++            try e.drawRows(lg, e.pbuf.b.cand_all, prompts.len, i, 1, p.prompt.len, s, firsts[i .. i + 1]);
+         }
+     }
+ 
+diff --git a/zig/src/families/flashnext/cuda_forward.zig b/zig/src/families/flashnext/cuda_forward.zig
+index 9a5c07f..a5c7be8 100644
+--- a/zig/src/families/flashnext/cuda_forward.zig
++++ b/zig/src/families/flashnext/cuda_forward.zig
+@@ -547,6 +547,17 @@ pub const Forward = struct {
+     mtp_q4: ?*const @import("cuda_mtp_q4.zig").Table = null,
+     /// on unless TF_FLASHNEXT_GLUE_FUSE=0: prompt read-outs' up projection and mix in one pass (`_hc_up_mix`)
+     up_mix: bool = false,
++    /// TF_FLASHNEXT_PROMPT_HEAD_SKIP=1: a one-prompt pass's MTP head stops after its layer (its cache written) as a
++    /// burst's always did: nothing reads the draft head's logits of a prompt pass (mtp.computeSegs)
++    prompt_head_skip: bool = false,
++    /// TF_FLASHNEXT_NGRAM_LATE=1: a prompt pass's host n-gram gather (stageMany) waits until the chunk's embedding and
++    /// the layers before the first n-gram layer are launched (layerForward, stageNgramLate), so its page faults run
++    /// beside their GPU time; the same rows into the same `ple_v` before the n-gram block reads them. `ngram_late_ok`:
++    /// set by the prompt passes (forward, Engine.prefillMany) around their stage and compute; `ngram_pending`: the
++    /// deferred gather until then (endNgramLate clears both, whatever happens)
++    ngram_late: bool = false,
++    ngram_late_ok: bool = false,
++    ngram_pending: ?struct { x: *const Bufs, R: usize } = null,
+     /// on unless TF_FLASHNEXT_UPMIX_DECODE=0: decode windows' layer read-outs on `_hc_up_mix` at BM 32 too;
+     /// `layer_ro` marks a layer's read-out (hcBlock) apart from the final mixer's, whose 32-group sums of mixed feed
+     /// the MTP draft head's 4-bit matmul
+@@ -1244,12 +1255,26 @@ pub const Forward = struct {
+             a.* = @intCast(t);
+         };
+         try f.upload(x.b.ids, 0, R * 4);
++        // TF_FLASHNEXT_NGRAM_LATE: a prompt pass's host-gathered n-gram rows wait for layerForward's first n-gram layer,
++        // so the gather's page faults run while the GPU computes the embedding and the layers before it
++        if (f.ngram_late_ok and x.b.prefill and f.ngramOnHost()) {
++            f.ngram_pending = .{ .x = x, .R = R };
++        } else try f.stageNgram(segs[0..windows.len], x, R);
++        for (windows) |w| w.seq.staged = true;
++        try f.staged.record(f.s);
++        if (!x.b.prefill and f.round != null and f.g.linear_layers > 0) try f.roundTables(segs[0..windows.len], 1 - f.cur_par);
++        return R;
++    }
++
++    /// stageMany's n-gram rows: each n-gram layer's ids from every stream's history and window, its rows gathered into
++    /// the pinned buffer and uploaded (a host table) or gathered on the device (W4's Gather), into x.b.ple_v.
++    fn stageNgram(f: *Forward, segs: []const Seg, x: *const Bufs, R: usize) !void {
+         const rows_at = std.mem.alignForward(usize, f.pin_rows * 4, 256);
+         for (f.w.layers) |l| if (l.ple) |p| {
+             const heads = p.ngram.heads;
+             const nid = try f.gpa.alloc(i64, R * heads);
+             defer f.gpa.free(nid);
+-            for (segs[0..windows.len]) |sg| try p.ngram.ids(sg.seq.st.history[0 .. p.ngram.n - 1], sg.seq.window.items, nid[sg.a0 * heads .. sg.a1 * heads]);
++            for (segs) |sg| try p.ngram.ids(sg.seq.st.history[0 .. p.ngram.n - 1], sg.seq.window.items, nid[sg.a0 * heads .. sg.a1 * heads]);
+             const table = &(f.w.table orelse return error.NoNgramTable);
+             if (table.gpu != null) {
+                 // the ids on the device, then the rank's heads' rows gathered there (W4's Gather, the host bits)
+@@ -1262,10 +1287,31 @@ pub const Forward = struct {
+             if (f.ngh) |h| try h.gather(nid, @alignCast(out)) else try table.gather(nid, @alignCast(out));
+             try f.upload(x.b.ple_v, rows_at, R * heads * table.width * 2);
+         };
+-        for (windows) |w| w.seq.staged = true;
++    }
++
++    /// The n-gram rows come from a host table (the layers have an n-gram block and the table is not on the device).
++    fn ngramOnHost(f: *const Forward) bool {
++        const t = f.w.table orelse return false;
++        if (t.gpu != null) return false;
++        for (f.w.layers) |l| if (l.ple != null) return true;
++        return false;
++    }
++
++    /// The deferred n-gram rows of the prompt pass in flight (TF_FLASHNEXT_NGRAM_LATE), gathered and uploaded now:
++    /// before the first n-gram layer's block reads them, after the pinned buffer's last copies are done.
++    fn stageNgramLate(f: *Forward, segs: []const Seg, x: *const Bufs, R: usize) !void {
++        const pp = f.ngram_pending orelse return;
++        f.ngram_pending = null;
++        if (pp.x != x or pp.R != R) return error.NgramLateMismatch;
++        try f.staged.synchronize();
++        try f.stageNgram(segs, x, R);
+         try f.staged.record(f.s);
+-        if (!x.b.prefill and f.round != null and f.g.linear_layers > 0) try f.roundTables(segs[0..windows.len], 1 - f.cur_par);
+-        return R;
++    }
++
++    /// A prompt pass ended (or failed): nothing of its deferred n-gram gather outlives it.
++    pub fn endNgramLate(f: *Forward) void {
++        f.ngram_late_ok = false;
++        f.ngram_pending = null;
+     }
+ 
+     /// forward.stage for one stream (its rows from 0).
+@@ -1290,6 +1336,8 @@ pub const Forward = struct {
+             f.pf_moe = prefetchHc(if (i + 1 < f.w.layers.len) &f.w.layers[i + 1].attn_hc else &f.w.mixer);
+             pending = try f.layerForward(layer, segs, x, R, pending, false);
+         }
++        // a deferred n-gram gather is staged by the first n-gram layer above: one still pending was never uploaded
++        if (f.ngram_pending != null) return error.NgramLateUnstaged;
+         return f.finishSegs(&f.w.mixer, x, R, pending.?, logits, segs);
+     }
+ 
+@@ -1313,6 +1361,8 @@ pub const Forward = struct {
+ 
+     /// The window `tokens` at st.pos ..: staged, then computed (Python forward; the state commits later).
+     pub fn forward(f: *Forward, seq: *Seq, x: *const Bufs, tokens: []const u32, logits: bool) !?u64 {
++        f.ngram_late_ok = f.ngram_late and x.b.prefill;
++        defer f.endNgramLate();
+         try f.stage(seq, x, tokens);
+         return f.compute(seq, x, tokens.len, logits);
+     }
+@@ -1332,6 +1382,7 @@ pub const Forward = struct {
+             // the n-gram block runs on every row (its conv reads the rows before each): the halves gathered first
+             if (sp) |q| try f.gatherRows(b.h, q, g.wide() * 2, .bf16, 2);
+             try f.mark(.hc_writeback);
++            if (f.ngram_pending != null) try f.stageNgramLate(segs, x, R);
+             try f.pleBlock(p, segs, x, R);
+             try f.mark(.ple);
+             try f.putLayer(layer, "ple_emb", b.ple_emb, R * g.ple_dim * 2);
+diff --git a/zig/src/families/flashnext/cuda_mtp.zig b/zig/src/families/flashnext/cuda_mtp.zig
+index 182bf4a..0da1c24 100644
+--- a/zig/src/families/flashnext/cuda_mtp.zig
++++ b/zig/src/families/flashnext/cuda_mtp.zig
+@@ -153,8 +153,9 @@ pub fn computeSegs(f: *Forward, segs: []const fwd.Seg, x: *const Bufs) !u64 {
+     f.pf_moe = Forward.prefetchOf(m.mixer.down);
+     const pending = try f.layerForward(&m.layer, segs, x, n, null, true);
+     // several prompts in one pass: the head's cache is written by the layer above and nothing reads the draft
+-    // head's logits of a prompt pass (the drafts come later, from the prompts' last rows), so stop here
+-    if (b.prefill and k > 1) return b.logits;
++    // head's logits of a prompt pass (the drafts come later, from the prompts' last rows), so stop here; one prompt
++    // too with TF_FLASHNEXT_PROMPT_HEAD_SKIP (every caller discards them), unless a dump records the head
++    if (b.prefill and (k > 1 or (f.prompt_head_skip and f.dump == null))) return b.logits;
+     _ = try f.finish(&m.mixer, x, n, pending, false);
+     // prompt buffers mix the last row into row 0; a window's last row is row n - 1; several streams' last rows
+     // gathered into one block (mtp_e and mtp_xe are free by now: Python's index_select)
+diff --git a/zig/src/families/flashnext/cuda_native.zig b/zig/src/families/flashnext/cuda_native.zig
+index 5d81503..4a39965 100644
+--- a/zig/src/families/flashnext/cuda_native.zig
++++ b/zig/src/families/flashnext/cuda_native.zig
+@@ -399,8 +399,9 @@ fn settingsText(gpa: std.mem.Allocator, base: []const u8, snapshot: [32]u8, kern
+     const fill = getenv("TF_FLASHNEXT_FILL") orelse "0";
+     const fill_layers = getenv("TF_FLASHNEXT_FILL_LAYERS") orelse "8";
+     const retime = getenv("TF_FLASHNEXT_COST_RETIME") orelse "0";
+-    return std.fmt.allocPrint(gpa, "flashnext tp={d} checkpoint={s} snapshot={x} context={d} parallel={d} drafts={} depth={d} window={d} confidence={d}/{d} yarn={s} fill={s}/{s} retime={s} kv={s} kernels={x}", .{
+-        o.tp, base, snapshot, o.context, o.parallel, o.drafts, depth, @import("cuda_engine.zig").windowSetting(lane_backend.max_rows), @import("cuda_engine.zig").confidenceSetting(), @import("cuda_engine.zig").productStreams(), yt, fill, fill_layers, retime, @tagName(o.kv_dtype), kernel_set,
++    const head_skip = getenv("TF_FLASHNEXT_PROMPT_HEAD_SKIP") orelse "0";
++    return std.fmt.allocPrint(gpa, "flashnext tp={d} checkpoint={s} snapshot={x} context={d} parallel={d} drafts={} depth={d} window={d} confidence={d}/{d} yarn={s} fill={s}/{s} retime={s} head_skip={s} kv={s} kernels={x}", .{
++        o.tp, base, snapshot, o.context, o.parallel, o.drafts, depth, @import("cuda_engine.zig").windowSetting(lane_backend.max_rows), @import("cuda_engine.zig").confidenceSetting(), @import("cuda_engine.zig").productStreams(), yt, fill, fill_layers, retime, head_skip, @tagName(o.kv_dtype), kernel_set,
+     });
+ }
+ 

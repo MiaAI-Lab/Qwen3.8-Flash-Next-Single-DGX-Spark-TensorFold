@@ -17,6 +17,10 @@ Script and tool fixes only; the image and `patches/` are unchanged.
   [naeemakhtar110](https://github.com/naeemakhtar110) (#38). Test: `tools/test_bench_stats.py`.
 - The ready summary of `start.sh` names the KV cache type in use (it always said `bf16 KV`). Authored by
   [mcclanahanaman](https://github.com/mcclanahanaman) (#51).
+- `patches/0026-flash-next-first-token-sooner`, `TF_FLASHNEXT_EARLY_DRAW=1`, `TF_FLASHNEXT_PROMPT_HEAD_SKIP=1` and
+  `TF_FLASHNEXT_NGRAM_LATE=1`: a prompt's first token is drawn before the last chunk's MTP absorb and commit, a
+  one-prompt pass's MTP head stops after its layer, and the host n-gram gather runs beside the first layers. Cold 1k
+  and 3k time to first token -3 to -4%; replies byte-identical (`tensorfold first-token-check`).
 
 ## [1.0.0] - 2026-10-08
 
