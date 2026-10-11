@@ -3,6 +3,13 @@
 Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:zig-db28187`, built by
 `scripts/prepare.sh` from TensorFold `db281878` plus `patches/`.
 
+## Unreleased
+
+- `patches/0021-flash-next-sliced-fill-one-at-a-time` (fix, `TF_FLASHNEXT_FILL=1` only; the setting stays off by
+  default): two or more prompts filling at once failed every one of them with `PromptBuffersBusy` (empty replies after
+  ~0.03 s); they now fill one after another. A prompt-cache resume no longer runs its MTP absorb in prompt buffers
+  another prompt's open chunk holds (a silent wrong reply). Replies equal `FILL=0`'s.
+
 ## [1.0.0] - 2026-10-08
 
 TensorFold's Zig engine (`tensorfold-native`, TP=1). Engine `37763df`, merged into `zig-single` as `453439d`

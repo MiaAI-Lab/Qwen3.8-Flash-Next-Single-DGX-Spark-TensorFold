@@ -330,9 +330,15 @@ the model was still thinking.
 
 ## What the patches are
 
-`patches/*.patch` is the Zig Flash Next CUDA engine against TensorFold `db281878` (the `zig-flashnext` pin), applied
-with `git apply` in the checkout root. They are the engine, not speed patches on a Python package. Drafts are still
-checked: a drafted reply matches `"draft": false`.
+`patches/0001`-`0009` are the Zig Flash Next CUDA engine against TensorFold `db281878` (the `zig-flashnext` pin),
+applied with `git apply` in the checkout root. They are the engine, not speed patches on a Python package. Drafts are
+still checked: a drafted reply matches `"draft": false`.
+
+Speed patches on top of the engine (each keeps every reply byte-identical):
+
+| Patch | What it changes |
+| --- | --- |
+| `0021-flash-next-sliced-fill-one-at-a-time` | fix for `TF_FLASHNEXT_FILL=1` (off by default): prompts that arrive together fill one after another on the one set of prompt buffers, and a resume's MTP absorb runs when its own first chunk opens |
 
 ## Checks
 
