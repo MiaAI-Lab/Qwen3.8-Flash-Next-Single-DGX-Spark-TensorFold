@@ -3,6 +3,14 @@
 Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:zig-db28187`, built by
 `scripts/prepare.sh` from TensorFold `db281878` plus `patches/`.
 
+## Unreleased
+
+- `patches/0024-flash-next-prompt-fp8-tiles-int4-gate-up`, `TF_FLASHNEXT_FP8_PROMPT_TILES=1` and
+  `TF_FLASHNEXT_INT4_PROMPT_GATE_UP=1` (the defaults): prompt chunks run the wide block-FP8 projections on 128 x 128
+  tiles and the fused split-K form in 2 stages, and the routed experts' gate/up on `int4_prompt_kernel` with 64-pair
+  items. Cold prefill +5.5% at 8k and 32k, +5.3% at 128k; every reply byte-identical (`fp8-tiles-check`,
+  `int4-check`).
+
 ## [1.0.0] - 2026-10-08
 
 TensorFold's Zig engine (`tensorfold-native`, TP=1). Engine `37763df`, merged into `zig-single` as `453439d`

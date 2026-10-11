@@ -74,6 +74,10 @@ export TF_FLASHNEXT_DEPTH="${TF_FLASHNEXT_DEPTH:-15}"
 # TF_FLASHNEXT_CONFIDENCE=0.5 forces the per-draft rule at every width.
 export TF_FLASHNEXT_PRODUCT_STREAMS="${TF_FLASHNEXT_PRODUCT_STREAMS:-2}"
 export TF_FLASHNEXT_PREFILL_TAIL="${TF_FLASHNEXT_PREFILL_TAIL:-512}"
+# Prompt chunks (patches/0024): the wide block-FP8 projections on 128 x 128 tiles and the fused split-K form in 2
+# stages; the routed experts' gate/up on the int4 prompt kernel. The same bits. 0 / 0: the stock kernels.
+export TF_FLASHNEXT_FP8_PROMPT_TILES="${TF_FLASHNEXT_FP8_PROMPT_TILES:-1}"
+export TF_FLASHNEXT_INT4_PROMPT_GATE_UP="${TF_FLASHNEXT_INT4_PROMPT_GATE_UP:-1}"
 # KV cache (--kv-dtype). fp8 is the default: about 1.84x the pool of bf16, and lossy (~98.8% top-1 agreement with a
 # bf16 cache, so a free-running reply can differ). bf16 is exact: KV_DTYPE=bf16. FP8 works together with --vision.
 KV_DTYPE="${KV_DTYPE:-fp8}"

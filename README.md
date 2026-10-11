@@ -298,6 +298,7 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `TENSORFOLD_MEMORY_RESERVE_GIB` | `10` | kept free when the engine sizes the pool. `prepare.sh` and `start.sh` refuse a Spark below this |
 | `TF_FLASHNEXT_PRODUCT_STREAMS` | `2` | running-product draft stop at this many streams or fewer; confidence 0.5 above it |
 | `TF_FLASHNEXT_PREFILL_TAIL` | `512` | a short last prompt chunk joins the previous one |
+| `TF_FLASHNEXT_FP8_PROMPT_TILES` / `TF_FLASHNEXT_INT4_PROMPT_GATE_UP` | `1` / `1` | prompt chunks' block-FP8 projections on the larger tiles, and the experts' gate/up on the int4 prompt kernel (`patches/0024`). `0` / `0`: the stock tiles and `int4_kernel` |
 | `MODEL_REVISION` | `14642741…` | the checkpoint commit this recipe serves |
 
 The Python recipe's int8 KV and SSD n-gram reader are gone. KV is fp8 (or bf16), and the n-gram table is on the GPU.
@@ -330,9 +331,15 @@ the model was still thinking.
 
 ## What the patches are
 
-`patches/*.patch` is the Zig Flash Next CUDA engine against TensorFold `db281878` (the `zig-flashnext` pin), applied
-with `git apply` in the checkout root. They are the engine, not speed patches on a Python package. Drafts are still
-checked: a drafted reply matches `"draft": false`.
+`patches/0001`-`0009` are the Zig Flash Next CUDA engine against TensorFold `db281878` (the `zig-flashnext` pin),
+applied with `git apply` in the checkout root. They are the engine, not speed patches on a Python package. Drafts are
+still checked: a drafted reply matches `"draft": false`.
+
+Speed patches on top of the engine (each keeps every reply byte-identical):
+
+| Patch | What it changes |
+| --- | --- |
+| `0024-flash-next-prompt-fp8-tiles-int4-gate-up` | prompt chunks: the wide block-FP8 projections on 128 x 128 tiles and the fused split-K form in 2 stages (`TF_FLASHNEXT_FP8_PROMPT_TILES`, `fp8-tiles-check`), and the routed experts' gate/up on `int4_prompt_kernel` with 64-pair items (`TF_FLASHNEXT_INT4_PROMPT_GATE_UP`, `int4-check`) |
 
 ## Checks
 
