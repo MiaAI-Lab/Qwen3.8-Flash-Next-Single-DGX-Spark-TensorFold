@@ -298,6 +298,7 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `TENSORFOLD_MEMORY_RESERVE_GIB` | `10` | kept free when the engine sizes the pool. `prepare.sh` and `start.sh` refuse a Spark below this |
 | `TF_FLASHNEXT_PRODUCT_STREAMS` | `2` | running-product draft stop at this many streams or fewer; confidence 0.5 above it |
 | `TF_FLASHNEXT_PREFILL_TAIL` | `512` | a short last prompt chunk joins the previous one |
+| `TF_FLASHNEXT_PREFILL_ROWS` | `4096` | prompt rows a chunk (the engine's one-GPU default is 2048); any chunking gives the same bits |
 | `MODEL_REVISION` | `14642741…` | the checkpoint commit this recipe serves |
 
 The Python recipe's int8 KV and SSD n-gram reader are gone. KV is fp8 (or bf16), and the n-gram table is on the GPU.

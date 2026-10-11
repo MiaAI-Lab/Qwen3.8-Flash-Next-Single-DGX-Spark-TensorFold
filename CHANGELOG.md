@@ -3,6 +3,11 @@
 Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:zig-db28187`, built by
 `scripts/prepare.sh` from TensorFold `db281878` plus `patches/`.
 
+## Unreleased
+
+- `TF_FLASHNEXT_PREFILL_ROWS=4096` (was the engine's 2,048 on one GPU): prompts run in 4,096-row chunks. Cold prefill
+  +0.3 to +3% at 32k-128k; every reply byte-identical (any chunking gives the same bits).
+
 ## [1.0.0] - 2026-10-08
 
 TensorFold's Zig engine (`tensorfold-native`, TP=1). Engine `37763df`, merged into `zig-single` as `453439d`

@@ -74,6 +74,8 @@ export TF_FLASHNEXT_DEPTH="${TF_FLASHNEXT_DEPTH:-15}"
 # TF_FLASHNEXT_CONFIDENCE=0.5 forces the per-draft rule at every width.
 export TF_FLASHNEXT_PRODUCT_STREAMS="${TF_FLASHNEXT_PRODUCT_STREAMS:-2}"
 export TF_FLASHNEXT_PREFILL_TAIL="${TF_FLASHNEXT_PREFILL_TAIL:-512}"
+# Prompt rows a chunk: 4096 on one Spark (the engine's default is 2048; the same bits either way).
+export TF_FLASHNEXT_PREFILL_ROWS="${TF_FLASHNEXT_PREFILL_ROWS:-4096}"
 # KV cache (--kv-dtype). fp8 is the default: about 1.84x the pool of bf16, and lossy (~98.8% top-1 agreement with a
 # bf16 cache, so a free-running reply can differ). bf16 is exact: KV_DTYPE=bf16. FP8 works together with --vision.
 KV_DTYPE="${KV_DTYPE:-fp8}"
