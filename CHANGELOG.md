@@ -17,6 +17,9 @@ Script and tool fixes only; the image and `patches/` are unchanged.
   [naeemakhtar110](https://github.com/naeemakhtar110) (#38). Test: `tools/test_bench_stats.py`.
 - The ready summary of `start.sh` names the KV cache type in use (it always said `bf16 KV`). Authored by
   [mcclanahanaman](https://github.com/mcclanahanaman) (#51).
+- `patches/0025-flash-next-cost-points-timed-again`, `TF_FLASHNEXT_COST_RETIME=4`: the boot cost table's points are timed
+  again after the first pass, each keeping its fastest median, so a page-compaction burst while the weights settle no
+  longer prices a decode shape 20-40% high for the life of the serve. Boot about 8 s longer; replies byte-identical.
 
 ## [1.0.0] - 2026-10-08
 

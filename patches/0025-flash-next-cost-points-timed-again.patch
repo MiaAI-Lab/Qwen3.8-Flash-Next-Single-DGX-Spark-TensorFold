@@ -1,0 +1,374 @@
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 5e40d11..c7ac63f 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -173,6 +173,8 @@ pub fn Lanes(comptime E: type) type {
+         /// the head's chain at most while two or more streams draft in one call (TF_FLASHNEXT_DRAFT_DEPTH_SHARED; 0:
+         /// `depth`): deep chains cost every stream in the shared step what one stream gains
+         depth_shared: usize = 0,
++        /// passes at most that time the cost points again after the first (measure; TF_FLASHNEXT_COST_RETIME, 0: none)
++        retime: usize = 0,
+ 
+         pub fn init(gpa: std.mem.Allocator, e: *E, drafting: bool, context: usize, window: usize) Self {
+             const late = if (std.c.getenv("TF_FLASHNEXT_KEEP_LATE")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+@@ -1051,9 +1053,16 @@ pub fn Lanes(comptime E: type) type {
+         /// (real text, at least 19 + depth + 1 tokens). A lone stream's wider copy windows are never priced: the
+         /// planner allocates the head's rows against these tables. Every call is the same on both ranks, so a
+         /// two-rank engine's collectives stay in step while each rank times itself.
++        ///
++        /// With `retime` > 0 (TF_FLASHNEXT_COST_RETIME) every point is timed again after that first pass, each keeping
++        /// its fastest median, until a pass finds none of them faster than its best by more than `retime_tol` (at
++        /// most `retime` passes; two ranks time every point in each of the `retime` passes, so their calls stay in
++        /// step). The first seconds after the load can run a stretch of rounds slow (the kernel compacting memory
++        /// beside the GPU), and that only ever adds time: one such stretch priced a boot's shared 32-row round at
++        /// 88-98 ms against 70-72, and the planner then planned four-stream rounds worse for the server's life.
++        /// `retime` 0: the first pass alone, its calls in the order they always ran.
+         pub fn measure(self: *Self, io: std.Io, ids: []const u32) !void {
+             if (!self.drafting) return;
+-            const reps = 5;
+             const e = self.e;
+             const head = @min(self.depth, self.window - 1) + 1;
+             // 19 prompt rows (the head absorbs 18): a multiple of 16 rows asks the kernel set for a variant
+@@ -1067,16 +1076,48 @@ pub fn Lanes(comptime E: type) type {
+             for (0..32) |_| try c.round(1, cont, null, 0); // the GPU at its working clocks before any window is timed
+             var verify_all: [max_rows + 1]f64 = @splat(0);
+             const verify = verify_all[0 .. head + 1];
+-            var times: [reps + 1]f64 = undefined;
+-            for (1..head + 1) |w| {
+-                for (&times) |*x| try c.round(w, cont, .{ .io = io, .out = x }, 0);
+-                verify[w] = median(times[1..]);
+-            }
++            for (1..head + 1) |w| verify[w] = try timeWindow(&c, io, w, cont);
+             var chain: [2]f64 = undefined;
+             const deep = @max(2, @min(8, head - 1));
+-            for ([_]usize{ 1, deep }, &chain) |levels, *out| {
+-                for (&times) |*x| x.* = try c.chain(io, levels);
+-                out.* = median(times[1..]);
++            const levels = [2]usize{ 1, deep };
++            for (levels, &chain) |l, *out| out.* = try timeChain(&c, io, l);
++            // shared rounds: n streams' full head windows in one forward
++            var counts: [shared_points]usize = undefined;
++            self.shared_count = 0;
++            var n: usize = 2;
++            while (n <= self.streams and self.shared_count < shared_points) : (n = if (n * 2 > self.streams and n < self.streams) self.streams else n * 2) {
++                counts[self.shared_count] = n;
++                self.shared[self.shared_count] = .{ .width = @intCast(n * head), .ms = try self.timeShared(io, ids, n, head) };
++                self.shared_count += 1;
++            }
++            if (self.retime > 0) {
++                const ranks: usize = if (comptime @hasField(E, "world")) e.world else 1;
++                var open_v: [max_rows + 1]bool = @splat(true);
++                var open_c = [2]bool{ true, true };
++                var open_s: [shared_points]bool = @splat(true);
++                var timed: usize = 0;
++                var passes: usize = 0;
++                while (passes < self.retime) {
++                    passes += 1;
++                    var any = false;
++                    for (1..head + 1) |w| if (open_v[w] or ranks > 1) {
++                        open_v[w] = keepFastest(&verify[w], try timeWindow(&c, io, w, cont));
++                        any = any or open_v[w];
++                        timed += 1;
++                    };
++                    for (levels, &chain, &open_c) |l, *best, *open| if (open.* or ranks > 1) {
++                        open.* = keepFastest(best, try timeChain(&c, io, l));
++                        any = any or open.*;
++                        timed += 1;
++                    };
++                    for (self.shared[0..self.shared_count], counts[0..self.shared_count], open_s[0..self.shared_count]) |*s, streams, *open| if (open.* or ranks > 1) {
++                        open.* = keepFastest(&s.ms, try self.timeShared(io, ids, streams, head));
++                        any = any or open.*;
++                        timed += 1;
++                    };
++                    if (!any and ranks == 1) break;
++                }
++                std.log.info("cost timing: {d} points timed again over {d} more passes (TF_FLASHNEXT_COST_RETIME={d})", .{ timed, passes, self.retime });
+             }
+             const k = @import("core").draft_depth.Costs.measured(verify, (chain[1] - chain[0]) / @as(f64, @floatFromInt(deep - 1)));
+             self.cost_count = 0;
+@@ -1085,23 +1126,63 @@ pub fn Lanes(comptime E: type) type {
+                 self.cost_count += 1;
+             }
+             self.mtp_ms = k.level;
+-            // shared rounds: n streams' full head windows in one forward
+-            self.shared_count = 0;
+-            var n: usize = 2;
+-            while (n <= self.streams and self.shared_count < shared_points) : (n = if (n * 2 > self.streams and n < self.streams) self.streams else n * 2) {
+-                var many = try Costing(E).init(self.gpa, e, @min(self.context, 2048), n, ids[0..lead]);
+-                defer many.deinit();
+-                try many.round(1, cont, null, 0);
+-                // a whole shared round: the forward, the draws and the batched head drafting every stream's next
+-                // window (C3: the allocator weighs rows against what the round costs, the head included)
+-                for (&times) |*x| try many.round(head, cont, .{ .io = io, .out = x }, head - 1);
+-                self.shared[self.shared_count] = .{ .width = @intCast(n * head), .ms = median(times[1..]) };
+-                self.shared_count += 1;
+-            }
++        }
++
++        /// One stream's `w`-row window, timed (median of 5 after a warm one).
++        fn timeWindow(c: *Costing(E), io: std.Io, w: usize, cont: []const u32) !f64 {
++            var times: [6]f64 = undefined;
++            for (&times) |*x| try c.round(w, cont, .{ .io = io, .out = x }, 0);
++            return median(times[1..]);
++        }
++
++        /// One stream's head chaining `levels` drafts, timed (median of 5 after a warm one).
++        fn timeChain(c: *Costing(E), io: std.Io, levels: usize) !f64 {
++            var times: [6]f64 = undefined;
++            for (&times) |*x| x.* = try c.chain(io, levels);
++            return median(times[1..]);
++        }
++
++        /// A whole shared round of `n` streams' `head`-row windows on sequences of their own: the forward, the draws
++        /// and the batched head drafting every stream's next window (C3: the allocator weighs rows against what the
++        /// round costs, the head included), timed (median of 5 after a warm one).
++        fn timeShared(self: *Self, io: std.Io, ids: []const u32, n: usize, head: usize) !f64 {
++            const lead = 19;
++            const cont = ids[lead..];
++            var many = try Costing(E).init(self.gpa, self.e, @min(self.context, 2048), n, ids[0..lead]);
++            defer many.deinit();
++            try many.round(1, cont, null, 0);
++            var times: [6]f64 = undefined;
++            for (&times) |*x| try many.round(head, cont, .{ .io = io, .out = x }, head - 1);
++            return median(times[1..]);
+         }
+     };
+ }
+ 
++/// TF_FLASHNEXT_COST_RETIME at most: passes that time the cost points again after the first.
++pub const max_retime = 8;
++/// A point timed again is settled when its new median is not under its best so far by more than this fraction.
++const retime_tol = 0.02;
++
++/// `best` = the faster of itself and `ms`; true when `ms` was faster by more than retime_tol (the point may be faster
++/// still: time it again). A slower median never raises the price.
++fn keepFastest(best: *f64, ms: f64) bool {
++    const faster = ms < best.* * (1 - retime_tol);
++    best.* = @min(best.*, ms);
++    return faster;
++}
++
++/// TF_FLASHNEXT_COST_RETIME (`v`, the environment's value): unset 0 (the first pass alone), else a count 0..max_retime;
++/// anything else is refused (error.BadSetting, logged with the setting's name), never read as 0.
++pub fn retimeSetting(v: ?[]const u8) !usize {
++    const s = v orelse return 0;
++    const n = std.fmt.parseInt(usize, s, 10) catch max_retime + 1;
++    if (n > max_retime) {
++        std.log.warn("TF_FLASHNEXT_COST_RETIME={s} refused: passes 0..{d} (0: the costs timed once)", .{ s, max_retime });
++        return error.BadSetting;
++    }
++    return n;
++}
++
+ /// Shared rounds' cost points at most (2, 4, ... 64 streams).
+ const shared_points = 8;
+ /// Streams one shared forward holds at most (the engine's round segments).
+@@ -1262,6 +1343,30 @@ pub const Toy = struct {
+     seqs: usize = 0,
+     forwards: usize = 0,
+     head_err: u64 = 1,
++    /// test hooks (measure's re-timing): the next `slow_shared` shared verifies (2+ windows) and the next
++    /// `slow_single` one-window verifies each spin `slow_ms` first, the next `slow_chain` one-stream head chains 2 ms a
++    /// level; `calls`, when set, logs every verify (windows x 1000 + the first window's rows) and every draft call
++    /// (-(requests x 1000 + the first request's count) - 1)
++    slow_shared: usize = 0,
++    slow_single: usize = 0,
++    slow_chain: usize = 0,
++    slow_ms: u64 = 20,
++    slow_io: ?std.Io = null,
++    calls: ?*std.ArrayList(i64) = null,
++    /// ranks of the engine it stands for (cuda_engine's Engine.world): 2 makes measure time as two ranks do
++    world: usize = 1,
++
++    fn spin(t: *Toy, counter: *usize, ms: u64) void {
++        const io = t.slow_io orelse return;
++        if (counter.* == 0) return;
++        counter.* -= 1;
++        const t0 = std.Io.Timestamp.now(io, .awake);
++        while (t0.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds < ms * std.time.ns_per_ms) {}
++    }
++
++    fn logCall(t: *Toy, code: i64) !void {
++        if (t.calls) |c| try c.append(t.gpa, code);
++    }
+ 
+     pub fn next(done: []const u32, extra: []const u32, s: ?lanes.Sampling, position: u64) u32 {
+         var h = std.hash.Wyhash.init(11);
+@@ -1451,6 +1556,8 @@ pub const Toy = struct {
+ 
+     pub fn verifyMany(t: *Toy, windows: []const Window) !void {
+         if (windows.len == 0 or windows.len > max_streams) return error.ToyMisuse;
++        try t.logCall(@intCast(windows.len * 1000 + windows[0].tokens.len));
++        t.spin(if (windows.len > 1) &t.slow_shared else &t.slow_single, t.slow_ms);
+         for (windows, 0..) |w, i| {
+             if (w.seq.tokens.items.len + w.tokens.len > w.seq.limit) return error.SeqFull;
+             t.round_windows[i] = .{ .seq = w.seq, .tokens = undefined, .n = w.tokens.len };
+@@ -1475,6 +1582,8 @@ pub const Toy = struct {
+         w.n = 0; // committed once
+     }
+     pub fn draftMany(t: *Toy, reqs: []DraftReq) !void {
++        if (reqs.len > 0) try t.logCall(-@as(i64, @intCast(reqs.len * 1000 + reqs[0].count)) - 1);
++        if (reqs.len == 1 and reqs[0].count > 0) t.spin(&t.slow_chain, 2 * reqs[0].count);
+         for (reqs) |*r| {
+             const q = r.seq;
+             q.head.shrinkRetainingCapacity(q.absorbed);
+@@ -1680,6 +1789,126 @@ test "costs are measured by the same calls a decode makes" {
+     for (b.costs[0..b.cost_count], 1..) |c, w| try std.testing.expectEqual(@as(u32, @intCast(w)), c.width);
+ }
+ 
++/// The Toy calls (Toy.calls' codes) of measure's points, each timed once, in the order the first pass has always
++/// timed them: windows 1..head (a warm round and five timed: a verify of one window, then a draft of none), the head
++/// chaining 1 and `deep` levels (six times a verify of one row, then the chain), then each shared point (its
++/// sequences' first draft, a warm round, then six rounds of n `head`-row windows, the head drafting head - 1 levels).
++fn pointCalls(gpa: std.mem.Allocator, out: *std.ArrayList(i64), head: usize, streams: usize) !void {
++    for (1..head + 1) |w| for (0..6) |_| try out.appendSlice(gpa, &.{ @intCast(1000 + w), -1001 });
++    for ([_]usize{ 1, @max(2, @min(8, head - 1)) }) |l| for (0..6) |_| try out.appendSlice(gpa, &.{ 1001, -@as(i64, @intCast(1000 + l)) - 1 });
++    var n: usize = 2;
++    var points: usize = 0;
++    while (n <= streams and points < shared_points) : (n = if (n * 2 > streams and n < streams) streams else n * 2) {
++        const k: i64 = @intCast(n * 1000);
++        try out.appendSlice(gpa, &.{ -k - 1, k + 1, -k - 1 });
++        for (0..6) |_| try out.appendSlice(gpa, &.{ k + @as(i64, @intCast(head)), -k - @as(i64, @intCast(head - 1)) - 1 });
++        points += 1;
++    }
++}
++
++/// measure's first pass on a Toy: the costing sequence's first draft, 32 warm rounds, then every point once.
++fn firstPassCalls(gpa: std.mem.Allocator, head: usize, streams: usize) !std.ArrayList(i64) {
++    var out: std.ArrayList(i64) = .empty;
++    errdefer out.deinit(gpa);
++    try out.append(gpa, -1001);
++    for (0..32) |_| try out.appendSlice(gpa, &.{ 1001, -1001 });
++    try pointCalls(gpa, &out, head, streams);
++    return out;
++}
++
++test "TF_FLASHNEXT_COST_RETIME=0 (unset) makes the first pass's calls alone, in the order they always ran" {
++    const gpa = std.testing.allocator;
++    var threaded: std.Io.Threaded = .init(gpa, .{});
++    defer threaded.deinit();
++    var want = try firstPassCalls(gpa, 7, 4);
++    defer want.deinit(gpa);
++    var ids: [64]u32 = undefined;
++    for (&ids, 0..) |*x, i| x.* = @intCast(i % 50);
++    for ([_]usize{ 0, 3 }) |retime| {
++        var log: std.ArrayList(i64) = .empty;
++        defer log.deinit(gpa);
++        var t: Toy = .{ .gpa = gpa, .calls = &log };
++        var b = Lanes(Toy).init(gpa, &t, true, 1 << 16, 7);
++        defer b.deinit();
++        b.streams = 4;
++        b.retime = retime;
++        try b.measure(threaded.io(), &ids);
++        if (retime == 0) {
++            try std.testing.expectEqualSlices(i64, want.items, log.items);
++        } else { // the same first pass, then points timed again
++            try std.testing.expect(log.items.len > want.items.len);
++            try std.testing.expectEqualSlices(i64, want.items, log.items[0..want.items.len]);
++        }
++        try std.testing.expectEqual(@as(usize, 0), t.seqs);
++    }
++}
++
++test "two ranks time every point in each of the TF_FLASHNEXT_COST_RETIME passes, so their calls stay in step" {
++    const gpa = std.testing.allocator;
++    var threaded: std.Io.Threaded = .init(gpa, .{});
++    defer threaded.deinit();
++    var want = try firstPassCalls(gpa, 7, 4);
++    defer want.deinit(gpa);
++    for (0..3) |_| try pointCalls(gpa, &want, 7, 4);
++    var log: std.ArrayList(i64) = .empty;
++    defer log.deinit(gpa);
++    // every verify a steady 1 ms and every chain 2 ms a level (a point timed again settles at once): one rank would
++    // stop after a pass, two time all three passes
++    var t: Toy = .{ .gpa = gpa, .calls = &log, .world = 2, .slow_shared = std.math.maxInt(usize), .slow_single = std.math.maxInt(usize), .slow_chain = std.math.maxInt(usize), .slow_ms = 1 };
++    t.slow_io = threaded.io();
++    var b = Lanes(Toy).init(gpa, &t, true, 1 << 16, 7);
++    defer b.deinit();
++    var ids: [64]u32 = undefined;
++    for (&ids, 0..) |*x, i| x.* = @intCast(i % 50);
++    b.streams = 4;
++    b.retime = 3;
++    try b.measure(threaded.io(), &ids);
++    try std.testing.expectEqualSlices(i64, want.items, log.items);
++}
++
++test "a first pass that ran a stretch of rounds slow is timed again and priced at the engine's own speed" {
++    const gpa = std.testing.allocator;
++    var threaded: std.Io.Threaded = .init(gpa, .{});
++    defer threaded.deinit();
++    var t: Toy = .{ .gpa = gpa };
++    var b = Lanes(Toy).init(gpa, &t, true, 1 << 16, 7);
++    defer b.deinit();
++    var ids: [64]u32 = undefined;
++    for (&ids, 0..) |*x, i| x.* = @intCast(i % 50);
++    b.streams = 4;
++    b.retime = 4;
++    // the first shared point's warm round and its six timed rounds each 20 ms slow (a boot's shared 32-row round
++    // timed at 88-98 ms against 70-72), and so the warm-up and window 1's rounds and both head chains (2 ms a
++    // level); every later round at the Toy's own microseconds
++    t.slow_io = threaded.io();
++    t.slow_shared = 7;
++    t.slow_single = 32 + 6;
++    t.slow_chain = 12;
++    try b.measure(threaded.io(), &ids);
++    try std.testing.expectEqual(@as(usize, 0), t.slow_shared + t.slow_single + t.slow_chain); // the slow stretch ran
++    try std.testing.expectEqual(@as(usize, 2), b.shared_count);
++    for (b.shared[0..b.shared_count]) |s| try std.testing.expect(s.ms < 10.0);
++    try std.testing.expect(b.costs[0].ms < 10.0);
++    try std.testing.expect(b.mtp_ms < 0.5);
++    try std.testing.expectEqual(@as(usize, 0), t.seqs);
++}
++
++test "a point timed again keeps its fastest median and is timed again only after a real gain" {
++    var best: f64 = 93.0;
++    try std.testing.expect(keepFastest(&best, 72.0)); // 23% faster: maybe faster still
++    try std.testing.expectEqual(@as(f64, 72.0), best);
++    try std.testing.expect(!keepFastest(&best, 71.0)); // within 2%: settled, the faster kept
++    try std.testing.expectEqual(@as(f64, 71.0), best);
++    try std.testing.expect(!keepFastest(&best, 90.0)); // a slow median never raises the price
++    try std.testing.expectEqual(@as(f64, 71.0), best);
++}
++
++test "TF_FLASHNEXT_COST_RETIME is a pass count 0..8, anything else refused" {
++    try std.testing.expectEqual(@as(usize, 0), try retimeSetting(null));
++    for ([_][]const u8{ "0", "4", "8" }, [_]usize{ 0, 4, 8 }) |v, n| try std.testing.expectEqual(n, try retimeSetting(v));
++    for ([_][]const u8{ "", "9", "-1", "x", "4 ", "1e1", "99999999999999999999999" }) |v| try std.testing.expectError(error.BadSetting, retimeSetting(v));
++}
++
+ test "a window wider than the head's chain prices the chain's rows only" {
+     const gpa = std.testing.allocator;
+     var threaded: std.Io.Threaded = .init(gpa, .{});
+diff --git a/zig/src/families/flashnext/cuda_native.zig b/zig/src/families/flashnext/cuda_native.zig
+index 440e9da..5d81503 100644
+--- a/zig/src/families/flashnext/cuda_native.zig
++++ b/zig/src/families/flashnext/cuda_native.zig
+@@ -92,6 +92,8 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const
+     const window: usize = if (getenv("TF_FLASHNEXT_WINDOW")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadWindow else lane_backend.max_rows;
+     if (window < depth + 1 or window > lane_backend.max_rows) return error.BadWindow;
+     if (o.drafts) std.log.info("copy windows: a lone stream verifies up to {d} rows (TF_FLASHNEXT_WINDOW; the MTP chain {d})", .{ window, depth + 1 });
++    // the cost points timed again after the first pass, at most this many passes (0: once; checked before the load)
++    const retime = try lane_backend.retimeSetting(getenv("TF_FLASHNEXT_COST_RETIME"));
+     if (o.tp == 2) {
+         // a rank stops on SIGTERM / SIGINT while it loads and, rank 1, while it follows (in a container it is PID 1,
+         // where a signal's default action is ignored); rank 0's server takes them over once it serves
+@@ -137,6 +139,7 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const
+     errdefer own.e.deinit();
+     own.lanes = lane_backend.Lanes(M.Engine).init(gpa, own.e, o.drafts, o.context, window);
+     own.lanes.depth = depth;
++    own.lanes.retime = retime;
+     // a shared forward's rows at most: the engine's decode buffers (streams x (depth + 1), or the window)
+     own.lanes.rows = if (@hasField(M.Engine, "buf")) own.e.buf.b.rows else streams * window;
+     own.lanes.streams = streams;
+@@ -395,8 +398,9 @@ fn settingsText(gpa: std.mem.Allocator, base: []const u8, snapshot: [32]u8, kern
+     const yt = if (yarn) |v| try std.fmt.bufPrint(&y, "{d}x{d}/ramp{d}/att{d}", .{ v.factor, v.original, v.ramp_positions, v.attention() }) else "off";
+     const fill = getenv("TF_FLASHNEXT_FILL") orelse "0";
+     const fill_layers = getenv("TF_FLASHNEXT_FILL_LAYERS") orelse "8";
+-    return std.fmt.allocPrint(gpa, "flashnext tp={d} checkpoint={s} snapshot={x} context={d} parallel={d} drafts={} depth={d} window={d} confidence={d}/{d} yarn={s} fill={s}/{s} kv={s} kernels={x}", .{
+-        o.tp, base, snapshot, o.context, o.parallel, o.drafts, depth, @import("cuda_engine.zig").windowSetting(lane_backend.max_rows), @import("cuda_engine.zig").confidenceSetting(), @import("cuda_engine.zig").productStreams(), yt, fill, fill_layers, @tagName(o.kv_dtype), kernel_set,
++    const retime = getenv("TF_FLASHNEXT_COST_RETIME") orelse "0";
++    return std.fmt.allocPrint(gpa, "flashnext tp={d} checkpoint={s} snapshot={x} context={d} parallel={d} drafts={} depth={d} window={d} confidence={d}/{d} yarn={s} fill={s}/{s} retime={s} kv={s} kernels={x}", .{
++        o.tp, base, snapshot, o.context, o.parallel, o.drafts, depth, @import("cuda_engine.zig").windowSetting(lane_backend.max_rows), @import("cuda_engine.zig").confidenceSetting(), @import("cuda_engine.zig").productStreams(), yt, fill, fill_layers, retime, @tagName(o.kv_dtype), kernel_set,
+     });
+ }
+ 
