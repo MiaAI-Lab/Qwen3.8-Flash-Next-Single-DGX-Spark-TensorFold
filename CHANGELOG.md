@@ -17,6 +17,10 @@ Script and tool fixes only; the image and `patches/` are unchanged.
   [naeemakhtar110](https://github.com/naeemakhtar110) (#38). Test: `tools/test_bench_stats.py`.
 - The ready summary of `start.sh` names the KV cache type in use (it always said `bf16 KV`). Authored by
   [mcclanahanaman](https://github.com/mcclanahanaman) (#51).
+- `patches/0027-flash-next-whole-prompt-states-cache-salt`, `TENSORFOLD_PROMPT_CACHE_WHOLE=1` and
+  `TENSORFOLD_PROMPT_CACHE_WHOLE_MIN=1024`: a prompt of 1,024+ tokens also keeps a state at its very end (with its last
+  logits row), so the same prompt sent again starts with no forward and a longer one resumes from it; vLLM's
+  `cache_salt` keys the states a request keeps and resumes. Replies byte-identical (`tensorfold reuse`).
 
 ## [1.0.0] - 2026-10-08
 
