@@ -1,0 +1,979 @@
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 3ac2240..493ab03 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -45,6 +45,7 @@ const kernels = [_]Kernel{
+     .{ .name = "fn_qmm_cluster", .flags = &.{"-O3"} }, // ours (decode D5): qmm_kernel's K-slice cluster forms for the MTP head in 4-bit
+     .{ .name = "fn_roce", .flags = &.{"-O3"} }, // ours (decode D1): the one-shot RoCE all-gather's GPU half (cuda/roce.zig)
+     .{ .name = "fn_qsa_scores", .flags = &.{"-O3"} }, // ours: attention._scores' bits from row tiles (the prompt indexer)
++    .{ .name = "fn_qsa_stream", .flags = &.{"-O3"} }, // ours: the indexer's block lists from one read of a row
+ };
+ 
+ /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
+diff --git a/zig/kernels/cuda/fn_qsa_scores.cu b/zig/kernels/cuda/fn_qsa_scores.cu
+index d54c9c7..a622a36 100644
+--- a/zig/kernels/cuda/fn_qsa_scores.cu
++++ b/zig/kernels/cuda/fn_qsa_scores.cu
+@@ -206,3 +206,128 @@ TF_QSA(fn_qsa_scores, 2, 4, false)
+ TF_QSA(fn_qsa_scores_r4b4, 4, 4, true)
+ TF_QSA(fn_qsa_scores_r2b8, 2, 8, false)
+ TF_QSA(fn_qsa_scores_r4b8, 4, 8, false)
++
++// The same tiles with the per-dim products on fma.rn.f32.bf16 (FHFMA):
++// _scores' own PTX instruction (its header above: "mul.f32 then fma.rn.f32.bf16"), reading the bf16 operands from
++// the packed words instead of widening each to fp32 first. The first product is fma.rn.f32.bf16(k1, q1, -0.0) =
++// mul.rn(k1, q1) exactly (x + -0 = x for every x, signed zeros included) and fma.rn.f32.bf16(k, q, p) =
++// fma.rn.f32(widen(k), widen(q), p) (bf16 widens exactly), so every score is the same fp32 word (qsa-check).
++namespace {
++
++__device__ __forceinline__ float lane_hf(const uint4& k, const uint4& q) {
++  float p;
++  asm("{\n .reg .b16 k0, k1, q0, q1;\n mov.b32 {k0, k1}, %1;\n mov.b32 {q0, q1}, %2;\n"
++      " mov.b32 %0, 0x80000000;\n fma.rn.f32.bf16 %0, k1, q1, %0;\n fma.rn.f32.bf16 %0, k0, q0, %0;\n}\n"
++      : "=f"(p) : "r"(k.x), "r"(q.x));
++#define TF_HF_STEP(W)                                                                                                \
++  asm("{\n .reg .b16 k0, k1, q0, q1;\n mov.b32 {k0, k1}, %1;\n mov.b32 {q0, q1}, %2;\n"                              \
++      " fma.rn.f32.bf16 %0, k0, q0, %0;\n fma.rn.f32.bf16 %0, k1, q1, %0;\n}\n"                                     \
++      : "+f"(p) : "r"(k.W), "r"(q.W));
++  TF_HF_STEP(y) TF_HF_STEP(z) TF_HF_STEP(w)
++#undef TF_HF_STEP
++  return p;
++}
++
++template <int TR, int TB>
++__device__ __forceinline__ void scores_hf(const uint16_t* __restrict__ IQ, const uint16_t* __restrict__ POOLED,
++                                          const int* __restrict__ POS0, float* __restrict__ SC, int NB, int rows,
++                                          int ratio, int top) {
++  constexpr int RT = 16 * TR;
++  constexpr int BT = 16 * TB;
++  extern __shared__ __align__(16) uint16_t smem[];
++  uint16_t* ks = smem;
++  uint16_t* qs = smem + BT * DI;
++  const int tid = threadIdx.x;
++  const int r0 = blockIdx.x * RT;
++  const int j0 = blockIdx.y * BT;
++  const int pos0 = __ldg(POS0);
++  const int last = min(r0 + RT, rows) - 1;
++  const int reach = (pos0 + last + 1) / ratio;
++  if (reach <= top || j0 >= reach) return;
++  for (int i = tid; i < BT * (DI / 8); i += 256) {
++    const int b = i / (DI / 8), c = i % (DI / 8);
++    uint4 v = make_uint4(0, 0, 0, 0);
++    if (j0 + b < reach) v = __ldg(reinterpret_cast<const uint4*>(POOLED + (size_t)(j0 + b) * DI) + c);
++    *reinterpret_cast<uint4*>(ks + kslot(b, c)) = v;
++  }
++  for (int i = tid; i < RT * HI * (DI / 8); i += 256) {
++    const int rh = i / (DI / 8), c = i % (DI / 8);
++    const int r = rh / HI;
++    uint4 v = make_uint4(0, 0, 0, 0);
++    if (r0 + r < rows) v = __ldg(reinterpret_cast<const uint4*>(IQ + (size_t)(r0 * HI + rh) * DI) + c);
++    *reinterpret_cast<uint4*>(qs + rh * DI + c * 8) = v;
++  }
++  __syncthreads();
++  const int tr = tid / 16;
++  const int tb = tid % 16;
++  float total[TR][TB];
++#pragma unroll 1
++  for (int h = 0; h < HI; ++h) {
++    float c0[TR][TB], cc[TR][TB], bb[TR][TB], aa[TR][TB];
++#pragma unroll 1
++    for (int step = 0; step < 16; ++step) {
++      const int half = step >> 3, q2 = (step >> 2) & 1, q4 = (step >> 1) & 1, q8 = step & 1;
++      const int l = half + 2 * q2 + 4 * q4 + 8 * q8;
++      uint4 qf[TR];
++#pragma unroll
++      for (int ir = 0; ir < TR; ++ir) qf[ir] = *reinterpret_cast<const uint4*>(qs + ((tr * TR + ir) * HI + h) * DI + l * 8);
++#pragma unroll
++      for (int jb = 0; jb < TB; ++jb) {
++        const uint4 kf = *reinterpret_cast<const uint4*>(ks + kslot(tb + 16 * jb, l));
++#pragma unroll
++        for (int ir = 0; ir < TR; ++ir) {
++          const float p = lane_hf(kf, qf[ir]);
++          float& A = aa[ir][jb];
++          float& B = bb[ir][jb];
++          float& C = cc[ir][jb];
++          if (q8 == 0) {
++            A = p;
++          } else {
++            const float a = add_rn(A, p);
++            if (q4 == 0) {
++              B = a;
++            } else {
++              const float bsum = add_rn(B, a);
++              if (q2 == 0) {
++                C = bsum;
++              } else {
++                const float csum = add_rn(C, bsum);
++                if (half == 0) {
++                  c0[ir][jb] = csum;
++                } else {
++                  const float S = max0(add_rn(c0[ir][jb], csum));
++                  total[ir][jb] = h == 0 ? add_rn(S, 0.0f) : add_rn(total[ir][jb], S);
++                }
++              }
++            }
++          }
++        }
++      }
++    }
++  }
++#pragma unroll
++  for (int ir = 0; ir < TR; ++ir) {
++    const int r = r0 + tr * TR + ir;
++    if (r >= rows) continue;
++    const int complete = (pos0 + r + 1) / ratio;
++    if (complete <= top) continue;
++#pragma unroll
++    for (int jb = 0; jb < TB; ++jb) {
++      const int bk = j0 + tb + 16 * jb;
++      if (bk < complete) SC[(size_t)r * NB + bk] = div_full(total[ir][jb]);
++    }
++  }
++}
++
++}  // namespace
++
++#define TF_QSA_HF(NAME, TR, TB)                                                                                      \
++  extern "C" __global__ void __launch_bounds__(256)                                                            \
++      NAME(const uint16_t* __restrict__ IQ, const uint16_t* __restrict__ POOLED, const int* __restrict__ POS0,    \
++           float* __restrict__ SC, int NB, int rows, int ratio, int top) {                                     \
++    scores_hf<TR, TB>(IQ, POOLED, POS0, SC, NB, rows, ratio, top);                                                 \
++  }
++TF_QSA_HF(fn_qsa_scores_f2b4, 2, 4)
++TF_QSA_HF(fn_qsa_scores_f4b4, 4, 4)
++TF_QSA_HF(fn_qsa_scores_f2b8, 2, 8)
++TF_QSA_HF(fn_qsa_scores_f4b8, 4, 8)
+diff --git a/zig/kernels/cuda/fn_qsa_stream.cu b/zig/kernels/cuda/fn_qsa_stream.cu
+new file mode 100644
+index 0000000..8daeddc
+--- /dev/null
++++ b/zig/kernels/cuda/fn_qsa_stream.cu
+@@ -0,0 +1,377 @@
++// Flash Next's indexer block selection (ours): attention._select / _select_tiles' lists from ONE CTA a
++// row reading the row's block scores ONCE, keeping a running candidate buffer in shared memory.
++//
++// The lists are integers fixed by the scores alone: a row keeps its TOP blocks under the order (key descending, block
++// id ascending), keys being the fp32 score bits made order-preserving (sign-flipped), and lists them in block order
++// (RATIO token ids a block), then the unfinished block's tokens; a row with complete <= TOP stores only its length.
++// `_select` finds the cut (the TOP-th largest key) by 33 halvings and takes the ties at the cut lowest id first;
++// `_select_tiles` the same cut by radix select. Any exact algorithm gives the same words.
++//
++// Here the row streams in id order through batches of THREADS * V keys. The buffer (CAP keys and ids, in id order)
++// always holds TOPP(P): the TOP best of the processed prefix P under that order, plus possibly more. Why it suffices:
++//   - every block of the row's selection S that lies in P is in TOPP(P) (TOP blocks of P ranked above it would rank
++//     above it in the whole row too);
++//   - a later block x (its id above all of P) enters TOPP(P + x) only if its key is ABOVE the key of TOPP(P)'s last
++//     element (a tie at that key loses on the id), so after a compaction to TOPP with cut T, a key <= T is dropped
++//     and a key > T appended (a stale T, lower than the current cut, only keeps more);
++//   - a compaction of a buffer B with TOPP(P) <= B <= P gives TOPP(B) = TOPP(P).
++// When an append would overflow, the buffer is compacted (radix select of the cut over 11, 11 and 10 bits, then the
++// keys above it and the first `need` ties at it, kept in order), which raises T; the end compacts once more and the
++// TOP survivors, in id order, are the row's list.
++#include <cooperative_groups.h>
++#include <stdint.h>
++
++namespace tf_qsa_stream {
++
++constexpr int THREADS = 512;
++constexpr int WARPS = THREADS / 32;
++constexpr int BINS = 2048;
++constexpr int BPT = BINS / THREADS;  // bins a thread owns when finding the digit
++
++__device__ __forceinline__ uint32_t key_of(float v) {
++  const uint32_t bits = __float_as_uint(v);
++  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
++}
++
++// exclusive prefix over threads (thread order) of v; *total the block's sum. Every thread calls it.
++__device__ __forceinline__ int excl_scan(int v, int* ws, int* total) {
++  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++  int x = v;
++#pragma unroll
++  for (int o = 1; o < 32; o <<= 1) {
++    const int y = __shfl_up_sync(0xffffffffu, x, o);
++    if (lane >= o) x += y;
++  }
++  if (lane == 31) ws[warp] = x;
++  __syncthreads();
++  if (warp == 0) {
++    int w = lane < WARPS ? ws[lane] : 0;
++#pragma unroll
++    for (int o = 1; o < 32; o <<= 1) {
++      const int y = __shfl_up_sync(0xffffffffu, w, o);
++      if (lane >= o) w += y;
++    }
++    if (lane < WARPS) ws[lane] = w;  // inclusive warp sums
++  }
++  __syncthreads();
++  const int before = (warp > 0 ? ws[warp - 1] : 0) + x - v;
++  *total = ws[WARPS - 1];
++  __syncthreads();  // ws reused by the next call
++  return before;
++}
++
++struct Shared {
++  int hist[BINS];
++  int ws[WARPS];
++  int cnt[32 * WARPS];  // appends of a batch by (key slot j, warp), then their exclusive offsets
++  int bcast[4];
++};
++
++// The TOP-th largest of the n buffer keys: *cut, and the ties at it to take (`need`, returned). Radix select over the
++// top 11, 11 and 10 bits; every thread returns the same values.
++__device__ __forceinline__ int radix_cut(const uint32_t* ck, int n, int top, Shared* sh, uint32_t* cut) {
++  const int tid = threadIdx.x, lane = tid & 31;
++  uint32_t prefix = 0, pmask = 0;
++  int need = top;
++#pragma unroll 1
++  for (int p = 0; p < 3; ++p) {
++    const int shift = p == 0 ? 21 : p == 1 ? 10 : 0;
++    const uint32_t dmask = p < 2 ? 0x7FFu : 0x3FFu;
++    for (int j = tid; j < BINS; j += THREADS) sh->hist[j] = 0;
++    __syncthreads();
++    for (int base = 0; base < n; base += THREADS) {
++      const int i = base + tid;
++      const uint32_t k = i < n ? ck[i] : 0u;
++      const bool ok = i < n && (k & pmask) == prefix;
++      const int d = ok ? static_cast<int>((k >> shift) & dmask) : -1;
++      const unsigned peers = __match_any_sync(0xffffffffu, d);
++      if (ok && lane == __ffs(peers) - 1) atomicAdd(&sh->hist[d], __popc(peers));
++    }
++    __syncthreads();
++    // thread t holds bins [BINS - BPT (t + 1), BINS - BPT t): the keys in higher bins are the threads before it
++    const int hi = BINS - BPT * tid;
++    int local = 0;
++#pragma unroll
++    for (int q = 1; q <= BPT; ++q) local += sh->hist[hi - q];
++    int all;
++    int above = excl_scan(local, sh->ws, &all);
++#pragma unroll
++    for (int q = 1; q <= BPT; ++q) {
++      const int d = hi - q;
++      const int c = sh->hist[d];
++      if (above < need && above + c >= need) {  // the one digit whose keys hold the need-th largest
++        sh->bcast[0] = d;
++        sh->bcast[1] = need - above;
++      }
++      above += c;
++    }
++    __syncthreads();
++    const int d = sh->bcast[0];
++    need = sh->bcast[1];
++    prefix |= static_cast<uint32_t>(d) << shift;
++    pmask |= dmask << shift;
++    __syncthreads();
++  }
++  *cut = prefix;
++  return need;
++}
++
++// The buffer's TOPP, in place and in order: the keys above the cut and the first `need` ties at it. Returns the cut;
++// the buffer then holds exactly `top` entries.
++template <int KMAX>
++__device__ __forceinline__ uint32_t compact(uint32_t* ck, int* cid, int n, int top, Shared* sh) {
++  uint32_t cut;
++  const int need = radix_cut(ck, n, top, sh, &cut);
++  const int tid = threadIdx.x;
++  const int K = (n + THREADS - 1) / THREADS;  // <= KMAX
++  const int i0 = min(n, tid * K), i1 = min(n, i0 + K);
++  uint32_t k[KMAX];
++  int id[KMAX];
++  int a = 0, e = 0;
++#pragma unroll
++  for (int q = 0; q < KMAX; ++q) {
++    const int i = i0 + q;
++    k[q] = i < i1 ? ck[i] : 0u;
++    id[q] = i < i1 ? cid[i] : 0;
++    a += i < i1 && k[q] > cut;
++    e += i < i1 && k[q] == cut;
++  }
++  int A, E;
++  const int a_before = excl_scan(a, sh->ws, &A);  // its barriers also order every read above before the writes
++  const int e_before = excl_scan(e, sh->ws, &E);
++  int place = a_before + min(e_before, need);
++  int eq = e_before;
++#pragma unroll
++  for (int q = 0; q < KMAX; ++q) {
++    const int i = i0 + q;
++    if (i >= i1) continue;
++    bool chosen = k[q] > cut;
++    if (k[q] == cut) {
++      chosen = eq < need;
++      ++eq;
++    }
++    if (chosen) {
++      ck[place] = k[q];
++      cid[place] = id[q];
++      ++place;
++    }
++  }
++  __syncthreads();
++  return cut;
++}
++
++// Streams the keys of blocks [b0, b1) of `row` through the buffer (ids absolute): on return the buffer's first n
++// entries, in id order, hold the range's TOPP (all of the range while it has <= top keys, or more). Batches of
++// THREADS * V keys; a batch's appends go in id order, after a compaction when they would overflow CAP.
++template <int CAP, int V>
++__device__ __forceinline__ int stream_range(const float* __restrict__ row, int b0, int b1, int top, uint32_t* ck,
++                                            int* cid, Shared* sh) {
++  static_assert(CAP % THREADS == 0 && V <= 32, "buffer and batch shapes");
++  constexpr int KMAX = CAP / THREADS;
++  constexpr int BATCH = THREADS * V;
++  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++  const unsigned lt = (1u << lane) - 1u;
++  int n = 0;
++  bool have = false;  // a cut T exists (the buffer was compacted once)
++  uint32_t T = 0;
++  float nxt[V];
++#pragma unroll
++  for (int j = 0; j < V; ++j) {
++    const int i = b0 + j * THREADS + tid;
++    nxt[j] = i < b1 ? row[i] : 0.f;
++  }
++#pragma unroll 1
++  for (int base = b0; base < b1; base += BATCH) {
++    uint32_t k[V];
++#pragma unroll
++    for (int j = 0; j < V; ++j) k[j] = key_of(nxt[j]);
++    // the next batch's loads in flight while this one is filtered
++    const int nb0 = base + BATCH;
++#pragma unroll
++    for (int j = 0; j < V; ++j) {
++      const int i = nb0 + j * THREADS + tid;
++      nxt[j] = i < b1 ? row[i] : 0.f;
++    }
++#pragma unroll 1
++    for (int attempt = 0; attempt < 2; ++attempt) {
++      unsigned m[V];
++      int c = 0;
++#pragma unroll
++      for (int j = 0; j < V; ++j) {
++        const int i = base + j * THREADS + tid;
++        const bool f = i < b1 && (!have || k[j] > T);
++        m[j] = __ballot_sync(0xffffffffu, f);
++        c += f;
++      }
++      if (!__syncthreads_or(c)) break;
++      // appends in id order: (slot j, then thread); per (j, warp) counts, then their exclusive offsets
++      if (lane == 0) {
++#pragma unroll
++        for (int j = 0; j < V; ++j) sh->cnt[j * WARPS + warp] = __popc(m[j]);
++      }
++      __syncthreads();
++      if (warp == 0) {
++        int carry = 0;
++        for (int q0 = 0; q0 < V * WARPS; q0 += 32) {
++          const int v = q0 + lane < V * WARPS ? sh->cnt[q0 + lane] : 0;
++          int x = v;
++#pragma unroll
++          for (int o = 1; o < 32; o <<= 1) {
++            const int y = __shfl_up_sync(0xffffffffu, x, o);
++            if (lane >= o) x += y;
++          }
++          if (q0 + lane < V * WARPS) sh->cnt[q0 + lane] = carry + x - v;
++          carry += __shfl_sync(0xffffffffu, x, 31);
++        }
++        if (lane == 0) sh->bcast[2] = carry;
++      }
++      __syncthreads();
++      const int total = sh->bcast[2];
++      if (n + total > CAP) {  // first make room: the buffer's TOPP, a higher cut, then the batch again
++        T = compact<KMAX>(ck, cid, n, top, sh);
++        n = top;
++        have = true;
++        continue;
++      }
++#pragma unroll
++      for (int j = 0; j < V; ++j) {
++        if (m[j] >> lane & 1u) {
++          const int pos = n + sh->cnt[j * WARPS + warp] + __popc(m[j] & lt);
++          ck[pos] = k[j];
++          cid[pos] = base + j * THREADS + tid;
++        }
++      }
++      n += total;
++      __syncthreads();
++      break;
++    }
++  }
++  return n;
++}
++
++// SC [rows, NB] fp32 scores, POS0 the first row's position; IDS [rows, IDW], NKR [rows], SPR [rows]. One CTA a row,
++// THREADS threads, dynamic shared memory CAP keys and CAP ids. Needs CAP >= top + THREADS * V.
++template <int CAP, int V>
++__device__ __forceinline__ void stream_body(const float* __restrict__ SC, const int* __restrict__ POS0,
++                                            int* __restrict__ IDS, int* __restrict__ NKR, int* __restrict__ SPR,
++                                            int NB, int ratio, int top, int idw) {
++  constexpr int KMAX = CAP / THREADS;
++  extern __shared__ __align__(16) uint32_t dyn[];
++  __shared__ Shared sh;
++  uint32_t* ck = dyn;
++  int* cid = reinterpret_cast<int*>(dyn + CAP);
++  const int r = blockIdx.x;
++  const int tid = threadIdx.x;
++  const int end = __ldg(POS0) + r + 1;
++  const int complete = end / ratio;
++  if (complete <= top) {
++    if (tid == 0) {
++      NKR[r] = end;
++      SPR[r] = 0;
++    }
++    return;
++  }
++  const float* row = SC + static_cast<size_t>(r) * NB;
++  const int n = stream_range<CAP, V>(row, 0, complete, top, ck, cid, &sh);
++  compact<KMAX>(ck, cid, n, top, &sh);  // n > top: the whole row passed through (complete > top)
++  int* out = IDS + static_cast<size_t>(r) * idw;
++  for (int i = tid; i < top * ratio; i += THREADS) out[i] = cid[i / ratio] * ratio + i % ratio;
++  if (tid < ratio) {
++    const int tail = ratio * complete + tid;
++    if (tail < end) out[top * ratio + tid] = tail;
++  }
++  if (tid == 0) {
++    NKR[r] = top * ratio + end - ratio * complete;
++    SPR[r] = 1;
++  }
++}
++
++// The cluster form: C CTAs a row (consecutive), CTA `rank` streams blocks [rank * per, ...) (per = ceil(complete / C))
++// into its own buffer and cuts it to its TOPP; rank 0 then gathers the C lists in rank order (= block order) through
++// distributed shared memory, cuts the union (TOPP of a union of TOPPs is the row's TOPP) and stores the list.
++// Needs CAP >= top + THREADS * V and CAP >= C * top.
++template <int C, int CAP, int V>
++__device__ __forceinline__ void cstream_body(const float* __restrict__ SC, const int* __restrict__ POS0,
++                                             int* __restrict__ IDS, int* __restrict__ NKR, int* __restrict__ SPR,
++                                             int NB, int ratio, int top, int idw) {
++#if __CUDA_ARCH__ < 900
++  __trap();  // clusters need sm_90+: the host never launches this
++#else
++  constexpr int KMAX = CAP / THREADS;
++  extern __shared__ __align__(16) uint32_t dyn[];
++  __shared__ Shared sh;
++  uint32_t* ck = dyn;
++  int* cid = reinterpret_cast<int*>(dyn + CAP);
++  cooperative_groups::cluster_group cl = cooperative_groups::this_cluster();
++  const int rank = static_cast<int>(cl.block_rank());
++  const int r = blockIdx.x / C;
++  const int tid = threadIdx.x;
++  const int end = __ldg(POS0) + r + 1;
++  const int complete = end / ratio;
++  if (complete <= top) {  // the whole cluster leaves here (the same row)
++    if (rank == 0 && tid == 0) {
++      NKR[r] = end;
++      SPR[r] = 0;
++    }
++    return;
++  }
++  const float* row = SC + static_cast<size_t>(r) * NB;
++  const int per = (complete + C - 1) / C;
++  const int b0 = min(complete, rank * per), b1 = min(complete, b0 + per);
++  int n = stream_range<CAP, V>(row, b0, b1, top, ck, cid, &sh);
++  if (n > top) {
++    compact<KMAX>(ck, cid, n, top, &sh);
++    n = top;
++  }
++  if (tid == 0) sh.bcast[3] = n;
++  cl.sync();  // every CTA's list and length published
++  if (rank == 0) {
++    int off = n;
++#pragma unroll 1
++    for (int q = 1; q < C; ++q) {
++      const Shared* rs = cl.map_shared_rank(&sh, q);
++      const uint32_t* rk = cl.map_shared_rank(ck, q);
++      const int* ri = cl.map_shared_rank(cid, q);
++      const int nq = rs->bcast[3];
++      for (int i = tid; i < nq; i += THREADS) {
++        ck[off + i] = rk[i];
++        cid[off + i] = ri[i];
++      }
++      off += nq;
++    }
++    n = off;
++  }
++  cl.sync();  // no CTA leaves while rank 0 may still read its buffer
++  if (rank != 0) return;
++  // n > top: two slices hold keys and every slice gave min(its keys, top) of them
++  compact<KMAX>(ck, cid, n, top, &sh);
++  int* out = IDS + static_cast<size_t>(r) * idw;
++  for (int i = tid; i < top * ratio; i += THREADS) out[i] = cid[i / ratio] * ratio + i % ratio;
++  if (tid < ratio) {
++    const int tail = ratio * complete + tid;
++    if (tail < end) out[top * ratio + tid] = tail;
++  }
++  if (tid == 0) {
++    NKR[r] = top * ratio + end - ratio * complete;
++    SPR[r] = 1;
++  }
++#endif
++}
++
++}  // namespace tf_qsa_stream
++
++#define TF_QSA_STREAM(NAME, CAP, V)                                                                                   \
++  extern "C" __global__ void __launch_bounds__(tf_qsa_stream::THREADS)                                               \
++      NAME(const float* __restrict__ SC, const int* __restrict__ POS0, int* __restrict__ IDS, int* __restrict__ NKR,  \
++           int* __restrict__ SPR, int NB, int ratio, int top, int idw) {                                              \
++    tf_qsa_stream::stream_body<CAP, V>(SC, POS0, IDS, NKR, SPR, NB, ratio, top, idw);                                 \
++  }
++TF_QSA_STREAM(fn_qsa_stream_k5v4, 5120, 4)
++
++#define TF_QSA_CSTREAM(NAME, C, CAP, V)                                                                               \
++  extern "C" __global__ void __launch_bounds__(tf_qsa_stream::THREADS)                                               \
++      NAME(const float* __restrict__ SC, const int* __restrict__ POS0, int* __restrict__ IDS, int* __restrict__ NKR,  \
++           int* __restrict__ SPR, int NB, int ratio, int top, int idw) {                                              \
++    tf_qsa_stream::cstream_body<C, CAP, V>(SC, POS0, IDS, NKR, SPR, NB, ratio, top, idw);                             \
++  }
++TF_QSA_CSTREAM(fn_qsa_cstream_c4k4v4, 4, 4096, 4)
+diff --git a/zig/src/cli/flashnext_cuda.zig b/zig/src/cli/flashnext_cuda.zig
+index 38f9e7b..9eaf060 100644
+--- a/zig/src/cli/flashnext_cuda.zig
++++ b/zig/src/cli/flashnext_cuda.zig
+@@ -1352,7 +1352,8 @@ fn expertsCheck(gpa: Allocator, ctx: *const cuda.Context, o: Options) !u8 {
+     return if (ok) 0 else 1;
+ }
+ 
+-/// `qsa-check`: no checkpoint; the prompt indexer's row-tiled scoring and tiled selection against Python's kernels.
++/// `qsa-check`: no checkpoint; the indexer's row-tiled scoring and its selections (tiled, fn_qsa_stream) against
++/// Python's kernels.
+ fn qsaCheck(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, kernels: []const u8) !u8 {
+     var set = try cuda.aot.Set.load(gpa, io, ctx.d, ctx.device, kernels);
+     defer set.deinit();
+@@ -1360,7 +1361,9 @@ fn qsaCheck(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, kernels: []con
+     defer stream.deinit();
+     var fast = try flashnext.prompt.QsaScores.init(ctx.d);
+     defer fast.deinit();
+-    const ok = try flashnext.prompt.qsaCheck(gpa, ctx.d, .{ .set = &set, .s = stream }, &fast);
++    var sel = try flashnext.prompt.QsaSelect.init(ctx.d);
++    defer sel.deinit();
++    const ok = try flashnext.prompt.qsaCheck(gpa, ctx.d, .{ .set = &set, .s = stream }, &fast, &sel);
+     // timing: Python's _scores against fn_qsa_scores on 256 rows at 128k and 1M-like key counts
+     try flashnext.prompt.qsaBench(ctx.d, .{ .set = &set, .s = stream }, &fast);
+     std.debug.print("{s} qsa-check\n", .{if (ok) "PASS" else "FAIL"});
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index b719c7c..4a9c9c7 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -46,6 +46,7 @@ pub const fn_qmm_cluster: []const u8 = if (available) &Blob("fatbin_fn_qmm_clust
+ pub const fn_roce: []const u8 = if (available) &Blob("fatbin_fn_roce").bytes else &.{};
+ pub const fn_nvfp4_shape: []const u8 = if (available) &Blob("fatbin_fn_nvfp4_shape").bytes else &.{};
+ pub const fn_qsa_scores: []const u8 = if (available) &Blob("fatbin_fn_qsa_scores").bytes else &.{};
++pub const fn_qsa_stream: []const u8 = if (available) &Blob("fatbin_fn_qsa_stream").bytes else &.{};
+ 
+ /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
+ pub const gdn_symbols = struct {
+diff --git a/zig/src/families/flashnext/cuda_engine.zig b/zig/src/families/flashnext/cuda_engine.zig
+index 98c1e6b..7c34fc7 100644
+--- a/zig/src/families/flashnext/cuda_engine.zig
++++ b/zig/src/families/flashnext/cuda_engine.zig
+@@ -439,6 +439,8 @@ pub const Engine = struct {
+     pass_times: bool = false,
+     /// TF_FLASHNEXT_QSA_FAST (default on): fn_qsa_scores for the prompt indexer's scores
+     qsa_fast: ?prompt_mm.QsaScores = null,
++    /// TF_FLASHNEXT_QSA_SELECT=1: fn_qsa_stream for the indexer's block lists
++    qsa_sel: ?prompt_mm.QsaSelect = null,
+ 
+     pub fn init(gpa: Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels_dir: []const u8, o: Options) !*Engine {
+         const t0 = std.Io.Clock.awake.now(io);
+@@ -608,6 +610,12 @@ pub const Engine = struct {
+         if (envGet("TF_FLASHNEXT_QSA_SPLIT_KEYS")) |v| {
+             e.f.qsa_split_keys = std.fmt.parseInt(usize, v, 10) catch 0;
+         }
++        if (envGet("TF_FLASHNEXT_QSA_SELECT")) |v| if (!std.mem.eql(u8, v, "0")) {
++            e.qsa_sel = try prompt_mm.QsaSelect.init(d);
++            e.f.qsa_sel = &e.qsa_sel.?;
++            std.log.info("qsa select: the indexer's block lists from fn_qsa_stream (decode: cs4 from {d} blocks, s5 below; prompt blocks: s5)", .{e.qsa_sel.?.dec_from});
++        };
++        errdefer if (e.qsa_sel) |*q| q.deinit();
+         // measured ~1% (research/R2-measured.md): off unless asked
+         if (e.f.glue_split and envGet("TF_FLASHNEXT_OVERLAP") != null and !envOff("TF_FLASHNEXT_OVERLAP")) {
+             if (envGet("TF_FLASHNEXT_OVERLAP")) |v| e.f.overlap = std.fmt.parseInt(u8, v, 10) catch 1;
+@@ -752,6 +760,7 @@ pub const Engine = struct {
+         if (e.mtpq) |*t| t.deinit();
+         if (e.hcq) |*t| t.deinit(e.gpa);
+         if (e.qsa_fast) |*q| q.deinit();
++        if (e.qsa_sel) |*q| q.deinit();
+         if (e.f.cs) |*cs| {
+             cs.synchronize() catch {};
+             cs.deinit();
+diff --git a/zig/src/families/flashnext/cuda_forward.zig b/zig/src/families/flashnext/cuda_forward.zig
+index bde5aa0..6e2837c 100644
+--- a/zig/src/families/flashnext/cuda_forward.zig
++++ b/zig/src/families/flashnext/cuda_forward.zig
+@@ -573,6 +573,9 @@ pub const Forward = struct {
+     qsa_tiles_from: usize = 8192,
+     /// fn_qsa_scores.cu for the prompt indexer's scores (`_scores`' bits); null: Python's `_scores`
+     qsa_fast: ?*const prompt.QsaScores = null,
++    /// TF_FLASHNEXT_QSA_SELECT=1: the indexer's block lists of decode windows, MTP steps and prompt blocks from
++    /// fn_qsa_stream.cu (QsaSelect); null: Triton's `_select` / `_select_tiles`. The same lists either way (qsa-check).
++    qsa_sel: ?*const prompt.QsaSelect = null,
+ 
+     pub fn init(gpa: Allocator, d: *const cuda.Driver, s: cuda.Stream, ops: kern.Ops, t: tri.Tri, th: tops.Torch, w: *const W.Weights, c: *const cfgs.Config, g: state.Geometry, dims: tri.Dims, max_rows: usize) !Forward {
+         var f: Forward = .{ .gpa = gpa, .d = d, .s = s, .ops = ops, .t = t, .th = th, .w = w, .c = c, .dims = dims, .g = g, .sc = undefined, .pin = undefined, .pin_rows = max_rows, .staged = undefined, .eps = @floatCast(c.eps), .vocab_offset = w.vocab_offset };
+@@ -830,6 +833,21 @@ pub const Forward = struct {
+         if (f.prof) |p| try p.mark(f.s, part);
+     }
+ 
++    /// A decode window's (or MTP step's) indexer rows: Tri.qsaRows' `_scores` and `_select`, or with `qsa_sel`
++    /// (or a profile, which marks the two launches apart) `_scores` and the same lists from QsaSelect.
++    fn qsaDecode(f: *Forward, iq: u64, pooled: u64, pos0: u64, sc: tri.AttnScratch, rows: usize, ag: tri.AttnGeometry, keys: usize) !void {
++        if (f.qsa_sel == null and f.prof == null) return f.t.qsaRows(iq, pooled, pos0, sc, rows, ag, keys, f.dims);
++        try prompt.qsaScores(f.t, iq, pooled, pos0, sc, rows, ag, keys, f.dims);
++        try f.mark(.qsa_scores);
++        if (f.qsa_sel) |q| if (prompt.QsaSelect.fits(q.decFor(ag.blocks(keys)), ag)) {
++            try q.run(q.decFor(ag.blocks(keys)), f.s, pos0, sc, rows, ag);
++            try f.mark(.qsa_select);
++            return;
++        };
++        try prompt.qsaSelect(f.t, pos0, sc, rows, ag, keys);
++        try f.mark(.qsa_select);
++    }
++
+     pub fn put(f: *Forward, name: []const u8, ptr: u64, bytes: usize) !void {
+         if (f.dump) |d| try d.put(f, name, ptr, bytes);
+     }
+@@ -1713,7 +1731,11 @@ pub const Forward = struct {
+                 continue;
+             }
+             const keys = if (f.contexts) |cs| cs[si] else f.context orelse host_pos + n;
+-            if (ag.qsa) try f.t.qsaSelectRope(iq, ikc, pooled, pos, a.ik_scale, f.w.inv_freq, sc, n, ag, keys, d, rope);
++            if (ag.qsa) {
++                try f.t.qsaPoolRope(ikc, pooled, pos, a.ik_scale, f.w.inv_freq, n, ag, d, rope);
++                try f.mark(.qsa_pool);
++                try f.qsaDecode(iq, pooled, pos, sc, n, ag, keys);
++            }
+             try f.t.attention(q, cache, pos, sc, b.att_out, n, ag, keys, d);
+             // the scratch output is the next stream's too
+             if (segs.len > 1) try f.th.copy(b.attn_o + sg.a0 * qrow, b.att_out, n * qrow);
+@@ -1764,7 +1786,9 @@ pub const Forward = struct {
+             try prompt.qsaScoresRows(f.t, iq, pooled, pos0, sc, m, ag, ends, f.dims, f.qsa_rt);
+         } else try prompt.qsaScores(f.t, iq, pooled, pos0, sc, m, ag, ends, f.dims);
+         try f.mark(.qsa_scores);
+-        if (ag.blocks(ends) >= f.qsa_tiles_from) {
++        if (f.qsa_sel != null and prompt.QsaSelect.fits(prompt.QsaSelect.s5, ag)) {
++            try f.qsa_sel.?.run(prompt.QsaSelect.s5, f.s, pos0, sc, m, ag);
++        } else if (ag.blocks(ends) >= f.qsa_tiles_from) {
+             try prompt.qsaSelectTiles(f.t, pos0, sc, m, ag);
+         } else try prompt.qsaSelect(f.t, pos0, sc, m, ag, ends);
+         try f.mark(.qsa_select);
+@@ -1803,7 +1827,7 @@ pub const Forward = struct {
+                 if (end / ag.ratio <= top) continue;
+                 const a0 = sg.a0;
+                 const sc: tri.AttnScratch = .{ .po = b.att_po, .pm = b.att_pm, .pl = b.att_pl, .ids = b.att_ids + a0 * ag.idw * 4, .nk = b.att_nk + a0 * 4, .sparse = b.att_sparse + a0 * 4, .scores = b.att_scores + a0 * ag.nb * 4 };
+-                try f.t.qsaRows(b.iq + a0 * irow, st.pooled[ai], st.pos_dev, sc, sg.a1 - sg.a0, ag, end, d);
++                try f.qsaDecode(b.iq + a0 * irow, st.pooled[ai], st.pos_dev, sc, sg.a1 - sg.a0, ag, end);
+             }
+             try f.mark(.qsa_rows);
+         }
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index dc760a4..ef48126 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -368,14 +368,16 @@ pub fn qsaScoresRows(t: tri.Tri, iq: u64, pooled: u64, pos0: u64, sc: tri.AttnSc
+     try run(t, "_scores_rows", .{ cdiv(rows, rt), cdiv(blocks, 64), 1 }, &.{ aot.ptr("IQ", bf16, iq), aot.ptr("POOLED", bf16, pooled), aot.ptr("POS0", "*i32", pos0), aot.ptr("SC", f32p, sc.scores), int("NB", g.nb), int("ROWS", rows) }, &.{ ci("HI", d.index_heads), ci("DI", d.index_dim), ci("RATIO", g.ratio), ci("TOP", g.budget / g.ratio), ci("BB", 64), ci("RT", rt) });
+ }
+ 
+-/// fn_qsa_scores.cu: `_scores`' bits from 32-row x 64-block tiles (the prompt indexer's scoring).
++/// fn_qsa_scores.cu: `_scores`' bits from 32-row x 64-block tiles (the prompt indexer's scoring). Tiles 4-7: the same
++/// shapes on fma.rn.f32.bf16 (the packed bf16 operands, no widening; the same words, qsa-check).
+ pub const QsaScores = struct {
+     mod: cuda.Module,
+-    fs: [4]cuda.Function, // (rows, blocks) a thread: (2, 4), (4, 4), (2, 8), (4, 8)
++    fs: [8]cuda.Function, // (rows, blocks) a thread: (2, 4), (4, 4), (2, 8), (4, 8), then the same four on FHFMA
+     pick: usize = 0,
+ 
+-    const tiles = [4][2]usize{ .{ 2, 4 }, .{ 4, 4 }, .{ 2, 8 }, .{ 4, 8 } };
+-    const names = [4][:0]const u8{ "fn_qsa_scores", "fn_qsa_scores_r4b4", "fn_qsa_scores_r2b8", "fn_qsa_scores_r4b8" };
++    pub const count = 8;
++    const tiles = [8][2]usize{ .{ 2, 4 }, .{ 4, 4 }, .{ 2, 8 }, .{ 4, 8 }, .{ 2, 4 }, .{ 4, 4 }, .{ 2, 8 }, .{ 4, 8 } };
++    const names = [8][:0]const u8{ "fn_qsa_scores", "fn_qsa_scores_r4b4", "fn_qsa_scores_r2b8", "fn_qsa_scores_r4b8", "fn_qsa_scores_f2b4", "fn_qsa_scores_f4b4", "fn_qsa_scores_f2b8", "fn_qsa_scores_f4b8" };
+ 
+     fn shared(i: usize) usize {
+         // tile 1 keeps its keys widened to fp32
+@@ -391,7 +393,7 @@ pub const QsaScores = struct {
+             f.* = try m.function(n);
+             try f.allowDynamicShared(@intCast(shared(i)));
+         }
+-        if (std.c.getenv("TF_FLASHNEXT_QSA_TILE")) |v| q.pick = @min(3, std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0);
++        if (std.c.getenv("TF_FLASHNEXT_QSA_TILE")) |v| q.pick = @min(count - 1, std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0);
+         return q;
+     }
+ 
+@@ -409,15 +411,83 @@ pub const QsaScores = struct {
+     }
+ };
+ 
++/// The indexer's key lists, lengths and flags (`_select` / `_select_tiles`' integers: any exact algorithm gives the
++/// same words) from fn_qsa_stream.cu: the row read once, in block order, through a candidate buffer, one CTA a row
++/// (s5) or a cluster of four (cs4). Decode windows and MTP steps use cs4 for rows of at least `dec_from` blocks and s5
++/// below; prompt blocks use s5 (GB10 qsa-check timings: cs4 is fastest at 200k, s5 below ~130k and never slower than
++/// Triton's `_select` there).
++pub const QsaSelect = struct {
++    mod: cuda.Module,
++    fs: [kinds.len]cuda.Function,
++    dec_from: usize = 32768,
++
++    pub const s5 = 0;
++    pub const cs4 = 1;
++
++    /// The decode kind for a row of `blocks` blocks.
++    pub fn decFor(q: *const QsaSelect, blocks: usize) usize {
++        return if (blocks >= q.dec_from) cs4 else s5;
++    }
++
++    pub const Kind = struct {
++        label: []const u8,
++        name: [:0]const u8,
++        /// CTAs a row (1: no cluster)
++        cluster: usize,
++        /// dynamic shared memory bytes
++        shared: usize,
++        /// the candidate buffer and the keys a batch (needs top + batch <= cap, cluster * top <= cap)
++        cap: usize,
++        batch: usize,
++    };
++    pub const kinds = [_]Kind{
++        .{ .label = "s5", .name = "fn_qsa_stream_k5v4", .cluster = 1, .shared = 5120 * 8, .cap = 5120, .batch = 2048 },
++        .{ .label = "cs4", .name = "fn_qsa_cstream_c4k4v4", .cluster = 4, .shared = 4096 * 8, .cap = 4096, .batch = 2048 },
++    };
++
++    pub fn init(d: *const cuda.Driver) !QsaSelect {
++        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
++        var m = try cuda.Module.load(d, cuda.kernels.fn_qsa_stream);
++        errdefer m.unload();
++        var q: QsaSelect = .{ .mod = m, .fs = undefined };
++        for (&q.fs, kinds) |*f, k| {
++            f.* = try m.function(k.name);
++            try f.allowDynamicShared(@intCast(k.shared));
++        }
++        return q;
++    }
++
++    pub fn deinit(q: *QsaSelect) void {
++        q.mod.unload();
++    }
++
++    /// Whether kind `k` lists a row (the buffer holds a batch past TOP and the cluster's TOPPs).
++    pub fn fits(k: usize, g: tri.AttnGeometry) bool {
++        const kd = kinds[k];
++        const top = g.budget / g.ratio;
++        return top + kd.batch <= kd.cap and kd.cluster * top <= kd.cap;
++    }
++
++    pub fn run(q: *const QsaSelect, k: usize, s: cuda.Stream, pos0: u64, sc: tri.AttnScratch, rows: usize, g: tri.AttnGeometry) !void {
++        var a: cuda.Args = .{};
++        for ([_]u64{ sc.scores, pos0, sc.ids, sc.nk, sc.sparse }) |v| a.add(v);
++        for ([_]usize{ g.nb, g.ratio, g.budget / g.ratio, g.idw }) |v| a.add(@as(c_int, @intCast(v)));
++        const kd = kinds[k];
++        const cl: ?cuda.launch.Dim3 = if (kd.cluster > 1) .{ .x = @intCast(kd.cluster), .y = 1, .z = 1 } else null;
++        try cuda.launch.launch(q.fs[k], .{ .grid = .{ .x = @intCast(rows * kd.cluster), .y = 1, .z = 1 }, .block = .{ .x = 512 }, .shared = @intCast(kd.shared), .cluster = cl }, s, &a);
++    }
++};
++
+ /// `_select_tiles` for any row length (Python's own choice past `_select`'s registers; the same lists).
+ pub fn qsaSelectTiles(t: tri.Tri, pos0: u64, sc: tri.AttnScratch, rows: usize, g: tri.AttnGeometry) !void {
+     const lists = [_]aot.Arg{ aot.ptr("SC", f32p, sc.scores), aot.ptr("POS0", "*i32", pos0), aot.ptr("IDS", "*i32", sc.ids), aot.ptr("NKR", "*i32", sc.nk), aot.ptr("SPR", "*i32", sc.sparse), int("NB", g.nb) };
+     try run(t, "_select_tiles", .{ rows, 1, 1 }, &lists, &.{ ci("RATIO", g.ratio), ci("TOP", g.budget / g.ratio), ci("IDW", g.idw), ci("TB", if (rows >= 64) 4096 else 8192) });
+ }
+ 
+-/// `qsa-check`: `_scores_rows` against `_scores` (score bytes) and `_select_tiles` against `_select` (key lists,
+-/// lengths, flags) on random and tie-heavy indexer keys, rows past several positions. True when all equal.
+-pub fn qsaCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, fast: ?*const QsaScores) !bool {
++/// `qsa-check`: `_scores_rows` against `_scores` (score bytes) and `_select_tiles` (and each fn_qsa_stream kind)
++/// against `_select` (key lists, lengths, flags) on random and tie-heavy indexer keys, rows past several positions.
++/// True when all equal.
++pub fn qsaCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, fast: ?*const QsaScores, sel: ?*const QsaSelect) !bool {
+     const capacity: usize = 262144 + 8;
+     const g = tri.AttnGeometry.init(capacity, 2048, 4);
+     const dims: tri.Dims = .{};
+@@ -467,9 +537,12 @@ pub fn qsaCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, fast:
+             }
+             try qsaScores(t, iq.ptr, pooled.ptr, pos.ptr, scs[0], n, g, ends, dims);
+             try qsaSelect(t, pos.ptr, scs[0], n, g, ends);
+-            for ([_]usize{ 8, 16, 0, 1, 2, 3 }) |rt| {
++            // `_scores_rows` RT 8 and 16, then every fn_qsa_scores tile (0-3 widened, 4-7 FHFMA)
++            for (0..2 + QsaScores.count) |arm| {
++                const tile = arm >= 2;
++                const rt: usize = if (tile) arm - 2 else @as(usize, 8) << @intCast(arm);
+                 try bufs[1][0].fill8(0xA7, t.s.handle);
+-                if (rt < 4) {
++                if (tile) {
+                     const q = fast orelse continue;
+                     var qq = q.*;
+                     qq.pick = rt;
+@@ -480,7 +553,7 @@ pub fn qsaCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, fast:
+                 try bufs[1][0].download(0, host2[0 .. n * g.nb * 4]);
+                 const ok = std.mem.eql(u8, host1[0 .. n * g.nb * 4], host2[0 .. n * g.nb * 4]);
+                 if (!ok) all = false;
+-                std.debug.print("{s} {s} RT {d} position {d} rows {d}{s}: score bytes\n", .{ if (ok) "EQUAL" else "DIFFER", if (rt < 4) "fn_qsa_scores tile" else "_scores_rows", rt, p0, n, if (ties) " tie-heavy" else if (kind == 2) " special" else "" });
++                std.debug.print("{s} {s} RT {d} position {d} rows {d}{s}: score bytes\n", .{ if (ok) "EQUAL" else "DIFFER", if (tile) "fn_qsa_scores tile" else "_scores_rows", rt, p0, n, if (ties) " tie-heavy" else if (kind == 2) " special" else "" });
+             }
+             // the lists from the same scores by the tiled select
+             try qsaSelectTiles(t, pos.ptr, scs[1], n, g);
+@@ -494,11 +567,156 @@ pub fn qsaCheck(gpa: std.mem.Allocator, d: *const cuda.Driver, t: tri.Tri, fast:
+             }
+             if (!ok) all = false;
+             std.debug.print("{s} _select_tiles = _select position {d} rows {d}{s}: key lists, lengths, flags\n", .{ if (ok) "EQUAL" else "DIFFER", p0, n, if (ties) " tie-heavy" else if (kind == 2) " special" else "" });
++            if (sel) |q| {
++                if (!try selCheck(t, q, bufs, scs, pos.ptr, n, g, ends, host1, host2, p0, kind)) all = false;
++                if (kind == 0) try qsaPromptSelTimes(d, t, q, pos.ptr, scs[1], n, g, ends, p0);
++            }
++        }
++        // decode windows (1-16 rows) at the graph's bucket bound and at the exact one: each fn_qsa_scores tile and
++        // `_select_tiles` (a decode window's TB 8192) against `_scores` + `_select` (Tri.qsaRows); random keys also timed
++        for ([_]usize{ 2045, 2049, 8000, 32000, 70000, 100000, 131000, 200000, 261000 }) |p0| for ([_]usize{ 1, 3, 16 }) |n| for ([_]bool{ true, false }) |bucketed| {
++            const ends = p0 + n;
++            const keys = if (bucketed) @min(capacity, @max(8192, std.math.ceilPowerOfTwo(usize, ends) catch ends)) else ends;
++            try pos.fill32(@intCast(p0), t.s.handle);
++            var scs: [2]tri.AttnScratch = undefined;
++            for (&scs, bufs) |*sc, set| {
++                for (set) |b| try b.fill8(0xA7, t.s.handle);
++                sc.* = .{ .po = 0, .pm = 0, .pl = 0, .ids = set[1].ptr, .nk = set[2].ptr, .sparse = set[3].ptr, .scores = set[0].ptr };
++            }
++            try qsaScores(t, iq.ptr, pooled.ptr, pos.ptr, scs[0], n, g, keys, dims);
++            try qsaSelect(t, pos.ptr, scs[0], n, g, keys);
++            if (fast) |q| {
++                for (0..QsaScores.count) |pk| {
++                    try bufs[1][0].fill8(0xA7, t.s.handle);
++                    var qq = q.*;
++                    qq.pick = pk;
++                    try qq.run(t.s, iq.ptr, pooled.ptr, pos.ptr, scs[1], n, g, keys);
++                    try t.s.synchronize();
++                    try bufs[0][0].download(0, host1[0 .. n * g.nb * 4]);
++                    try bufs[1][0].download(0, host2[0 .. n * g.nb * 4]);
++                    const same = std.mem.eql(u8, host1[0 .. n * g.nb * 4], host2[0 .. n * g.nb * 4]);
++                    if (!same) all = false;
++                    if (!same or pk == 0) std.debug.print("{s} decode fn_qsa_scores tile {d} position {d} rows {d} keys {d}{s}: score bytes\n", .{ if (same) "EQUAL" else "DIFFER", pk, p0, n, keys, if (ties) " tie-heavy" else if (kind == 2) " special" else "" });
++                }
++            } else try qsaScores(t, iq.ptr, pooled.ptr, pos.ptr, scs[1], n, g, keys, dims);
++            try qsaSelectTiles(t, pos.ptr, scs[1], n, g);
++            try t.s.synchronize();
++            var ok = true;
++            for (1..4) |k| {
++                const bytes = if (k == 1) n * g.idw * 4 else n * 4;
++                try bufs[0][k].download(0, host1[0..bytes]);
++                try bufs[1][k].download(0, host2[0..bytes]);
++                ok = ok and std.mem.eql(u8, host1[0..bytes], host2[0..bytes]);
++            }
++            if (!ok) all = false;
++            std.debug.print("{s} decode _select_tiles = _select position {d} rows {d} keys {d}{s}: key lists, lengths, flags\n", .{ if (ok) "EQUAL" else "DIFFER", p0, n, keys, if (ties) " tie-heavy" else if (kind == 2) " special" else "" });
++            if (sel) |q| if (!try selCheck(t, q, bufs, scs, pos.ptr, n, g, keys, host1, host2, p0, kind)) {
++                all = false;
++            };
++            if (kind == 0 and bucketed) try qsaDecodeTimes(d, t, fast, sel, iq.ptr, pooled.ptr, pos.ptr, scs, n, g, keys, dims, p0);
++        };
++    }
++    return all;
++}
++
++/// Each QsaSelect kind's lists from scs[1]'s scores (equal to scs[0]'s) against scs[0]'s `_select` lists: every word
++/// of the rows' IDW-word lists (the words a list leaves alone still hold the 0xA7 fill), lengths and flags.
++fn selCheck(t: tri.Tri, q: *const QsaSelect, bufs: [2][4]cuda.DeviceBuffer, scs: [2]tri.AttnScratch, pos: u64, n: usize, g: tri.AttnGeometry, keys: usize, host1: []u8, host2: []u8, p0: usize, kind: u8) !bool {
++    var all = true;
++    for (QsaSelect.kinds, 0..) |kd, k| {
++        if (!QsaSelect.fits(k, g)) continue;
++        for (bufs[1][1..]) |b| try b.fill8(0xA7, t.s.handle);
++        try q.run(k, t.s, pos, scs[1], n, g);
++        try t.s.synchronize();
++        var ok = true;
++        for (1..4) |b| {
++            const bytes = if (b == 1) n * g.idw * 4 else n * 4;
++            try bufs[0][b].download(0, host1[0..bytes]);
++            try bufs[1][b].download(0, host2[0..bytes]);
++            ok = ok and std.mem.eql(u8, host1[0..bytes], host2[0..bytes]);
+         }
++        if (!ok) all = false;
++        std.debug.print("{s} qsa select {s} = _select position {d} rows {d} keys {d}{s}: key lists, lengths, flags\n", .{ if (ok) "EQUAL" else "DIFFER", kd.label, p0, n, keys, if (kind == 1) " tie-heavy" else if (kind == 2) " special" else "" });
+     }
+     return all;
+ }
+ 
++/// ms a call (20 calls, after a warm pass) of each decode-window indexer launch: `_scores`, each fn_qsa_scores tile,
++/// `_select` (while its registers hold the row), `_select_tiles` and each QsaSelect kind.
++fn qsaDecodeTimes(d: *const cuda.Driver, t: tri.Tri, fast: ?*const QsaScores, sel: ?*const QsaSelect, iq: u64, pooled: u64, pos: u64, scs: [2]tri.AttnScratch, n: usize, g: tri.AttnGeometry, keys: usize, dims: tri.Dims, p0: usize) !void {
++    var e0 = try cuda.Event.init(d, true);
++    defer e0.deinit();
++    var e1 = try cuda.Event.init(d, true);
++    defer e1.deinit();
++    const reps = 20;
++    const nt = QsaScores.count;
++    const nk = QsaSelect.kinds.len;
++    // 0 `_scores`, 1..nt the tiles, nt + 1 `_select`, nt + 2 `_select_tiles`, then the QsaSelect kinds
++    const s0 = nt + 3;
++    var ms: [s0 + nk]f32 = @splat(-1);
++    var width: usize = 1;
++    while (width < g.blocks(keys)) width *= 2;
++    for (0..ms.len) |which| {
++        if (which >= 1 and which <= nt and fast == null) continue;
++        if (which == nt + 1 and width > tri.AttnGeometry.select_regs) continue;
++        if (which >= s0 and (sel == null or !QsaSelect.fits(which - s0, g))) continue;
++        for (0..2) |pass| {
++            try e0.record(t.s);
++            for (0..reps) |_| {
++                if (which == 0) {
++                    try qsaScores(t, iq, pooled, pos, scs[0], n, g, keys, dims);
++                } else if (which <= nt) {
++                    var qq = fast.?.*;
++                    qq.pick = which - 1;
++                    try qq.run(t.s, iq, pooled, pos, scs[1], n, g, keys);
++                } else if (which == nt + 1) {
++                    try qsaSelect(t, pos, scs[0], n, g, keys);
++                } else if (which == nt + 2) {
++                    try qsaSelectTiles(t, pos, scs[1], n, g);
++                } else try sel.?.run(which - s0, t.s, pos, scs[1], n, g);
++            }
++            try e1.record(t.s);
++            try e1.synchronize();
++            if (pass == 1) ms[which] = try cuda.Event.elapsedMs(e0, e1) / reps;
++        }
++    }
++    std.debug.print("time decode position {d} rows {d} keys {d}: _scores {d:.4} ms, fn_qsa_scores tiles", .{ p0, n, keys, ms[0] });
++    for (1..nt + 1) |i| std.debug.print(" {d:.4}", .{ms[i]});
++    std.debug.print(" ms, _select {d:.4} ms, _select_tiles {d:.4} ms, qsa select", .{ ms[nt + 1], ms[nt + 2] });
++    for (QsaSelect.kinds, 0..) |kd, k| std.debug.print(" {s} {d:.4}", .{ kd.label, ms[s0 + k] });
++    std.debug.print(" ms\n", .{});
++}
++
++/// ms a call of a prompt block's (`n` rows) selection: the engine's (`_select` below 8192 blocks, `_select_tiles`
++/// from them) against each QsaSelect kind.
++fn qsaPromptSelTimes(d: *const cuda.Driver, t: tri.Tri, sel: *const QsaSelect, pos: u64, sc: tri.AttnScratch, n: usize, g: tri.AttnGeometry, ends: usize, p0: usize) !void {
++    var e0 = try cuda.Event.init(d, true);
++    defer e0.deinit();
++    var e1 = try cuda.Event.init(d, true);
++    defer e1.deinit();
++    const reps = 5;
++    var ms: [1 + QsaSelect.kinds.len]f32 = @splat(-1);
++    for (0..ms.len) |which| {
++        if (which > 0 and !QsaSelect.fits(which - 1, g)) continue;
++        for (0..2) |pass| {
++            try e0.record(t.s);
++            for (0..reps) |_| {
++                if (which > 0) {
++                    try sel.run(which - 1, t.s, pos, sc, n, g);
++                } else if (g.blocks(ends) >= 8192) {
++                    try qsaSelectTiles(t, pos, sc, n, g);
++                } else try qsaSelect(t, pos, sc, n, g, ends);
++            }
++            try e1.record(t.s);
++            try e1.synchronize();
++            if (pass == 1) ms[which] = try cuda.Event.elapsedMs(e0, e1) / reps;
++        }
++    }
++    std.debug.print("time prompt block position {d} rows {d}: engine select {d:.4} ms, qsa select", .{ p0, n, ms[0] });
++    for (QsaSelect.kinds, 0..) |kd, k| std.debug.print(" {s} {d:.4}", .{ kd.label, ms[1 + k] });
++    std.debug.print(" ms\n", .{});
++}
++
+ /// Scoring time of 256 rows: `_scores` against fn_qsa_scores at several key counts (keys are random).
+ pub fn qsaBench(d: *const cuda.Driver, t: tri.Tri, fast: *const QsaScores) !void {
+     const capacity: usize = 1048576 + 8;
+@@ -533,7 +751,7 @@ pub fn qsaBench(d: *const cuda.Driver, t: tri.Tri, fast: *const QsaScores) !void
+             try e2.synchronize();
+         }
+         const a = try cuda.Event.elapsedMs(e0, e1) / 5;
+-        for (0..4) |pk| {
++        for (0..QsaScores.count) |pk| {
+             var qq = fast.*;
+             qq.pick = pk;
+             try e1.record(t.s);

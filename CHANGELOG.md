@@ -3,6 +3,14 @@
 Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:zig-db28187`, built by
 `scripts/prepare.sh` from TensorFold `db281878` plus `patches/`.
 
+## Unreleased
+
+- `patches/0023-flash-next-indexer-select-scores-tile`, `TF_FLASHNEXT_QSA_SELECT=1` and `TF_FLASHNEXT_QSA_TILE=4` (the
+  defaults): the sparse-attention indexer's block lists come from one read of each row's scores (`fn_qsa_stream.cu`,
+  one CTA a row or a cluster of 4), and the prompt indexer's scores use `fma.rn.f32.bf16` on the packed bf16 words.
+  Cold prefill +4.2% at 128k and +5.5% at 200k through the server; decode -6.5% time a token at 200k; every reply
+  byte-identical (`qsa-check`).
+
 ## [1.0.0] - 2026-10-08
 
 TensorFold's Zig engine (`tensorfold-native`, TP=1). Engine `37763df`, merged into `zig-single` as `453439d`
