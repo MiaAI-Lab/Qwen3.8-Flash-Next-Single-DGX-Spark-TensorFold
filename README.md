@@ -406,36 +406,71 @@ free under load. On this machine, exhausting unified memory freezes it.
 ### Kernel `NV_ERR_NO_MEMORY` messages under load (issue #33)
 
 Under a long mixed load, stock 1.0.0 can log `NV_ERR_NO_MEMORY ... _memdescAllocInternal` in the kernel log while
-`MemAvailable` stays above 30 GiB. No request fails. On a GB10 (driver 580.173.02, kernel 6.17.0-1029-nvidia), with
-8 clients for 45 minutes, a ~62k-token prompt every fifth request and images every seventh, stock logged 103 and 90
-in two runs. A trace put 108 of 115 inside the ~28 MiB `cuMemCreate` calls that grow a kept ~62k-token state.
+`MemAvailable` stays above 30 GiB; no request failed in the runs below. On a GB10 (driver 580.173.02, kernel
+6.17.0-1029-nvidia), with 8 clients for 45 minutes, a ~62k-token prompt every fifth request and images every
+seventh, stock logged 103 and 90 in two runs (139 in one run on 6.17.0-1031-nvidia). A trace put 108 of 115 inside
+the `cuMemCreate` calls that grow a kept ~62k-token state (103 of them 28 MiB, 5 of 4 or 6 MiB).
 
-`patches/0010-system-memory-cache.patch` is an opt-in mitigation. It is off unless set:
+A stock driver probe on 1031 recorded 12 failed system-memory allocations requesting 64 KiB pages; each 64 KiB block
+must be physically contiguous. NVIDIA's 580.173.02 source logs the failure (`memdescAlloc`) before retrying eligible
+default-page allocations with 4 KiB pages (`sysmemConstruct`). The aggregate counts fit that retry, but the probe
+does not pair each buffer with its retry. All 105 load requests succeeded. This does not identify the patched runs'
+remaining warnings or the Linux allocator's reason for each failure.
+
+`patches/0010-system-memory-cache.patch` is an opt-in mitigation. Its allocation changes are off unless set (the
+patch also fixes partial-growth accounting and partial ring cleanup, which apply either way):
 
 - `TF_FLASHNEXT_SYSTEM_CACHE=1` backs the K/V caches, fixed sequence state and snapshots with locked, ordinary
-  system memory registered with CUDA (`cuMemHostRegister`), instead of new driver allocations. It needs Linux, one
-  GPU (TP=1), VMM and an integrated GPU with pageable memory access, and refuses to start otherwise. `start.sh`
-  already runs the container with `--ulimit memlock=-1`.
+  system memory registered with CUDA (`cuMemHostRegister`), instead of native CUDA backing allocations for those
+  buffers. It needs Linux, one GPU (TP=1), VMM and an integrated GPU with pageable memory access, and refuses to start
+  otherwise. `start.sh` already runs the container with `--ulimit memlock=-1`. CUDA registration still needs driver
+  metadata and mappings. Weights, scratch and ring-cache misses still use native allocations.
 - `TF_FLASHNEXT_RING_CACHE=1` (with the above) also reuses whole retired indexer-ring regions, capped at 64 MiB
-  physical, 32 entries and 1 GiB of addresses.
+  physical, 32 entries, 1 GiB of addresses and 512 mappings of idle retained regions per engine.
+
+From a checkout containing patch 0010, build locally and restart the container (a published image with this patch
+is not established by these tests). Remove `TF_FLASHNEXT_GRAPH_LOG` from the environment and `.env` entirely: setting
+it to 0 turns diagnostics on.
 
 ```bash
-TF_FLASHNEXT_SYSTEM_CACHE=1 TF_FLASHNEXT_RING_CACHE=1 ./start.sh
+./scripts/prepare.sh --rebuild
+TF_FLASHNEXT_SYSTEM_CACHE=1 TF_FLASHNEXT_RING_CACHE=1 ./start.sh restart
 ```
 
-Same load, two 45-minute runs each:
+Check the running container's image and both flags, and that `TF_FLASHNEXT_GRAPH_LOG` is absent. To turn the
+allocation options off, restart with both flags set to 0; the accounting and cleanup fixes remain. A full rollback
+needs the previous recipe and image.
 
-| build | messages | requests / errors | tok/s | p50 / p95 (s) |
+Same reproduction load on kernel 1029, two runs per build with 45 minutes of admission each. Request counts are
+totals across both runs; throughput includes drain time.
+
+| build | messages | total requests / errors | tok/s | p50 / p95 (s) |
 | --- | ---: | ---: | ---: | ---: |
 | stock | 103, 90 | 580 / 0 | 62.3, 62.9 | 80.7 / 99.4, 80.7 / 97.9 |
-| `SYSTEM_CACHE=1` | 0, 10 | 578 / 0 | 62.6, 62.5 | 81.6 / 95.3, 81.1 / 100.1 |
-| `SYSTEM_CACHE=1 RING_CACHE=1` | 0, 2 | 580 / 0 | 62.5, 62.3 | 82.9 / 91.7, 81.1 / 94.7 |
+| `SYSTEM_CACHE=1` | 0, 10 | 578 / 0 | 62.6, 62.4 | 81.6 / 95.3, 81.1 / 100.0 |
+| `SYSTEM_CACHE=1 RING_CACHE=1` * | 0, 2 | 580 / 0 | 62.5, 62.3 | 82.9 / 91.7, 81.1 / 94.6 |
 
-The prompt cache budget and peak (8,370 MiB, eight states) are unchanged. Greedy replies matched stock on seven
+\* These two runs also had `TF_FLASHNEXT_GRAPH_LOG=0` set, which turns graph diagnostics *on* (the engine checks
+that the variable exists) and adds a synchronization, so they don't isolate the effect of ring reuse on warnings or
+speed. On 6.17.0-1031-nvidia, without it, one run each: stock 139 messages, 62.8 tok/s, 80.7 / 96.9 s; with both
+settings 0 messages, 61.8 tok/s, 82.5 / 100.4 s.
+
+The prompt-cache budget policy and the observed peak (8,370 MiB, eight states) are unchanged; the budget itself is
+computed from free memory at startup and varied slightly between runs. Greedy replies matched stock on seven
 cases, including two ~62k passphrases, prompt-cache repeat and extension, eviction and images. Two runs per build
-show no large speed change, not equality. The exact driver allocation behind the remaining messages is not
-identified. Untested: TP=2, other GPUs, other context sizes, long production soaks. `--prompt-cache-gib 2` without
-the patch gave 38 in one run.
+show no large speed change, not equality. The allocation behind the few messages left with the patch was not traced.
+Untested: other GPUs, other context sizes, long production soaks; TP=2 is refused. The test load completed fewer
+requests than in the issue (290 vs 986) and had no prompt reuse. `--prompt-cache-gib 2` without the patch gave 38
+in one run.
+
+These results cover the 1.0.0 recipe: TensorFold db281878 plus patches 0001–0009 and the allocator patch. The
+tested image replaced the native binary, built with Zig 0.17.0, and reused the control GPU kernels; the normal recipe
+build and a 1.0.7 rebase have not been validated by these tests. The patched residual warnings remain unidentified.
+Longer soaks and the reporter's workload with prompt reuse remain open.
+
+Without the patch, the driver setting `NVreg_RegistryDwords="RmEnableLargePageSizeSysmemDefault=0"` (nvidia module
+option, reboot) makes default system-memory allocations start at 4 KiB. In one 45-minute run on 1031 it gave 0
+messages, but 58.6 instead of 62.8 tok/s (p50 86.4 vs 80.7 s).
 
 ## Configuration
 
