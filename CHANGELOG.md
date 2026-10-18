@@ -5,6 +5,15 @@ Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:
 
 ## Unreleased
 
+**Image prompts keep and resume through the prompt cache (one rank, when the engine fills prompts).**
+
+- `patches/0016-flash-next-media-prompt-cache.patch`, active with `TF_FLASHNEXT_FILL=1` or `TF_FLASHNEXT_FILL_FAIR=1`: each run of visual rows goes
+  into the prompt cache key by its features, so a conversation that re-sends its pictures keeps its state at the history mark and resumes it. A
+  seven-picture second turn sent again resumes 19,581 of its 19,588 tokens (prefill 9.1 s to 0.2 s) and replies byte-identical to a whole prefill
+  of the same prompt; one picture replaced by same-size, different bytes does not match, and neither does an image re-sized by the per-image budget. With
+  `TF_FLASHNEXT_FILL` off, at two ranks, or with keyless media, prompts with images are not kept, exactly as before. `tools/image_reuse.py` checks
+  the kept case (fresh, again, one changed picture).
+
 **Faster prompt prefill on the NVIDIA FP4 checkpoint (+13 to 15%), and an opt-in fair prefill for mixed loads.**
 
 - `patches/0014-engine-prompt-expert-tile.patch`: the routed experts of prompt chunks of 1,024 rows or more run through a new shared-memory kernel

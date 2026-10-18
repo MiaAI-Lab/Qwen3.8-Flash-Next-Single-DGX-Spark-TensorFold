@@ -343,7 +343,10 @@ A video is a `video_url` part (`{"type": "video_url", "video_url": {"url": "data
 | Tokens | up to 16,384 for all images, at most 4,096 an image (`"detail": "low"`: 256 an image) | 2 frames a second (at most 256 frames), up to 16,384 tokens a request (`TENSORFOLD_VIDEO_TOKENS`) |
 
 By default only data URLs are accepted. `VISION_URLS=1` also lets the server fetch public `https://` URLs. Image and
-video prompts are not kept for prefix reuse, so each turn of a chat with images processes them again. A request body
+video prompts are kept for prefix reuse when the engine fills prompts (`TF_FLASHNEXT_FILL=1` or
+`TF_FLASHNEXT_FILL_FAIR=1`, patch `0016`): a run of visual rows goes into the prompt cache key by its features, so
+each turn of a chat with images resumes what it re-sends, and a changed or re-sized picture is processed again. With
+fills off they are not kept, so each turn processes them again. A request body
 can be up to 96 MiB. `VISION=0 ./start.sh restart` serves text only and gives the 2 GiB helper workspace back to the
 KV pool.
 
@@ -517,9 +520,9 @@ the model was still thinking.
 
 `patches/*.patch` is the Zig Flash Next CUDA engine against TensorFold `db281878` (the `zig-flashnext` pin), applied
 with `git apply` in the checkout root. They are the engine, not speed patches on a Python package. Drafts are still
-checked: a drafted reply matches `"draft": false`. `0011` to `0015` are this recipe's own: `0011` lets the vision helper load the NVIDIA
+checked: a drafted reply matches `"draft": false`. `0011` to `0016` are this recipe's own: `0011` lets the vision helper load the NVIDIA
 checkpoint's quantized tower, `0012` makes the Zig engine serve the NVIDIA FP4 checkpoint (config, CSF-compressed expert scales, MXFP8 linears, the
-NVFP4 n-gram table with read-ahead) and `0013` tunes decoding (draft depth 6, the repeat-prompt cache, burst admission). `0014` adds a shared-memory expert tile for prompt chunks (on by default, bit-identical, cold prefill +13 to 15%) and `0015` an opt-in fair prefill for mixed loads (`TF_FLASHNEXT_FILL_FAIR=1`).
+NVFP4 n-gram table with read-ahead) and `0013` tunes decoding (draft depth 6, the repeat-prompt cache, burst admission). `0014` adds a shared-memory expert tile for prompt chunks (on by default, bit-identical, cold prefill +13 to 15%), `0015` an opt-in fair prefill for mixed loads (`TF_FLASHNEXT_FILL_FAIR=1`), and `0016` image prompts that keep and resume through the prompt cache when the fills run.
 
 ## Checks
 
@@ -531,6 +534,7 @@ NVFP4 n-gram table with read-ahead) and `0013` tunes decoding (draft depth 6, th
 | `tools/toolcheck.py` | a tool call whose array argument comes back as a JSON array |
 | `tools/needle.py` | a passphrase in a ~200,000-token prompt |
 | `tools/prompt_reuse.py` | a resumed prompt matches a fresh one |
+| `tools/image_reuse.py` | a re-sent image prompt resumes; a changed picture does not (fills on) |
 | `tools/bench.py` | prefill at 8k-128k and a short decode |
 | `tools/bench_streams.py` | decode at 1 to 5 concurrent requests (prose and code, with TTFT) and prefill 4k to 128k, median of 3 |
 | `tools/context_boundary.py` | a prompt plus reply that fills `--context` succeeds; one token over returns HTTP 400. Authored by [321sssrt-bit](https://github.com/321sssrt-bit) |

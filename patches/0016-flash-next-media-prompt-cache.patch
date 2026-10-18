@@ -1,0 +1,693 @@
+diff --git a/src/tensorfold/vision/native_helper.py b/src/tensorfold/vision/native_helper.py
+index 8e3e886a..03249240 100644
+--- a/src/tensorfold/vision/native_helper.py
++++ b/src/tensorfold/vision/native_helper.py
+@@ -9,7 +9,9 @@ after its ``split_images``: the sources' checks, ``load_images`` (Pillow), ``loa
+ construction; the Zig engine only moves them into the prompt rows.
+ 
+ Frames on stdin / stdout, little endian. Request: u32 length, then JSON
+-``{"prompt": str, "media": [{"kind": "image"|"video", "url": str, "detail": str}], "max_prompt_tokens": int|null}``.
++``{"prompt": str, "media": [{"kind": "image"|"video", "url": str, "detail": str}], "max_prompt_tokens": int|null,
++"history": str|null}`` (``history``: the same messages rendered without the generation prompt; the reply's
++``history_tokens`` is its token count when it is a prefix of the prompt's ids, else 0).
+ Reply: u32 header length, the header JSON, u64 payload length, the payload: token ids u32 [n], feature rows u32 [k]
+ (prompt positions, ascending), rotary positions i32 [n, 3], features bf16 [k, width]. An error reply is a header
+ ``{"ok": false, "status": 400|503, "error": message}`` and an empty payload. The first frame written is the
+@@ -160,7 +162,9 @@ class Helper:
+             budget["videos"] = load_videos(clips, self.vision.video_size, limits=self.video_limits,
+                                            allow_urls=self.allow_urls)
+         limit = request.get("max_prompt_tokens")
+-        return self.vision.prepare(prompt, images, max_prompt_tokens=int(limit) if limit else None, **budget)
++        history = request.get("history")
++        return self.vision.prepare(prompt, images, history=history if isinstance(history, str) and history else None,
++                                   max_prompt_tokens=int(limit) if limit else None, **budget)
+ 
+     def handle(self, request: dict) -> tuple[dict, list[bytes]]:
+         import numpy as np
+@@ -181,6 +185,7 @@ class Helper:
+                   "delta": int(prepared.rope_delta), "width": int(self.vision.config["out_hidden_size"]),
+                   "images": len(prepared.image_spans), "video_groups": len(prepared.video_spans),
+                   "videos": len(prepared.video_hashes), "visual_tokens": int(prepared.visual_tokens),
++                  "history_tokens": int(prepared.history_tokens),
+                   "features_sha256": hashlib.sha256(features).hexdigest(),
+                   "tokens_sha256": hashlib.sha256(tokens).hexdigest(),
+                   "positions_sha256": hashlib.sha256(positions).hexdigest(),
+diff --git a/src/tensorfold/vision/qwen_processing.py b/src/tensorfold/vision/qwen_processing.py
+index cd7fbfcd..00059fc9 100644
+--- a/src/tensorfold/vision/qwen_processing.py
++++ b/src/tensorfold/vision/qwen_processing.py
+@@ -27,6 +27,9 @@ class PreparedVisionPrompt:
+     video_grid_thw: np.ndarray | None = None
+     video_spans: tuple[tuple[int, int], ...] = ()
+     video_hashes: tuple[str, ...] = ()
++    # the history render (the same messages without the generation prompt), when one was sent and tokenizes as a
++    # prefix of ``token_ids``: its length, the prompt cache's history mark for this prompt (0: none)
++    history_tokens: int = 0
+ 
+     @property
+     def visual_tokens(self) -> int:
+@@ -180,10 +183,14 @@ class QwenImageProcessor:
+ 
+     def prepare(self, rendered_prompt: str, images: Sequence[Any], *, videos: Sequence[Any] = (),
+                 max_visual_tokens: int = 4096, max_prompt_tokens: int | None = None,
+-                max_image_tokens: int | None = None) -> PreparedVisionPrompt:
++                max_image_tokens: int | None = None, history: str | None = None) -> PreparedVisionPrompt:
+         """Expand image (and video) markers and calculate request-local rotary metadata without touching the GPU.
+         A video marker (``<|vision_start|><|video_pad|><|vision_end|>``) becomes one timestamped block a frame group,
+-        ``<t seconds><|vision_start|>pads<|vision_end|>``, as Qwen3-VL's processor writes it."""
++        ``<t seconds><|vision_start|>pads<|vision_end|>``, as Qwen3-VL's processor writes it.
++
++        ``history`` (the same messages rendered without the generation prompt): its expansion, tokenization and
++        prefix check against the full prompt's ids fill ``history_tokens``, the Zig server's cache key's history
++        mark. Anything that does not line up leaves it 0, and the prompt is served uncached."""
+         if (not images and not videos) or max_visual_tokens < 1:
+             raise ValueError("Image preprocessing needs images and a positive visual-token budget")
+         if rendered_prompt.count(self.image_token) != len(images):
+@@ -222,21 +229,36 @@ class QwenImageProcessor:
+             raise ValueError("Processed images exceed the visual-token budget; reduce image resolution or count")
+         clips = [self._video_patches(video) for video in videos]
+         markers = [self.image_token] + ([self.video_marker, self.video_token] if videos else [])
+-        pieces = re.split("(" + "|".join(re.escape(m) for m in markers) + ")", rendered_prompt)
+-        image_counts, clip_iter, expanded = iter(counts), iter(zip(videos, clips)), []
+-        for piece in pieces:
+-            if piece == self.image_token:
+-                expanded.append(self.image_token * next(image_counts))
+-            elif piece in (self.video_marker, self.video_token):
+-                video, (_, video_grid) = next(clip_iter)
+-                seqlen = int(video_grid[1] * video_grid[2]) // merge**2
+-                expanded.append("".join(f"<{t:.1f} seconds>{self.vision_start}{self.video_token * seqlen}"
+-                                        f"{self.vision_end}"
+-                                        for t in video.timestamps(int(vision["temporal_patch_size"]))))
+-            else:
+-                expanded.append(piece)
+-        encoded = self.tokenizer("".join(expanded), add_special_tokens=False, return_attention_mask=False)
++
++        def expand(text: str) -> str:
++            """One rendering's markers as the processor's expanded text (each call its own iterators)."""
++            pieces = re.split("(" + "|".join(re.escape(m) for m in markers) + ")", text)
++            image_counts, clip_iter, expanded = iter(counts), iter(zip(videos, clips)), []
++            for piece in pieces:
++                if piece == self.image_token:
++                    expanded.append(self.image_token * next(image_counts))
++                elif piece in (self.video_marker, self.video_token):
++                    video, (_, video_grid) = next(clip_iter)
++                    seqlen = int(video_grid[1] * video_grid[2]) // merge**2
++                    expanded.append("".join(f"<{t:.1f} seconds>{self.vision_start}{self.video_token * seqlen}"
++                                            f"{self.vision_end}"
++                                            for t in video.timestamps(int(vision["temporal_patch_size"]))))
++                else:
++                    expanded.append(piece)
++            return "".join(expanded)
++
++        encoded = self.tokenizer(expand(rendered_prompt), add_special_tokens=False, return_attention_mask=False)
+         tokens = tuple(int(t) for t in encoded["input_ids"])
++        history_tokens = 0
++        if history:
++            # the history render's ids, when they are a prefix of the prompt's: the mark a later turn resumes at
++            try:
++                history_ids = tuple(int(t) for t in self.tokenizer(
++                    expand(history), add_special_tokens=False, return_attention_mask=False)["input_ids"])
++            except (StopIteration, ValueError, KeyError):
++                history_ids = ()            # a history the markers do not line up with: no mark
++            if 0 < len(history_ids) <= len(tokens) and tokens[:len(history_ids)] == history_ids:
++                history_tokens = len(history_ids) if len(history_ids) < len(tokens) else len(tokens) - 1
+         if max_prompt_tokens is not None and len(tokens) > max_prompt_tokens:   # OpenAI's context_length_exceeded
+             raise ValueError(f"{CONTEXT_LIMIT} {max_prompt_tokens} tokens: the expanded image prompt has {len(tokens)} "
+                              "tokens, which exceeds the context window; reduce image resolution or prompt length")
+@@ -249,7 +271,7 @@ class QwenImageProcessor:
+                 array.setflags(write=False)
+         return PreparedVisionPrompt(tokens, pixels, grid, positions, delta, spans,
+                                     tuple(image.content_hash for image in images), video_pixels, video_grid, frames,
+-                                    tuple(video.content_hash for video in videos))
++                                    tuple(video.content_hash for video in videos), history_tokens=history_tokens)
+ 
+     def video_size(self, frames: int, height: int, width: int) -> tuple[int, int]:
+         """A video's frame size for the tower: Qwen3-VL's ``smart_resize`` with its per-frame cap (at most 768 tokens a
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index 1a5216da..90fc30b4 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -180,6 +180,10 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
+     const mods = family(b, host, .debug, cuda, draft_ids);
+     const native = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron, mods.flashnext).engines;
+     for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.flashnext, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
++    // the server's content key for media prompts (zig/src/server/image_key.zig), over the same engine_api
++    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = mods.lanes }} });
++    const image_key = b.createModule(.{ .root_source_file = b.path("zig/src/server/image_key.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "engine_api", .module = api }} });
++    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = image_key })).step);
+     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
+     cli.addImport("cuda", cuda);
+     cli.addImport("core", mods.core);
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index ec26b4a9..843cddee 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -80,8 +80,17 @@ pub const Request = struct {
+     structure: ?Structure = null,
+     /// Stop a short exact cycle while the think block is open.
+     loop_guard: bool = false,
+-    /// The prompt's images and videos (``Info.media`` engines only); such a prompt is never kept or resumed.
++    /// The prompt's images and videos (``Info.media`` engines only); such a prompt is kept and resumed only
++    /// through ``cache_key``.
+     media: ?*const Media = null,
++    /// Where the prompt cache matches, keeps and resumes a prompt with media: the server's words for its visual
++    /// rows (``server/image_key.zig``). Empty: a media prompt is neither kept nor resumed (it prefills whole).
++    cache_key: []const u32 = &.{},
++
++    /// The array the prompt cache matches and keeps states for: the content key when there is one.
++    pub fn cacheKey(r: *const Request) []const u32 {
++        return if (r.cache_key.len > 0) r.cache_key else r.prompt;
++    }
+ };
+ 
+ pub const Reason = enum { stop, length, cancelled, failed };
+@@ -134,6 +143,9 @@ pub const Info = struct {
+     prefill_step: u32 = 0,
+     /// The engine takes ``Request.media`` (image and video rows with their rotary positions).
+     media: bool = false,
++    /// The engine keeps and resumes prompts with media through ``Request.cache_key`` (single-rank engines only;
++    /// a two-rank engine's follower copies carry no visual rows to key).
++    media_cache: bool = false,
+ };
+ 
+ /// A checkpoint family an engine reads: its config ``model_type`` and weight formats, as gate entries name them.
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 96d8f07d..a0e76e49 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -66,7 +66,7 @@ pub const LaneHost = struct {
+         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
+             const job: *Job = @ptrCast(@alignCast(ptr));
+             job.reported(); // before a keep can evict the entry the pass restored
+-            if (job.host.cache) |store| _ = store.keep(job.request.prompt, at, s);
++            if (job.host.cache) |store| _ = store.keep(job.request.cacheKey(), at, s);
+         }
+ 
+         /// The pass started from its kept state, or its copy failed (the entry goes); a pass that never got there: neither.
+@@ -76,7 +76,7 @@ pub const LaneHost = struct {
+             const store = job.host.cache orelse return;
+             if (!job.started) return;
+             job.stream.reuse.saved = null; // the backend restores before its first chunk; a later keep may free it
+-            if (job.stream.reuse_failed) store.resumed(e, job.request.prompt, false) else if (job.stream.cached == e.at) store.resumed(e, job.request.prompt, true);
++            if (job.stream.reuse_failed) store.resumed(e, job.request.cacheKey(), false) else if (job.stream.cached == e.at) store.resumed(e, job.request.cacheKey(), true);
+         }
+     };
+ 
+@@ -303,8 +303,9 @@ pub const LaneHost = struct {
+         const r = job.request;
+         var reuse: lanes.stream.Reuse = .{};
+         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
+-        // a prompt with images or video is neither resumed nor kept (Python keeps token-only states)
+-        if (r.media == null) if (h.cache) |store| if (store.lookup(h.gpa, r.prompt, r.history_len, r.shared_prefixes, r.chunks)) |l| {
++        // a prompt with images or video is matched, kept and resumed through its content key (the server's words
++        // for its visual rows); without one it is left uncached, as it was before the key existed
++        if (r.media == null or r.cache_key.len > 0) if (h.cache) |store| if (store.lookup(h.gpa, r.cacheKey(), r.history_len, r.shared_prefixes, r.chunks)) |l| {
+             job.entry = l.entry;
+             job.kept0 = store.counts.kept;
+             job.marks = l.marks;
+@@ -423,7 +424,7 @@ pub const LaneHost = struct {
+         job.reported();
+         if (h.cache) |store| {
+             store.report(job.request.prompt.len, job.stream.cached, store.counts.kept - job.kept0);
+-            if (job.request.media == null) store.noteServed(job.request.prompt);
++            if (job.request.media == null or job.request.cache_key.len > 0) store.noteServed(job.request.cacheKey());
+         }
+         emit(job, .{ .prefilled = job.stream.cached });
+     }
+diff --git a/zig/src/core/lane_host_reuse_test.zig b/zig/src/core/lane_host_reuse_test.zig
+index 3855da58..cec69a88 100644
+--- a/zig/src/core/lane_host_reuse_test.zig
++++ b/zig/src/core/lane_host_reuse_test.zig
+@@ -1,4 +1,5 @@
+-//! LaneHost with the prompt cache: a conversation's next turn resumes from its kept prompt state (the fake backend).
++//! LaneHost with the prompt cache: a conversation's next turn resumes from its kept prompt state (the fake backend),
++//! and a prompt with media resumes through its content key (and is left uncached without one).
+ const std = @import("std");
+ const lanes = @import("lanes");
+ const api = @import("engine_api.zig");
+@@ -258,3 +259,110 @@ test "a lane host fills prompts between rounds: requests arriving together fill
+     }
+     try std.testing.expect(target.fill_steps > 0);
+ }
++
++test "a media prompt is kept and resumed through its content key, and left uncached without one" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    const Snaps = struct {
++        fn bytes(_: *anyopaque, at: u32) u64 {
++            return 64 + 4 * @as(u64, at);
++        }
++        fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!pc.Saved {
++            const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++            return f.save(@ptrCast(@alignCast(owner.?)), at);
++        }
++        fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {
++            return error.BackendRestores;
++        }
++        fn drop(ptr: *anyopaque, saved: pc.Saved) void {
++            const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++            f.drop(saved);
++        }
++    };
++    var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
++    defer store.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    host.cache = &store;
++    try host.start();
++    defer host.stop();
++    const Box = struct {
++        mutex: std.Io.Mutex = .init,
++        tokens: std.ArrayList(u32) = .empty,
++        cached: ?u32 = null,
++        done: ?Reason = null,
++        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++            const b: *@This() = @ptrCast(@alignCast(ctx));
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            switch (e.*) {
++                .prefilled => |c| b.cached = c,
++                .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
++                .finished => |f| b.done = f.reason,
++            }
++        }
++        fn wait(b: *@This()) Reason {
++            while (true) {
++                b.mutex.lockUncancelable(std.testing.io);
++                const d = b.done;
++                b.mutex.unlock(std.testing.io);
++                if (d) |r| return r;
++                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++            }
++        }
++    };
++    const e = host.engine();
++    const picture: lanes.Media = .{ .rows = &.{2}, .positions = &.{}, .delta = 0, .features = &.{}, .width = 2 };
++    const t1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3 };
++    var k1 = t1; // the server's key: the image's row and its boundaries are words, the rest are the tokens
++    k1[1] = 0x8000_0001;
++    k1[2] = 0x8000_0002;
++    var b1: Box = .{};
++    defer b1.tokens.deinit(gpa);
++    const r1: Request = .{ .prompt = &t1, .max_tokens = 6, .history_len = 8, .media = &picture, .cache_key = &k1 };
++    try e.submit(1, &r1, .{ .ctx = &b1, .event = Box.event });
++    try std.testing.expectEqual(Reason.length, b1.wait());
++    try std.testing.expectEqual(@as(?u32, 0), b1.cached);
++    try std.testing.expectEqual(@as(usize, 1), store.entries.items.len);
++    try std.testing.expectEqualSlices(u32, k1[0..8], store.entries.items[0].tokens); // the key, not the prompt
++    var t2: std.ArrayList(u32) = .empty; // the next turn: the history, the reply, a new user turn
++    defer t2.deinit(gpa);
++    try t2.appendSlice(gpa, &t1);
++    try t2.appendSlice(gpa, b1.tokens.items[0..4]);
++    try t2.appendSlice(gpa, &.{ 7, 7, 5, 3 });
++    var k2: std.ArrayList(u32) = .empty;
++    defer k2.deinit(gpa);
++    try k2.appendSlice(gpa, &k1);
++    try k2.appendSlice(gpa, b1.tokens.items[0..4]);
++    try k2.appendSlice(gpa, &.{ 7, 7, 5, 3 }); // the same picture: the same words at the image's rows
++    var b2: Box = .{};
++    defer b2.tokens.deinit(gpa);
++    const r2: Request = .{ .prompt = t2.items, .max_tokens = 12, .history_len = @intCast(t2.items.len - 2), .media = &picture, .cache_key = k2.items };
++    try e.submit(2, &r2, .{ .ctx = &b2, .event = Box.event });
++    try std.testing.expectEqual(Reason.length, b2.wait());
++    try std.testing.expectEqual(@as(?u32, 8), b2.cached); // resumed at the history mark
++    try std.testing.expectEqual(@as(u64, 1), store.counts.hits);
++    var k3 = k2; // the same tokens, another picture: the image's words change
++    k3.items[2] = 0x8000_0003;
++    var b3: Box = .{};
++    defer b3.tokens.deinit(gpa);
++    const r3: Request = .{ .prompt = t2.items, .max_tokens = 12, .history_len = @intCast(t2.items.len - 2), .media = &picture, .cache_key = k3.items };
++    try e.submit(3, &r3, .{ .ctx = &b3, .event = Box.event });
++    try std.testing.expectEqual(Reason.length, b3.wait());
++    try std.testing.expectEqual(@as(?u32, 0), b3.cached); // another picture: no state may be resumed
++    const entries = store.entries.items.len;
++    const kept = store.counts.kept;
++    var b4: Box = .{};
++    defer b4.tokens.deinit(gpa);
++    const r4: Request = .{ .prompt = t2.items, .max_tokens = 12, .history_len = @intCast(t2.items.len - 2), .media = &picture }; // no key
++    try e.submit(4, &r4, .{ .ctx = &b4, .event = Box.event });
++    try std.testing.expectEqual(Reason.length, b4.wait());
++    try std.testing.expectEqual(@as(?u32, 0), b4.cached); // no key: neither resumed nor kept
++    try std.testing.expectEqual(entries, store.entries.items.len);
++    try std.testing.expectEqual(kept, store.counts.kept);
++}
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index 1e3c65f6..80b2dbbd 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -99,7 +99,8 @@ pub const Held = struct {
+ /// A prompt's images and video frames as the vision frontend prepared them (Python's EncodedVision): the prompt
+ /// rows the visual features replace (ascending), each prompt row's three rotary positions (t, h, w: [n, 3] row
+ /// major, i32), the decode offset (text after the prompt rotates at its position + delta) and the features
+-/// (bf16 [rows.len, width]). A prompt with media prefills from its start and keeps no prefix states.
++/// (bf16 [rows.len, width]). A prompt with media is kept and resumed through the server's content key
++/// (``Request.cache_key``, ``server/image_key.zig``); without one it prefills from its start and keeps no states.
+ pub const Media = struct {
+     rows: []const u32,
+     positions: []const i32,
+diff --git a/zig/src/families/flashnext/cuda_engine.zig b/zig/src/families/flashnext/cuda_engine.zig
+index 5ca0bb89..c1b9c168 100644
+--- a/zig/src/families/flashnext/cuda_engine.zig
++++ b/zig/src/families/flashnext/cuda_engine.zig
+@@ -1167,7 +1167,8 @@ pub const Engine = struct {
+         if (prompt.len == 0) return error.EmptyPrompt;
+         if (prompt.len + e.depth + 1 > seq.st.limit) return error.ContextPastWindow;
+         if (o.keep_at) |k| if (k == 0 or k > prompt.len) return error.BadKeepPoint;
+-        if (o.media != null and (o.keep_at != null or o.resume_from != null)) return error.MediaPromptKept;
++        // one rank: a media prompt fills, keeps and resumes when the server gave it a content key; two: refused
++        if (o.media != null and (o.keep_at != null or o.resume_from != null) and e.f.comm != null) return error.MediaPromptKept;
+         const fl = try e.gpa.create(Fill);
+         errdefer e.gpa.destroy(fl);
+         fl.* = .{ .seq = seq, .prompt = try e.gpa.dupe(u32, prompt), .sampling = if (sampling) |x| (if (x.temperature > 0) x else null) else null, .keep_at = o.keep_at, .use_mtp = e.absorbing and e.w.mtp != null, .start = 0 };
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 9e56f2df..1029e8b1 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -240,7 +240,7 @@ pub fn Lanes(comptime E: type) type {
+             };
+             // fair fills: another prompt is mid-chunk, so a resume (it runs the MTP head over the prompt buffers) waits
+             if (comptime @hasField(E, "pfill")) {
+-                if (self.fair and self.e.pfill != null and s.media == null) {
++                if (self.fair and self.e.pfill != null and (s.media == null or s.reuse.at > 0)) {
+                     l.fill = .{ .fl = undefined, .lazy = true };
+                     return;
+                 }
+@@ -284,7 +284,17 @@ pub fn Lanes(comptime E: type) type {
+                 if (m > f.at and m < ids.len) break m;
+             } else null;
+             if (next_mark) |m| {
+-                f.fl = try self.e.fillBegin(l.seq, ids[0..m], s.sampling, .{ .keep_at = m, .resume_from = f.cur });
++                // a segment that ends at a mark keeps a state the cache may resume: its fill covers the prompt's
++                // first `m` rows, so its media is the rows (and theirs positions) under `m` alone, and no media at
++                // all when no visual row lies under it (the segment is plain text)
++                var cut: ?lanes.Media = null;
++                if (s.media) |m0| {
++                    // two ranks: a follower's copy has no rows to cut, and the server gives media no key there
++                    if (self.gate != null) return error.MediaRefused;
++                    const under = mediaUnder(m0, m);
++                    if (under.rows.len > 0) cut = under;
++                }
++                f.fl = try self.e.fillBegin(l.seq, ids[0..m], s.sampling, .{ .keep_at = m, .resume_from = f.cur, .media = if (cut) |*c| c else null });
+                 f.final = false;
+             } else {
+                 f.fl = try self.e.fillBegin(l.seq, ids, s.sampling, .{ .resume_from = f.cur, .media = s.media });
+@@ -372,7 +382,12 @@ pub fn Lanes(comptime E: type) type {
+                 } else |err| std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ m, @errorName(err) });
+                 if (s.reuse.hook) |h| h.at(h.ptr, s, m);
+                 f.at = m;
+-                self.startSegment(s, l, f) catch |err| return self.lost("a prompt's fill", err);
++                self.startSegment(s, l, f) catch |err| {
++                    self.dropLane(s, l);
++                    // a media attachment refused (memory, bad rows): the request fails, not the engine
++                    if (err == error.MediaRefused) return err;
++                    return self.lost("a prompt's fill", err);
++                };
+                 return;
+             }
+             _ = self.take(f.fl.first);
+@@ -1294,6 +1309,19 @@ fn passNow(e: anytype) std.Io.Timestamp {
+     return std.Io.Timestamp.now(e.io, .awake);
+ }
+ 
++/// `m` as the rows under `at` alone: a mark segment's fill covers the prompt's first `at` rows, so the media it
++/// attaches is the visual rows before `at` and their positions (`attachMedia` reads `positions[0 .. at*3]` and
++/// the features row-major). `m.rows` ascends, so the rows' count is the first row at or past `at`.
++fn mediaUnder(m: *const lanes.Media, at: u32) lanes.Media {
++    var k: usize = 0;
++    while (k < m.rows.len and m.rows[k] < at) k += 1;
++    var out = m.*;
++    out.rows = m.rows[0..k];
++    out.positions = m.positions[0 .. @as(usize, at) * 3];
++    out.features = m.features[0 .. k * @as(usize, m.width) * 2];
++    return out;
++}
++
+ /// ms since `last` (the stream drained first), and `last` moved to now.
+ fn passSince(e: anytype, last: *std.Io.Timestamp) f64 {
+     const now = passNow(e);
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index e00b222f..0e14a251 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -285,7 +285,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     h.clock = .{ .io = io };
+     h.core = lanes.Engine.init(gpa, &h.cfg, h.backend(), h.clock.clock());
+     errdefer h.core.deinit();
+-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = F.prefill_step, .call_gates = true, .media = @hasDecl(F, "media") and F.media });
++    // the keyed media cache needs the sliced fill path (the lane backend's beginFill/stepOne keep each mark
++    // segment's rows and inject the visual features under the mark): the whole-prompt pass cannot do either
++    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = F.prefill_step, .call_gates = true, .media = @hasDecl(F, "media") and F.media, .media_cache = @hasDecl(F, "media") and F.media and o.tp < 2 and h.core.fills() });
+     h.store = null;
+     if (@hasField(@TypeOf(loaded), "cache")) if (loaded.cache) |c| if (c.budget > 0) {
+         // the family keeps and restores the states; the store picks them (exact reuse, core/prompt_cache.zig)
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 81b63c16..d8b2cbb4 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -182,6 +182,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+         .chunks = try srv.chunks.starts(a, rendered.ids),
+         .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
+         .media = rendered.media,
++        .cache_key = rendered.cache_key,
+     };
+     try srv.checkFeatures(cx, f, input.tools.len > 0, thinking, rendered.ids, input.tools, &request);
+     if (thinking) {
+diff --git a/zig/src/server/image_key.zig b/zig/src/server/image_key.zig
+new file mode 100644
+index 00000000..b03caf14
+--- /dev/null
++++ b/zig/src/server/image_key.zig
+@@ -0,0 +1,132 @@
++//! The prompt cache's key for a prompt with images or video: the token ids, with each run of visual rows and the
++//! token that opens and closes it replaced by words derived from the run's features. Two prompts of the same
++//! tokens whose pictures differ (a later screenshot, an image re-sized at a new budget) then key differently, so
++//! the store's exact matching keeps and resumes whole states only for the same pictures, as upstream's
++//! server/image_key.zig does. Positions outside the runs keep their token id, so a text prompt that is a prefix
++//! of such a key matches that prefix of the prompt.
++const std = @import("std");
++const api = @import("engine_api");
++const Allocator = std.mem.Allocator;
++
++/// Set in every word a visual run writes: no vocabulary has it (token ids are far below 2^31), so a key word can
++/// never be mistaken for a token.
++const tag: u32 = 0x8000_0000;
++const low31: u64 = 0x7fff_ffff;
++/// The identity's seed: private to this build (keys never cross the wire and do not persist).
++const seed: u64 = 0x696d_6167_655f_6b65; // "image_ke"
++
++/// The token before a run (``vision_start``): a word naming the run's features.
++fn openWord(identity: u64) u32 {
++    return tag | @as(u32, @truncate(identity & low31));
++}
++
++/// The token after a run (``vision_end``): the identity's other half.
++fn closeWord(identity: u64) u32 {
++    return tag | @as(u32, @truncate((identity >> 31) & low31));
++}
++
++/// Row `row` (0-based, in the run) of a run: distinct words for one identity.
++fn rowWord(identity: u64, row: usize) u32 {
++    const j: u64 = @intCast(row);
++    return tag | @as(u32, @truncate(std.hash.Wyhash.hash(identity, std.mem.asBytes(&j)) & low31));
++}
++
++/// The end of the run of consecutive rows that starts at `run`.
++fn runEnd(rows: []const u32, run: usize) usize {
++    var end = run + 1;
++    while (end < rows.len and rows[end] == rows[end - 1] + 1) end += 1;
++    return end;
++}
++
++/// `ids` as the cache's key for the media `m`: an empty key when the media is a following rank's copy, is not the
++/// shape of one prompt for these ids, or a run has no boundary token to hold its words (the vision helper
++/// validates both boundaries before it answers; a key without them would be unsound). A request without a key is
++/// left uncached.
++pub fn key(a: Allocator, ids: []const u32, m: *const api.Media) ![]const u32 {
++    if (m.follower_rows != 0 or m.rows.len == 0 or m.width == 0) return &.{};
++    const row_bytes = @as(usize, m.width) * 2;
++    if (m.positions.len != ids.len * 3 or m.features.len != m.rows.len * row_bytes) return &.{};
++    var run: usize = 0;
++    while (run < m.rows.len) {
++        const end = runEnd(m.rows, run);
++        if (m.rows[run] == 0 or m.rows[end - 1] >= ids.len -| 1 or (run > 0 and m.rows[run] <= m.rows[run - 1])) return &.{};
++        run = end;
++    }
++    const out = try a.dupe(u32, ids);
++    run = 0;
++    while (run < m.rows.len) {
++        const end = runEnd(m.rows, run);
++        const identity = std.hash.Wyhash.hash(seed, m.features[run * row_bytes .. end * row_bytes]);
++        out[m.rows[run] - 1] = openWord(identity);
++        out[m.rows[end - 1] + 1] = closeWord(identity);
++        for (run..end) |i| out[m.rows[i]] = rowWord(identity, i - run);
++        run = end;
++    }
++    return out;
++}
++
++const testing = std.testing;
++
++fn mediaOf(rows: []const u32, positions: []const i32, features: []const u8, width: u32) api.Media {
++    return .{ .rows = rows, .positions = positions, .delta = 0, .features = features, .width = width };
++}
++
++test "a run's rows and its boundaries become words of its own features; every other position keeps its id" {
++    const ids = [_]u32{ 10, 11, 99, 99, 99, 12, 13 };
++    const rows = [_]u32{ 2, 3, 4 };
++    var positions: [ids.len * 3]i32 = @splat(0);
++    const features = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }; // 3 rows * width 2 * 2 bytes
++    const m = mediaOf(&rows, &positions, &features, 2);
++    const got = try key(testing.allocator, &ids, &m);
++    defer testing.allocator.free(got);
++    try testing.expectEqual(ids.len, got.len);
++    try testing.expectEqual(@as(u32, 10), got[0]);
++    try testing.expectEqual(@as(u32, 13), got[6]);
++    for (got[1..6]) |w| try testing.expect(w & tag != 0); // the open, three rows, the close
++    try testing.expect(got[1] != got[2] and got[2] != got[3] and got[1] != got[4]); // distinct words in one run
++    const again = try key(testing.allocator, &ids, &m);
++    defer testing.allocator.free(again);
++    try testing.expectEqualSlices(u32, got, again); // the same features key identically
++}
++
++test "other features key every word of their run differently" {
++    const ids = [_]u32{ 10, 11, 99, 99, 12 };
++    const rows = [_]u32{ 2, 3 };
++    var positions: [ids.len * 3]i32 = @splat(0);
++    const a_features = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
++    var b_features = a_features;
++    b_features[7] = 9; // one byte of one row differs
++    const a = mediaOf(&rows, &positions, &a_features, 2);
++    const b = mediaOf(&rows, &positions, &b_features, 2);
++    const ka = try key(testing.allocator, &ids, &a);
++    defer testing.allocator.free(ka);
++    const kb = try key(testing.allocator, &ids, &b);
++    defer testing.allocator.free(kb);
++    for (1..5) |i| try testing.expect(ka[i] != kb[i]); // rows and both boundaries
++    try testing.expectEqual(ka[0], kb[0]);
++}
++
++test "runs key independently, and no key when the media cannot be trusted" {
++    const ids = [_]u32{ 10, 99, 99, 11, 12, 99, 99, 99, 13, 14 };
++    const rows = [_]u32{ 1, 2, 5, 6, 7 };
++    var positions: [ids.len * 3]i32 = @splat(0);
++    const features: [5 * 2 * 2]u8 = @splat(0);
++    const m = mediaOf(&rows, &positions, &features, 2);
++    const got = try key(testing.allocator, &ids, &m);
++    defer testing.allocator.free(got);
++    try testing.expectEqual(@as(u32, 14), got[9]); // outside the runs: the token id
++    try testing.expect(got[0] & tag != 0 and got[3] & tag != 0 and got[4] & tag != 0 and got[8] & tag != 0);
++    try testing.expect(got[1] & tag != 0 and got[5] & tag != 0);
++    try testing.expect(got[0] != got[4] and got[3] != got[8]); // two runs, two identities
++    var follower = m;
++    follower.follower_rows = 5; // a following rank's copy carries the row count only
++    try testing.expectEqual(@as(usize, 0), (try key(testing.allocator, &ids, &follower)).len);
++    var short = m;
++    short.features = features[0 .. features.len - 1];
++    try testing.expectEqual(@as(usize, 0), (try key(testing.allocator, &ids, &short)).len);
++    const two: [8]u8 = @splat(0); // two rows of width 2
++    const edge = mediaOf(&.{ 0, 1 }, &positions, &two, 2); // no token before the run to hold its open word
++    try testing.expectEqual(@as(usize, 0), (try key(testing.allocator, &ids, &edge)).len);
++    const tail = mediaOf(&.{ 8, 9 }, &positions, &two, 2); // the last row's close word would write past the prompt
++    try testing.expectEqual(@as(usize, 0), (try key(testing.allocator, &ids, &tail)).len);
++}
+diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
+index 65a8a397..e5fb5940 100644
+--- a/zig/src/server/prompt.zig
++++ b/zig/src/server/prompt.zig
+@@ -8,11 +8,12 @@ const chat = @import("chat.zig");
+ const Server = @import("server.zig").Server;
+ const api = @import("engine_api");
+ const vision = @import("vision.zig");
++const image_key = @import("image_key.zig");
+ const log = @import("log.zig");
+ const Value = json.Value;
+ const Cx = errors.Cx;
+ 
+-pub const Rendered = struct { ids: []const u32, history_len: usize = 0, media: ?*const api.Media = null };
++pub const Rendered = struct { ids: []const u32, history_len: usize = 0, media: ?*const api.Media = null, cache_key: []const u32 = &.{} };
+ 
+ pub const isTitle = messages_mod.isTitleRequest;
+ 
+@@ -63,7 +64,8 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
+ 
+ /// ``prepare_images``: the messages split (image_url / video_url parts as the template's image / video parts, the
+ /// media in order), normalized with their parts, rendered, then the vision helper's processor and tower: Python's
+-/// token ids and the media the engine takes. Such a prompt is neither kept nor resumed.
++/// token ids and the media the engine takes, the history render's token count (the prompt cache's history mark)
++/// and the content key for its visual rows when the engine keeps media states.
+ fn prepareMedia(srv: *Server, cx: *Cx, raw: Value, tools: []const Value, thinking: bool, effort: ?[]const u8) errors.Refused!Rendered {
+     const helper = srv.vision orelse return cx.refuse("image input requires a supported vision checkpoint served with --vision");
+     if (!srv.info.media) return cx.refuse("image input requires a supported vision checkpoint served with --vision");
+@@ -82,8 +84,20 @@ fn prepareMedia(srv: *Server, cx: *Cx, raw: Value, tools: []const Value, thinkin
+         error.OutOfMemory => return error.OutOfMemory,
+         error.Template => return cx.fail(.request, "the chat template rejected the request: {s}", .{problem}),
+     };
++    // the cache's history mark: the same messages without the generation prompt, the helper counting its tokens
++    // with the same images. A template that rejects or a helper that finds no prefix leaves the prompt uncached.
++    var history: []const u8 = "";
++    if (srv.info.media_cache) {
++        var history_options = options;
++        history_options.add_generation_prompt = false;
++        var history_problem: []const u8 = "";
++        history = srv.text.render(cx.a, normalized, history_options, &history_problem) catch |e| switch (e) {
++            error.OutOfMemory => return error.OutOfMemory,
++            error.Template => "",
++        };
++    }
+     const window = srv.info.context_window;
+-    const result = helper.prepare(cx.a, text, sources.items, if (window > 0) window else null) catch |e| switch (e) {
++    const result = helper.prepare(cx.a, text, history, sources.items, if (window > 0) window else null) catch |e| switch (e) {
+         error.OutOfMemory => return error.OutOfMemory,
+         else => return cx.fail(.capacity, "image processing failed ({s}); retry shortly", .{@errorName(e)}),
+     };
+@@ -93,8 +107,9 @@ fn prepareMedia(srv: *Server, cx: *Cx, raw: Value, tools: []const Value, thinkin
+             return cx.fail(if (r.status == 503) .capacity else .request, "{s}", .{r.message});
+         },
+         .ok => |p| {
+-            log.line("vision: {d} image(s), {d} video(s): {d} visual tokens of {d} prompt tokens (prepare {d:.3}s, tower {d:.3}s, helper GPU peak {d:.2} GiB, features {s})", .{ p.images, p.videos, p.visual_tokens, p.tokens.len, p.prepare_s, p.encode_s, @as(f64, @floatFromInt(p.peak)) / (1 << 30), if (p.features_sha.len >= 16) p.features_sha[0..16] else p.features_sha });
+-            return .{ .ids = p.tokens, .media = p.media };
++            const cache_key = if (srv.info.media_cache and p.history_tokens > 0) try image_key.key(cx.a, p.tokens, p.media) else &[_]u32{};
++            log.line("vision: {d} image(s), {d} video(s): {d} visual tokens of {d} prompt tokens (prepare {d:.3}s, tower {d:.3}s, helper GPU peak {d:.2} GiB, features {s}, cache {d} rows, history {d})", .{ p.images, p.videos, p.visual_tokens, p.tokens.len, p.prepare_s, p.encode_s, @as(f64, @floatFromInt(p.peak)) / (1 << 30), if (p.features_sha.len >= 16) p.features_sha[0..16] else p.features_sha, if (cache_key.len > 0) p.media.rows.len else 0, if (cache_key.len > 0) p.history_tokens else 0 });
++            return .{ .ids = p.tokens, .history_len = if (cache_key.len > 0) p.history_tokens else 0, .media = p.media, .cache_key = cache_key };
+         },
+     }
+ }
+diff --git a/zig/src/server/vision.zig b/zig/src/server/vision.zig
+index 49ec1d40..1296f1e2 100644
+--- a/zig/src/server/vision.zig
++++ b/zig/src/server/vision.zig
+@@ -31,6 +31,9 @@ pub const Prepared = struct {
+     features_sha: []const u8,
+     /// the helper's torch reservation peak during the request (bytes)
+     peak: u64 = 0,
++    /// how many of `tokens` the request's history render (no generation prompt) covers, when one was sent
++    /// and the helper found it a prefix: the prompt cache's history mark for the keyed media prompt (0: none)
++    history_tokens: u32 = 0,
+ };
+ 
+ pub const Refusal = struct { status: u16, message: []const u8, context: bool = false };
+@@ -237,9 +240,10 @@ pub const Helper = struct {
+     }
+ 
+     /// The helper's answer for one rendered prompt and its media; `a` holds the result (the request's arena).
+-    pub fn prepare(h: *Helper, a: Allocator, prompt: []const u8, sources: []const Source, max_prompt_tokens: ?u32) !Result {
++    pub fn prepare(h: *Helper, a: Allocator, prompt: []const u8, history: []const u8, sources: []const Source, max_prompt_tokens: ?u32) !Result {
+         const req = try json.newObject(a);
+         try req.put(a, "prompt", .{ .string = prompt });
++        if (history.len > 0) try req.put(a, "history", .{ .string = history });
+         const list = try a.alloc(Value, sources.len);
+         for (sources, list) |s, *slot| {
+             const o = try json.newObject(a);
+@@ -320,6 +324,6 @@ pub const Helper = struct {
+                 return @intCast(if (v.get(key)) |x| x.int64() orelse 0 else 0);
+             }
+         };
+-        return .{ .ok = .{ .tokens = tokens, .media = media, .images = count.of(head, "images"), .videos = count.of(head, "videos"), .visual_tokens = count.of(head, "visual_tokens"), .prepare_s = if (head.get("prepare_s")) |x| x.float64() orelse 0 else 0, .encode_s = if (head.get("encode_s")) |x| x.float64() orelse 0 else 0, .features_sha = head.strField("features_sha256") orelse "", .peak = @intCast(@max(0, if (head.get("peak")) |x| x.int64() orelse 0 else 0)) } };
++        return .{ .ok = .{ .tokens = tokens, .media = media, .images = count.of(head, "images"), .videos = count.of(head, "videos"), .visual_tokens = count.of(head, "visual_tokens"), .prepare_s = if (head.get("prepare_s")) |x| x.float64() orelse 0 else 0, .encode_s = if (head.get("encode_s")) |x| x.float64() orelse 0 else 0, .features_sha = head.strField("features_sha256") orelse "", .peak = @intCast(@max(0, if (head.get("peak")) |x| x.int64() orelse 0 else 0)), .history_tokens = count.of(head, "history_tokens") } };
+     }
+ };
