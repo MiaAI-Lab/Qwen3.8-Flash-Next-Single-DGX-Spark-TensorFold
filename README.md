@@ -566,8 +566,16 @@ the model was still thinking.
 - A conversation's next turn resumes from the kept state of its earlier turns, with images too (patch 0030: each
   image is matched by a hash of its bytes, so a changed image resumes only up to its first row). Video prompts are not
   kept.
-- Structured outputs (`response_format`, the `guided_*` fields) are refused with HTTP 400: this engine does not
-  enforce them.
+- Structured outputs are enforced by constrained decoding: `response_format` `json_object` and `json_schema`,
+  `structured_outputs`, the `guided_json`, `guided_regex`, `guided_choice` and `guided_grammar` (EBNF) fields, the
+  Responses API `text.format` and Anthropic `output_config.format`. Every token the engine samples, MTP drafts
+  included, is checked against an [xgrammar](https://github.com/mlc-ai/xgrammar) mask, so the reply parses against
+  the schema unless `max_tokens` cuts it short. With thinking on, the grammar starts after `</think>`. HTTP 400
+  refuses a schema xgrammar cannot compile, one that does not compile within 10 s, and one over 64 KiB or nested
+  deeper than 64 levels. At most 4 grammars compile at once; a request waits for a free compile within the same
+  10 s, and is refused with "retry shortly" when none frees up. The masks come from `libtfgrammar`
+  (built into the image, loaded on the first structured request). A drafted structured reply is the same as its
+  `"draft": false` reply.
 - When the KV pool is full, a new request is refused. Admission reserves the prompt plus `max_tokens`; the request is
   not queued. Kept prompt states share that pool: admission frees them first (patch 0029), so a request is refused
   only when it would not fit with every freeable state gone. A request whose prompt plus `max_tokens` equals `--context` is admitted: the draft rows sit past that

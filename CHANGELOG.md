@@ -5,6 +5,45 @@ Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:
 
 ## Unreleased
 
+**Structured output: `response_format` (`json_object`, `json_schema`) and the `guided_*` fields are enforced, not refused.**
+
+- `patches/0032-engine-structured-output.patch`: constrained decoding on the Flash Next CUDA engine. The grammar layer is
+  TensorFold PR #596 (`libtfgrammar` over xgrammar v0.2.8, the lane core's grammar constraint, the server's request
+  parsing), ported to `db281878`. On the CUDA side one kernel sets the logits of tokens the grammar does not allow to
+  -inf before the existing greedy, top-k or nucleus draw; the first token is drawn from the prompt's last logits row
+  under the same mask; held MTP drafts are read back and walked through the grammar, drafts it rejects are dropped,
+  and each verify row is masked, so a drafted structured reply equals its `"draft": false` reply. A prompt burst with
+  a structured request is filled one prompt at a time. One rank only (`structures` is off at TP=2). It applies after
+  0031 (it was 0016 when its pull request opened).
+- The server compiles a request's grammar once, before the request reaches the engine, on a thread it waits on for
+  up to 10 s; past that the request is refused (HTTP 400) and the compile ends on its own. At most 4 compiles run at
+  once, abandoned ones included: a request waits for a free one within the same 10 s, and is refused with "retry
+  shortly" when none frees up. The engine thread only builds a matcher from the compiled grammar: it compiles
+  nothing and takes no lock, so a slow schema cannot stall the other requests. A schema, regex, choice list or
+  grammar over 64 KiB or nested deeper than 64 levels is refused with HTTP 400 before it is compiled.
+- `scripts/prepare.sh` builds xgrammar v0.2.8 (commit-checked) into `libtfgrammar.so` with `zig build grammar`,
+  links it into `/usr/local/lib` and checks that it loads by name; its licenses (and dlpack's, picojson's) are in
+  `/opt/tensorfold/share/doc/xgrammar`. Of xgrammar's submodules it fetches only `3rdparty/dlpack` (googletest and
+  cpptrace are not built), and it runs `zig build grammar-test` on the library it built.
+- Tests: `zig build grammar-test` (libtfgrammar's C ABI through the lane core: masks, a drafted window and its
+  rollback, the grammar after `</think>`, xgrammar's error text for a bad schema, the compile limits) and
+  `zig build flashnext-grammar-mask` (`tf-flashnext-grammar-mask`: the CUDA mask kernel against a host reference on
+  5 shapes, Flash Next's 248,320-token rows and a padded 16-row drafted window among them, and the shapes it refuses).
+  A server test covers the depth count (nesting inside strings and after escapes does not count).
+- tool-eval-bench 2.8.1 (97 scenarios, `--hardmode`, seed 42, temperature 0, thinking off): Structured Output 6/12 to
+  10/12, Final Score 86 to 88 (166 to 170 points). TC-65, TC-66, TC-67 and TC-69 go from partial (prose after the tool
+  call) to pass; no `response_format` fallback is left in the report. Every other scenario scores as in both stock
+  runs. TC-68 still fails: it sends no `response_format` by design, so the server has nothing to enforce.
+- Checks against the `e1f564e` image: plain requests are unchanged (`tools/exact.py` text and token hashes equal its,
+  drafted equal to `"draft": false`, concurrent equal to serial; `tools/toolcheck.py` 3/3). Decode, `tools/bench.py`:
+  code greedy 69.9 to 70.2 tok/s, chat sampled 42.9 to 43.4. A 700-token reply: plain 41.9 tok/s, `json_object` 40.4,
+  `json_schema` 40.8 (`e1f564e` plain 41.4). Structured replies drafted equal `"draft": false`; 60 of them
+  (`json_object` and `json_schema`, drafted and `"draft": false`, 10 rounds) all succeed and each equals the first
+  reply of its kind; 4 structured next to 4 plain requests equal each served alone; `guided_choice`, `guided_regex`, a
+  JSON answer after a tool result and thinking on (the grammar starts after `</think>`) pass; a schema xgrammar cannot
+  compile, one over 64 KiB, one nested 81 deep and a regex nested 70 deep are refused with HTTP 400, a schema nested
+  21 deep is served, and 8 distinct schemas sent at once are all served.
+
 **Triage of the open pull requests and issues (2026-10-25): two ports, one new setting and README notes.**
 
 - `patches/0021-flash-next-sliced-fill-one-at-a-time.patch`, from [BadAd84](https://github.com/BadAd84)'s PR #53 and hand-rebased onto the FP4 engine tree: with

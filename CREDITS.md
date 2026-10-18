@@ -52,6 +52,15 @@ license files from the pinned checkout.
 - **Sliced fills one at a time** (`patches/0021`): by [BadAd84](https://github.com/BadAd84) (PR #53), rebased onto the FP4 engine by MiaAI-Lab.
 - **Image prompts in the prompt cache** (`patches/0030`): by [tempeste](https://github.com/tempeste), on TensorFold's prompt cache
   (`core/prompt_cache.zig`), lane host, vision input and Flash Next lanes engine by Ash Hart and the TensorFold contributors.
+- **Structured output** (`patches/0032`): the grammar layer (`libtfgrammar`, the C ABI over xgrammar; the lane core's
+  grammar constraint and mask hooks; the server's `response_format` and `guided_*` parsing) was authored by
+  BobClawblaw ([BobClawblaw](https://github.com/BobClawblaw)) in
+  [TensorFold PR #596](https://github.com/ashhart/TensorFold/pull/596) and is ported to the pinned commit. The Flash Next CUDA side (the device mask kernel, the masked first token, MTP drafts read back and
+  checked against the grammar) is by devopsfortunato ([devopsfortunato](https://github.com/devopsfortunato)).
+- **[xgrammar](https://github.com/mlc-ai/xgrammar)** v0.2.8 by the XGrammar contributors (Apache-2.0): the grammar
+  engine behind structured output, built from source into the image as `libtfgrammar`, with
+  [dlpack](https://github.com/dmlc/dlpack) (Apache-2.0) and [picojson](https://github.com/kazuho/picojson)
+  (BSD-2-Clause). Their license files are in the image under `/opt/tensorfold/share/doc/xgrammar`.
 - **The Zig CUDA serving path and the CUDA family registry** were authored by Jürgen Schmied
   ([jschmied](https://github.com/jschmied)) in [TensorFold PR #443](https://github.com/ashhart/TensorFold/pull/443)
   (commit [`59e77e8`](https://github.com/ashhart/TensorFold/commit/59e77e8f4b875ce0e863a8c896fc8e424bc539ac)):
