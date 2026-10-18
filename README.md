@@ -505,8 +505,13 @@ the model was still thinking.
 - Tool calls work, including `tool_choice: "required"` and a named function (Anthropic `tool_choice: {"type": "any"}`
   too): the reply then always opens a tool call.
 - A conversation's next turn resumes from the kept state of its earlier turns. Image and video prompts are not kept.
-- Structured outputs (`response_format`, the `guided_*` fields) are refused with HTTP 400: this engine does not
-  enforce them.
+- Structured outputs are enforced by constrained decoding: `response_format` `json_object` and `json_schema`,
+  `structured_outputs`, the `guided_json`, `guided_regex`, `guided_choice` and `guided_grammar` (EBNF) fields, the
+  Responses API `text.format` and Anthropic `output_config.format`. Every token the engine samples, MTP drafts
+  included, is checked against an [xgrammar](https://github.com/mlc-ai/xgrammar) mask, so the reply parses against
+  the schema unless `max_tokens` cuts it short. With thinking on, the grammar starts after `</think>`. A schema
+  xgrammar cannot compile is refused with HTTP 400. The masks come from `libtfgrammar` (built into the image,
+  loaded on the first structured request). A drafted structured reply is the same as its `"draft": false` reply.
 - When the KV pool is full, a new request is refused. Admission reserves the prompt plus `max_tokens`; the request is
   not queued. A request whose prompt plus `max_tokens` equals `--context` is admitted: the draft rows sit past that
   window. That admission change was authored by [321sssrt-bit](https://github.com/321sssrt-bit)

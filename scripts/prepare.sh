@@ -2,7 +2,7 @@
 # Prepare this Spark to serve Qwen3.8-Flash-Next ($QUANT_LABEL; see CHECKPOINT in scripts/config.sh) with TensorFold's Zig engine (tensorfold-native, one GPU):
 #   1. preflight: docker, the GPU, disk
 #   2. the image: tensorfold-native built from TensorFold (TF_REF) plus patches/*.patch with Zig, on NVIDIA's
-#      PyTorch container, with the TP=1 kernel set; pulled prebuilt when a matching tag is reachable (PULL=0 skips
+#      PyTorch container, with the TP=1 kernel set and libtfgrammar (structured output, over xgrammar v0.2.8); pulled prebuilt when a matching tag is reachable (PULL=0 skips
 #      that), else built locally
 #   3. the checkpoint in the Hugging Face cache (~96 GiB for the NVIDIA FP4 default, ~122 GiB for CHECKPOINT=int4), at its pinned revision
 #   4. verify it: every shard its index names is there, and it is a checkpoint format this engine serves (ModelOpt NVFP4 or GPTQ int4)
@@ -120,6 +120,8 @@ RUN curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/z
     echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c - && \
     mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 && rm /tmp/zig.tar.xz && \
     /opt/zig/zig version
+RUN git clone -q --depth 1 --branch v0.2.8 --recurse-submodules --shallow-submodules https://github.com/mlc-ai/xgrammar /opt/xgrammar && \
+    test "$(git -C /opt/xgrammar rev-parse HEAD)" = 97787376faee5ed8466cfad57c99855e4ce2f6aa
 ARG TF_REPO
 ARG TF_REF
 RUN git init -q /tensorfold && cd /tensorfold && git remote add origin "${TF_REPO}" && \
@@ -131,9 +133,14 @@ RUN cd /tensorfold && \
 RUN cd /tensorfold && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Doptimize=fast --prefix /opt/tensorfold \
       -j"$(nproc)" fatbins install native && \
     test -x /opt/tensorfold/native/bin/tensorfold-native
+RUN cd /tensorfold && /opt/zig/zig build grammar -Dxgrammar=/opt/xgrammar --prefix /opt/tensorfold && \
+    test -f /opt/tensorfold/native/lib/libtfgrammar.so
 RUN mkdir -p /opt/tensorfold/share/doc/tensorfold && cd /tensorfold && \
     for f in LICENSE LICENSE.md LICENSES NOTICE THIRD_PARTY_NOTICES.md; do \
-      if [ -e "$f" ]; then cp -a "$f" /opt/tensorfold/share/doc/tensorfold/ || exit 1; fi; done
+      if [ -e "$f" ]; then cp -a "$f" /opt/tensorfold/share/doc/tensorfold/ || exit 1; fi; done && \
+    d=/opt/tensorfold/share/doc/xgrammar && mkdir -p "$d" && cp -a /opt/xgrammar/LICENSE /opt/xgrammar/NOTICE "$d/" && \
+    cp -a /opt/xgrammar/3rdparty/dlpack/LICENSE "$d/LICENSE.dlpack" && \
+    sed -n '1,/\*\//p' /opt/xgrammar/3rdparty/picojson/picojson.h > "$d/LICENSE.picojson"
 ARG KERNEL_SOURCE_MTIME
 RUN cd /tensorfold && python -B -c 'import json, os, sys; t = int(sys.argv[1]); \
       [os.utime(os.path.join("src", f), (t, t)) for f in sorted({k["source"]["file"] for k in \
@@ -151,6 +158,8 @@ FROM ${BASE_IMAGE}
 COPY --from=build /opt/tensorfold /opt/tensorfold
 COPY --from=build /tensorfold/src/tensorfold /opt/tensorfold/python/tensorfold
 RUN ln -s /opt/tensorfold/native/bin/tensorfold-native /usr/local/bin/tensorfold-native && \
+    ln -s /opt/tensorfold/native/lib/libtfgrammar.so /usr/local/lib/libtfgrammar.so && ldconfig && \
+    python -c 'import ctypes; ctypes.CDLL("libtfgrammar.so")' && \
     pip install --no-cache-dir "huggingface_hub>=1.0" && \
     pip install --no-cache-dir --no-deps "transformers==5.17.0" "av==19.0.1"
 ARG PATCHES_HASH
