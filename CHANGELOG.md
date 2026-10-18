@@ -5,6 +5,29 @@ Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:
 
 ## Unreleased
 
+**Structured output: `response_format` (`json_object`, `json_schema`) and the `guided_*` fields are enforced, not refused.**
+
+- `patches/0016-engine-structured-output.patch`: constrained decoding on the Flash Next CUDA engine. The grammar layer is
+  TensorFold PR #596 (`libtfgrammar` over xgrammar v0.2.8, the lane core's grammar constraint, the server's request
+  parsing), ported to `db281878`. On the CUDA side one kernel sets the logits of tokens the grammar does not allow to
+  -inf before the existing greedy, top-k or nucleus draw; the first token is drawn from the prompt's last logits row
+  under the same mask; held MTP drafts are read back and walked through the grammar, drafts it rejects are dropped,
+  and each verify row is masked, so a drafted structured reply equals its `"draft": false` reply. A prompt burst with
+  a structured request is filled one prompt at a time. One rank only (`structures` is off at TP=2).
+- `scripts/prepare.sh` builds xgrammar v0.2.8 (commit-checked) into `libtfgrammar.so` with `zig build grammar`,
+  links it into `/usr/local/lib` and checks that it loads by name; its licenses (and dlpack's, picojson's) are in
+  `/opt/tensorfold/share/doc/xgrammar`.
+- tool-eval-bench 2.8.1 (97 scenarios, `--hardmode`, seed 42, temperature 0, thinking off): Structured Output 6/12 to
+  10/12, Final Score 86 to 88 (166 to 170 points). TC-65, TC-66, TC-67 and TC-69 go from partial (prose after the tool
+  call) to pass; no `response_format` fallback is left in the report. Every other scenario scores as in both stock
+  runs. TC-68 still fails: it sends no `response_format` by design, so the server has nothing to enforce.
+- Checks: plain requests are unchanged (`tools/exact.py` text and token hashes equal the stock image's, drafted equal to
+  `"draft": false`, concurrent equal to serial; `tools/toolcheck.py` 3/3). Decode, `tools/bench.py`: code greedy 68.9 to
+  69.4 tok/s, chat sampled 42.7 to 42.7. A 700-token reply: plain 40.8 tok/s, `json_object` 39.8, `json_schema` 40.2
+  (stock plain 41.2). Structured replies drafted equal `"draft": false`; 4 structured next to 4 plain requests equal
+  each served alone; `guided_choice`, `guided_regex`, a JSON answer after a tool result and thinking on (the grammar
+  starts after `</think>`) pass; a schema xgrammar cannot compile is refused with HTTP 400.
+
 **Faster prompt prefill on the NVIDIA FP4 checkpoint (+13 to 15%), and an opt-in fair prefill for mixed loads.**
 
 - `patches/0014-engine-prompt-expert-tile.patch`: the routed experts of prompt chunks of 1,024 rows or more run through a new shared-memory kernel

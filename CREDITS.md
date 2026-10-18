@@ -47,6 +47,15 @@ license files from the pinned checkout.
   formats (CSF scale decoding, MXFP8 linears, the NVFP4 n-gram table and its read-ahead), written by the TensorFold Contributors, to the Zig engine
   and its CUDA kernels. The Python kernels it mirrors are copied into the engine's kernel directory and pinned to their sources by
   `zig/tests/cuda/copies.py`; the engine's own new files say "Written for TensorFold by TensorFold Contributors". The prompt expert tile kernel (`patches/0014`) follows the staging idea of the earlier Python engine's expert kernel; its header credits the TensorFold Contributors.
+- **Structured output** (`patches/0016`): the grammar layer (`libtfgrammar`, the C ABI over xgrammar; the lane core's
+  grammar constraint and mask hooks; the server's `response_format` and `guided_*` parsing) was authored by
+  BobClawblaw ([BobClawblaw](https://github.com/BobClawblaw)) in
+  [TensorFold PR #596](https://github.com/ashhart/TensorFold/pull/596) and is ported to the pinned commit. The Flash Next CUDA side (the device mask kernel, the masked first token, MTP drafts read back and
+  checked against the grammar) is by devopsfortunato ([devopsfortunato](https://github.com/devopsfortunato)).
+- **[xgrammar](https://github.com/mlc-ai/xgrammar)** v0.2.8 by the XGrammar contributors (Apache-2.0): the grammar
+  engine behind structured output, built from source into the image as `libtfgrammar`, with
+  [dlpack](https://github.com/dmlc/dlpack) (Apache-2.0) and [picojson](https://github.com/kazuho/picojson)
+  (BSD-2-Clause). Their license files are in the image under `/opt/tensorfold/share/doc/xgrammar`.
 - **The Zig CUDA serving path and the CUDA family registry** were authored by Jürgen Schmied
   ([jschmied](https://github.com/jschmied)) in [TensorFold PR #443](https://github.com/ashhart/TensorFold/pull/443)
   (commit [`59e77e8`](https://github.com/ashhart/TensorFold/commit/59e77e8f4b875ce0e863a8c896fc8e424bc539ac)):
