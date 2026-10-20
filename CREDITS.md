@@ -47,6 +47,8 @@ license files from the pinned checkout.
   formats (CSF scale decoding, MXFP8 linears, the NVFP4 n-gram table and its read-ahead), written by the TensorFold Contributors, to the Zig engine
   and its CUDA kernels. The Python kernels it mirrors are copied into the engine's kernel directory and pinned to their sources by
   `zig/tests/cuda/copies.py`; the engine's own new files say "Written for TensorFold by TensorFold Contributors". The prompt expert tile kernel (`patches/0014`) follows the staging idea of the earlier Python engine's expert kernel; its header credits the TensorFold Contributors.
+- **Free after drain and admission reclaim** (`patches/0029`): by [tempeste](https://github.com/tempeste), on TensorFold's prompt cache
+  (`core/prompt_cache.zig`), lane host and Flash Next lanes engine by Ash Hart and the TensorFold contributors.
 - **The Zig CUDA serving path and the CUDA family registry** were authored by Jürgen Schmied
   ([jschmied](https://github.com/jschmied)) in [TensorFold PR #443](https://github.com/ashhart/TensorFold/pull/443)
   (commit [`59e77e8`](https://github.com/ashhart/TensorFold/commit/59e77e8f4b875ce0e863a8c896fc8e424bc539ac)):

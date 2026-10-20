@@ -5,6 +5,34 @@ Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:
 
 ## Unreleased
 
+**Free after drain and admission reclaim: no more `CUDA_ERROR_ILLEGAL_ADDRESS` after a refused prompt, and kept prompt states give way to new requests.**
+
+- `patches/0029-flash-next-free-after-drain-admission-reclaim.patch`, three parts:
+  - Free after drain (always on): `Region.deinit` unmapped a sequence's memory without waiting for the GPU, so a sequence
+    freed while its prompt kernels were still queued (a prompt refused for room mid-fill, a kept state evicted during its fill
+    copy) could kill the CUDA context with `CUDA_ERROR_ILLEGAL_ADDRESS`. Freeing a sequence or a kept state now drains the context
+    first (`Engine.drain`, `freeSeqDrained`). The toy engine models queued work, and two new unit tests fail without the drains.
+  - Admission reclaim (`TF_FLASHNEXT_ADMIT_RECLAIM`, on): kept prompt states share the sequence pool with live requests, and a
+    prompt that did not fit was refused with `NoRoom` even when idle kept states held the room. Admission now frees kept states
+    (superseded first, then least recently used, never the state the prompt resumes or one a lane holds), and only when that
+    makes the prompt fit. `0` refuses as before.
+  - Supersede (`TF_FLASHNEXT_SUPERSEDE`, on): a conversation's next turn frees the kept state it resumed once it keeps a longer
+    one, so the cache holds about one state a conversation instead of one a turn. `0` turns it off.
+  - The startup log says `prompt cache: supersede on|off, admission reclaim on|off`. One rank only.
+  - Kept states are told apart by an entry id and fill copies by a generation, so a deferred fair fill (`TF_FLASHNEXT_FILL_FAIR=1`)
+    never begins from a state that was freed and reused.
+- NoRoom repro: three long conversations (30k, 100k and 100k tokens, two turns each) fill the prompt cache, then 5 concurrent ~2,000-token
+  prompts with `max_tokens` up to the window. `./start.sh --prompt-cache-gib 12`, otherwise defaults: 0015 admitted 3 of 5 and refused 2 with
+  HTTP 500 `NoRoom`, in each of two runs (8 states, 11,854 MiB kept). 0029 admitted 5 of 5 in both runs, freeing 1 and then 4 kept states, with 0 `NoRoom`
+  and 0 CUDA errors. At the default cache budget (a quarter of the pool) five full windows plus the cache still fit, so neither build refused.
+- Checks (defaults, NVIDIA FP4 checkpoint, 5 x 262,144 fp8): `tools/exact.py` passes with the same token hashes as 0015 (6 drafted replies, 495 drafts
+  accepted, equal to `"draft": false`; concurrent equal to serial), before and after the other checks. `tools/toolcheck.py` 3/3, `tools/visioncheck.py`,
+  and `tools/prompt_reuse.py 100000 4 --other` pass (worst follow-up resumed 99.8%). `zig build test`: 206 of 206 (202 on 0015).
+  Prefill and decode are unchanged: 100k prompt 1,973 tok/s (1,974 on 0015), 50k 2,062 (2,057), decode code 49.2 tok/s (49.3), chat 42.1 (42.1).
+- On a DGX Spark serving several long-context coding agents, 19 hours with an earlier form of the same change: 0 `NoRoom`, 0 CUDA errors, 66 kept
+  states freed by admission and 6,166 superseded.
+- Open pull requests already claim patch numbers 0016 to 0028, so this one is 0029.
+
 **Faster prompt prefill on the NVIDIA FP4 checkpoint (+13 to 15%), and an opt-in fair prefill for mixed loads.**
 
 - `patches/0014-engine-prompt-expert-tile.patch`: the routed experts of prompt chunks of 1,024 rows or more run through a new shared-memory kernel

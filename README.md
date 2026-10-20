@@ -481,6 +481,8 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `TF_FLASHNEXT_PREFILL_TAIL` | `512` | a short last prompt chunk joins the previous one |
 | `TF_FLASHNEXT_PROMPT_EXPERT_TILE` | `2` | routed experts of prompt chunks of 1,024 rows or more run through a shared-memory tile kernel (patch 0014): `2` gate/up and down, `1` gate/up only, `0` the older kernels. Same output bits, cold prefill +13 to 15%. One rank only (two ranks keep the older kernels unless it is set) |
 | `TF_FLASHNEXT_FILL_FAIR` | `0` | `1` fills prompts in slices, shortest first, so short requests and running decoders are not stalled behind long prompts (patch 0015): a short request behind five 100k prompts waits about 2 s instead of 3 to 4 minutes; a mixed load takes about 20% longer in total. `TF_FLASHNEXT_FILL_LAYERS` (slice, default 2) and `TF_FLASHNEXT_FILL_AGING` (rows, default 1024) tune it. One rank only |
+| `TF_FLASHNEXT_ADMIT_RECLAIM` | `1` | a prompt that does not fit frees kept prompt states first (a superseded one, else the least recently used; never the state the prompt resumes), and only when that makes it fit; `0` refuses it with `NoRoom` as before (patch 0029). One rank only |
+| `TF_FLASHNEXT_SUPERSEDE` | `1` | a conversation's next turn frees the kept state it resumed once it keeps a longer one, so the cache holds about one state a conversation instead of one a turn (patch 0029). `0` turns it off. One rank only |
 | `CHECKPOINT` | `nvfp4` | `nvfp4` serves `nvidia/Qwen3.8-Flash-Next-FP4-Local`; `int4` serves azampatti's INT4-AutoRound (sets its model id and revision). `MODEL_ID` / `MODEL_REVISION` override either |
 | `MODEL_REVISION` | `b9ce18a6…` | the checkpoint commit this recipe serves (`14642741…` with `CHECKPOINT=int4`) |
 
@@ -508,7 +510,8 @@ the model was still thinking.
 - Structured outputs (`response_format`, the `guided_*` fields) are refused with HTTP 400: this engine does not
   enforce them.
 - When the KV pool is full, a new request is refused. Admission reserves the prompt plus `max_tokens`; the request is
-  not queued. A request whose prompt plus `max_tokens` equals `--context` is admitted: the draft rows sit past that
+  not queued. Kept prompt states share that pool: admission frees them first (patch 0029), so a request is refused
+  only when it would not fit with every freeable state gone. A request whose prompt plus `max_tokens` equals `--context` is admitted: the draft rows sit past that
   window. That admission change was authored by [321sssrt-bit](https://github.com/321sssrt-bit)
   ([issue #1](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/issues/1),
   [PR #2](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/pull/2)).
@@ -517,9 +520,12 @@ the model was still thinking.
 
 `patches/*.patch` is the Zig Flash Next CUDA engine against TensorFold `db281878` (the `zig-flashnext` pin), applied
 with `git apply` in the checkout root. They are the engine, not speed patches on a Python package. Drafts are still
-checked: a drafted reply matches `"draft": false`. `0011` to `0015` are this recipe's own: `0011` lets the vision helper load the NVIDIA
+checked: a drafted reply matches `"draft": false`. `0011` to `0015` and `0029` are this recipe's own: `0011` lets the vision helper load the NVIDIA
 checkpoint's quantized tower, `0012` makes the Zig engine serve the NVIDIA FP4 checkpoint (config, CSF-compressed expert scales, MXFP8 linears, the
-NVFP4 n-gram table with read-ahead) and `0013` tunes decoding (draft depth 6, the repeat-prompt cache, burst admission). `0014` adds a shared-memory expert tile for prompt chunks (on by default, bit-identical, cold prefill +13 to 15%) and `0015` an opt-in fair prefill for mixed loads (`TF_FLASHNEXT_FILL_FAIR=1`).
+NVFP4 n-gram table with read-ahead) and `0013` tunes decoding (draft depth 6, the repeat-prompt cache, burst admission). `0014` adds a shared-memory expert tile for prompt chunks (on by default, bit-identical, cold prefill +13 to 15%) and `0015` an opt-in fair prefill for mixed loads (`TF_FLASHNEXT_FILL_FAIR=1`). `0029` frees a sequence only after
+the GPU work queued on it is done (a request refused for room mid-prompt could unmap memory under queued kernels and
+kill the CUDA context with `CUDA_ERROR_ILLEGAL_ADDRESS`), and lets admission free kept prompt states before it refuses
+a prompt (`TF_FLASHNEXT_ADMIT_RECLAIM`, `TF_FLASHNEXT_SUPERSEDE`, both on).
 
 ## Checks
 
@@ -574,6 +580,8 @@ covers this repository's scripts only.
   (commit [`59e77e8`](https://github.com/ashhart/TensorFold/commit/59e77e8f4b875ce0e863a8c896fc8e424bc539ac)).
 - **NVIDIA FP4 support in the Zig engine** (patches 0011 to 0015): MiaAI-Lab, built on TensorFold's Python implementation of the same formats by the
   TensorFold Contributors.
+- **Free after drain and admission reclaim** (patch 0029): [tempeste](https://github.com/tempeste), on TensorFold's prompt cache and lanes engine by
+  Ash Hart and the TensorFold contributors.
 - **Model:** [Qwen3.8 Flash Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team (Alibaba).
 - **Default checkpoint:** NVIDIA's [FP4 QAD export](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) (Model Optimizer).
 - **Optional INT4 checkpoint** (`CHECKPOINT=int4`): [azampatti](https://huggingface.co/azampatti)'s
