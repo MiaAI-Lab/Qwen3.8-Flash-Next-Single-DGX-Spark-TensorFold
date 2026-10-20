@@ -102,6 +102,13 @@ export TF_FLASHNEXT_PROMPT_EXPERT_TILE="${TF_FLASHNEXT_PROMPT_EXPERT_TILE:-2}"
 # so a short request waits ~2 s (not minutes) behind five 100k prompts and running decoders keep a ~0.15 s gap. Costs ~20% on
 # the total time of a mixed load (five 100k prompts + shorts: 280 s -> 342 s); idle prefill is unchanged. One rank only.
 # Opt in: TF_FLASHNEXT_FILL_FAIR=1 (TF_FLASHNEXT_FILL_LAYERS slice size, default 2; TF_FLASHNEXT_FILL_AGING rows, default 1024).
+# Prompt cache room (patch 0029), ON by default, one rank only. Kept prompt states share the sequence pool with live requests;
+# without this a prompt that does not fit is refused (NoRoom) even when idle kept states hold the room it needs.
+# TF_FLASHNEXT_ADMIT_RECLAIM: admission frees kept states (superseded first, else least recently used, never the prompt's
+# own resume) when, and only when, that makes the prompt fit. TF_FLASHNEXT_SUPERSEDE: a conversation's next turn frees the
+# state it resumed once it keeps a longer one. 0 turns either off. Freeing a sequence always waits for the GPU's queued work.
+export TF_FLASHNEXT_ADMIT_RECLAIM="${TF_FLASHNEXT_ADMIT_RECLAIM:-1}"
+export TF_FLASHNEXT_SUPERSEDE="${TF_FLASHNEXT_SUPERSEDE:-1}"
 # KV cache (--kv-dtype). fp8 is the default: about 1.84x the pool of bf16, and lossy (~98.8% top-1 agreement with a
 # bf16 cache, so a free-running reply can differ). bf16 is exact: KV_DTYPE=bf16. FP8 works together with --vision.
 KV_DTYPE="${KV_DTYPE:-fp8}"
