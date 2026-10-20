@@ -5,6 +5,35 @@ Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:
 
 ## Unreleased
 
+**Image prompts resume the prompt cache: the next turn after a screenshot prefills only its new rows (#5).**
+
+- `patches/0030-flash-next-image-prompt-reuse.patch`: a prompt with an image was neither kept nor resumed, so every turn of a conversation with an
+  image prefilled from its first token, the long system prompt included. Image placeholder rows were all the same token, so a token match could not
+  tell two images apart. Each image's rows now carry match ids from a SHA-256 over its data URL bytes, its detail and its rotary grid (an https
+  image's hash also takes its feature rows, as the URL's content may change), so the cache resumes up to the first row where two prompts differ, image
+  or text. On resume the rotary table and the features of the kept rows are attached before the prompt continues; each prompt segment gets only the
+  images before its cut. Videos are not kept.
+  - A segment whose images are refused for memory at a kept mark ends that request alone; its fill is freed once.
+  - A deferred fair-fill begin (`TF_FLASHNEXT_FILL_FAIR=1`) resumes only the kept state it saw (its generation); a state evicted meanwhile means a
+    prefill from 0. Works with `TF_FLASHNEXT_FILL_FAIR` off and on.
+  - `TF_FLASHNEXT_MEDIA_REUSE=0` restores the old rule. One rank only.
+- Before and after, same server settings (defaults, NVIDIA FP4 checkpoint, 5 x 262,144 fp8), a 12.2k-token system prompt, temperature 0:
+
+  | request | prompt | 0015: cached, prefill | 0030: cached, prefill |
+  |---|---:|---:|---:|
+  | text only, cold | 12,226 | 0, 6.56 s | 0, 6.58 s |
+  | image A, first turn | 12,528 | 0, 6.24 s | 11,687, 0.93 s |
+  | image A, next turn | 12,614 | 0, 6.29 s | 12,521, 0.35 s |
+  | image B in place of A | 12,614 | 0, 6.28 s | 12,199, 0.72 s |
+  | text only, next turn | 12,260 | 12,219, 0.25 s | 12,219, 0.28 s |
+  | image A turn repeated | 12,614 | 0, 6.30 s | 12,607, 0.19 s |
+
+  Every reply has the same token hash on both builds (image B is read as its own text, not image A's). With `TF_FLASHNEXT_FILL_FAIR=1` the hashes and
+  cached counts are the same; with `TF_FLASHNEXT_MEDIA_REUSE=0` every image request is cached 0, as on 0015.
+- Checks: `tools/exact.py` passes with the same token hashes as 0015, `tools/toolcheck.py` 3/3, `tools/visioncheck.py` (also with fair fill and with
+  reuse off), `tools/prompt_reuse.py 30000` (worst follow-up resumed 99.3%). `zig build test`: 203 of 203 (202 on 0015). Prefill and decode are
+  unchanged: 100k prompt 1,969 tok/s (1,974 on 0015), decode code 49.3 tok/s, chat 42.1 (the same).
+
 **Faster prompt prefill on the NVIDIA FP4 checkpoint (+13 to 15%), and an opt-in fair prefill for mixed loads.**
 
 - `patches/0014-engine-prompt-expert-tile.patch`: the routed experts of prompt chunks of 1,024 rows or more run through a new shared-memory kernel

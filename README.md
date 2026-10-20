@@ -481,6 +481,7 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `TF_FLASHNEXT_PREFILL_TAIL` | `512` | a short last prompt chunk joins the previous one |
 | `TF_FLASHNEXT_PROMPT_EXPERT_TILE` | `2` | routed experts of prompt chunks of 1,024 rows or more run through a shared-memory tile kernel (patch 0014): `2` gate/up and down, `1` gate/up only, `0` the older kernels. Same output bits, cold prefill +13 to 15%. One rank only (two ranks keep the older kernels unless it is set) |
 | `TF_FLASHNEXT_FILL_FAIR` | `0` | `1` fills prompts in slices, shortest first, so short requests and running decoders are not stalled behind long prompts (patch 0015): a short request behind five 100k prompts waits about 2 s instead of 3 to 4 minutes; a mixed load takes about 20% longer in total. `TF_FLASHNEXT_FILL_LAYERS` (slice, default 2) and `TF_FLASHNEXT_FILL_AGING` (rows, default 1024) tune it. One rank only |
+| `TF_FLASHNEXT_MEDIA_REUSE` | `1` | image prompts keep and resume prompt states like text ones, each image told apart by a hash of its bytes, so a conversation's next turn after a screenshot prefills only its new rows (patch 0030). Videos are not kept. `0` restores the old rule (an image prompt prefills from its start). One rank only |
 | `CHECKPOINT` | `nvfp4` | `nvfp4` serves `nvidia/Qwen3.8-Flash-Next-FP4-Local`; `int4` serves azampatti's INT4-AutoRound (sets its model id and revision). `MODEL_ID` / `MODEL_REVISION` override either |
 | `MODEL_REVISION` | `b9ce18a6…` | the checkpoint commit this recipe serves (`14642741…` with `CHECKPOINT=int4`) |
 
@@ -504,7 +505,9 @@ the model was still thinking.
 - `"draft": false` serves the request without drafts, the serial reference.
 - Tool calls work, including `tool_choice: "required"` and a named function (Anthropic `tool_choice: {"type": "any"}`
   too): the reply then always opens a tool call.
-- A conversation's next turn resumes from the kept state of its earlier turns. Image and video prompts are not kept.
+- A conversation's next turn resumes from the kept state of its earlier turns, with images too (patch 0030: each
+  image is matched by a hash of its bytes, so a changed image resumes only up to its first row). Video prompts are not
+  kept.
 - Structured outputs (`response_format`, the `guided_*` fields) are refused with HTTP 400: this engine does not
   enforce them.
 - When the KV pool is full, a new request is refused. Admission reserves the prompt plus `max_tokens`; the request is
@@ -517,9 +520,10 @@ the model was still thinking.
 
 `patches/*.patch` is the Zig Flash Next CUDA engine against TensorFold `db281878` (the `zig-flashnext` pin), applied
 with `git apply` in the checkout root. They are the engine, not speed patches on a Python package. Drafts are still
-checked: a drafted reply matches `"draft": false`. `0011` to `0015` are this recipe's own: `0011` lets the vision helper load the NVIDIA
+checked: a drafted reply matches `"draft": false`. `0011` to `0015` and `0030` are this recipe's own: `0011` lets the vision helper load the NVIDIA
 checkpoint's quantized tower, `0012` makes the Zig engine serve the NVIDIA FP4 checkpoint (config, CSF-compressed expert scales, MXFP8 linears, the
-NVFP4 n-gram table with read-ahead) and `0013` tunes decoding (draft depth 6, the repeat-prompt cache, burst admission). `0014` adds a shared-memory expert tile for prompt chunks (on by default, bit-identical, cold prefill +13 to 15%) and `0015` an opt-in fair prefill for mixed loads (`TF_FLASHNEXT_FILL_FAIR=1`).
+NVFP4 n-gram table with read-ahead) and `0013` tunes decoding (draft depth 6, the repeat-prompt cache, burst admission). `0014` adds a shared-memory expert tile for prompt chunks (on by default, bit-identical, cold prefill +13 to 15%) and `0015` an opt-in fair prefill for mixed loads (`TF_FLASHNEXT_FILL_FAIR=1`). `0030` lets image prompts keep and
+resume prompt states (`TF_FLASHNEXT_MEDIA_REUSE`, on).
 
 ## Checks
 
@@ -574,6 +578,8 @@ covers this repository's scripts only.
   (commit [`59e77e8`](https://github.com/ashhart/TensorFold/commit/59e77e8f4b875ce0e863a8c896fc8e424bc539ac)).
 - **NVIDIA FP4 support in the Zig engine** (patches 0011 to 0015): MiaAI-Lab, built on TensorFold's Python implementation of the same formats by the
   TensorFold Contributors.
+- **Image prompts in the prompt cache** (patch 0030): [tempeste](https://github.com/tempeste), on TensorFold's prompt cache, lane host and vision
+  input by Ash Hart and the TensorFold contributors.
 - **Model:** [Qwen3.8 Flash Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team (Alibaba).
 - **Default checkpoint:** NVIDIA's [FP4 QAD export](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local) (Model Optimizer).
 - **Optional INT4 checkpoint** (`CHECKPOINT=int4`): [azampatti](https://huggingface.co/azampatti)'s
