@@ -1,0 +1,330 @@
+diff --git a/zig/src/families/flashnext/cuda_engine.zig b/zig/src/families/flashnext/cuda_engine.zig
+index 8fcc581..5ca0bb8 100644
+--- a/zig/src/families/flashnext/cuda_engine.zig
++++ b/zig/src/families/flashnext/cuda_engine.zig
+@@ -354,6 +354,8 @@ pub const Engine = struct {
+     rings: vmm.RingCache = .{},
+     /// the fill whose chunk holds the prompt buffers between slices (one at a time; prefill waits for it)
+     pfill: ?*const Fill = null,
++    /// TF_FLASHNEXT_FILL_FAIR: a fillStep returns when its chunk ends (the lanes host then picks the next owner)
++    boundary_stop: bool = false,
+     graphs: std.AutoHashMapUnmanaged(GraphKey, cuda.graph.Exec) = .empty,
+     captures: usize = 0,
+     /// a failed capture, instantiate or upload is not fatal: that round runs eagerly (the same bits) and captures
+@@ -1257,6 +1259,7 @@ pub const Engine = struct {
+                 fl.done = true;
+                 return true;
+             }
++            if (e.boundary_stop) return false;
+             budget -= 1;
+         }
+         return false;
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 95d6f4a..9e56f2d 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -87,7 +87,7 @@ pub fn Lanes(comptime E: type) type {
+             broken: bool = false,
+         };
+ 
+-        const Tentative = struct { at: u32, kept: *Kept, adopted: bool = false };
++        const Tentative = struct { at: u32, kept: *Kept, adopted: bool = false, owner: ?*Lane = null };
+ 
+         const Lane = struct {
+             seq: SeqPtr,
+@@ -115,6 +115,10 @@ pub fn Lanes(comptime E: type) type {
+             owned: bool = false,
+             at: usize = 0,
+             final: bool = false,
++            /// fair fills: the begin (resume, first segment) waits for this stream to own the prompt buffers
++            lazy: bool = false,
++            /// fair fills: chunk boundaries this prompt lost to another (its priority ages with them)
++            waited: usize = 0,
+         };
+ 
+         gpa: std.mem.Allocator,
+@@ -155,6 +159,10 @@ pub fn Lanes(comptime E: type) type {
+         /// prompts fill in slices between rounds (prefill_begin / prefill_step), `fill_layers` layers a step
+         sliced: bool = false,
+         fill_layers: usize = 8,
++        /// TF_FLASHNEXT_FILL_FAIR: one fill owns the prompt buffers at a time, handed on at chunk boundaries
++        fair: bool = false,
++        /// fair fills: rows of priority a prompt gains for each chunk boundary it lost
++        fill_aging: usize = 1024,
+         lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, *Lane) = .empty,
+         /// the last verify's lanes whose windows wait for their commits: committed before the next forward
+         opened: std.ArrayList(*Lane) = .empty,
+@@ -222,7 +230,6 @@ pub fn Lanes(comptime E: type) type {
+         fn prefillBeginFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
+             const self = of(ptr);
+             self.fillLate();
+-            const e = self.e;
+             const l = self.preparePrefill(s) catch |err| {
+                 try self.agree(err);
+                 unreachable;
+@@ -231,6 +238,19 @@ pub fn Lanes(comptime E: type) type {
+                 self.dropLane(s, l);
+                 return err;
+             };
++            // fair fills: another prompt is mid-chunk, so a resume (it runs the MTP head over the prompt buffers) waits
++            if (comptime @hasField(E, "pfill")) {
++                if (self.fair and self.e.pfill != null and s.media == null) {
++                    l.fill = .{ .fl = undefined, .lazy = true };
++                    return;
++                }
++            }
++            try self.beginFill(s, l);
++        }
++
++        /// The prefill's resume made and the first segment's fill started (after the begin's agreements).
++        fn beginFill(self: *Self, s: *lanes.Stream, l: *Lane) anyerror!void {
++            const e = self.e;
+             const requested = s.reuse.at > 0;
+             var from: ?*Kept = if (requested) self.keptOf(s.reuse.saved) else null;
+             if (requested) {
+@@ -247,7 +267,7 @@ pub fn Lanes(comptime E: type) type {
+             }
+             s.cached = @intCast(f.at);
+             s.reuse_failed = requested and from == null;
+-            self.dropTentative();
++            if (self.fair) self.dropTentativeOf(null) else self.dropTentative();
+             self.startSegment(s, l, &f) catch |err| {
+                 self.dropLane(s, l);
+                 // a media attachment both ranks refused together (memory, bad rows): this request fails, not the server
+@@ -278,40 +298,98 @@ pub fn Lanes(comptime E: type) type {
+             const self = of(ptr);
+             self.fillLate();
+             try self.agree(null); // nothing to prepare: the ranks only meet before the slices' collectives
+-            for (streams, states) |s, *st| {
++            if (comptime @hasField(E, "pfill")) if (self.fair) {
++                const i = try self.pickOwner(streams);
++                try self.stepOne(streams[i], &states[i]);
++                return;
++            };
++            for (streams, states) |s, *st| try self.stepOne(s, st);
++        }
++
++        /// Fair fills: the prompt that gets this step's slice. The one whose chunk is open keeps the prompt buffers;
++        /// at a chunk boundary the prompt with the fewest rows left goes next, each boundary a prompt loses taking
++        /// `fill_aging` rows off its count (so a long prompt is not starved by a stream of short ones).
++        fn pickOwner(self: *Self, streams: []const *lanes.Stream) !usize {
++            if (self.e.pfill) |open| {
++                for (streams, 0..) |s, i| {
++                    const l = self.lanes.get(s) orelse return error.UnknownStream;
++                    const f = l.fill orelse return error.NotFilling;
++                    if (!f.lazy and @intFromPtr(f.fl) == @intFromPtr(open)) return i;
++                }
++                return error.PromptBuffersBusy; // the buffers' owner is not among the filling prompts
++            }
++            var best: usize = 0;
++            var best_score: i64 = std.math.maxInt(i64);
++            for (streams, 0..) |s, i| {
+                 const l = self.lanes.get(s) orelse return error.UnknownStream;
+-                const f = &(l.fill orelse return error.NotFilling);
+-                const done = self.e.fillStep(f.fl, self.fill_layers) catch |err| return self.lost("a prompt's fill", err);
+-                if (!done) continue;
+-                if (!f.final) {
+-                    const m: u32 = @intCast(f.fl.prompt.len);
+-                    const snap = f.fl.kept orelse return self.lost("a prompt's fill", error.NoStateKept);
+-                    f.fl.kept = null; // the pass's now
+-                    self.e.fillFree(f.fl);
+-                    if (f.owned) self.e.freeSnapshot(f.cur.?);
+-                    f.cur = snap;
+-                    f.owned = true;
+-                    if (self.keep(l, snap, m)) |k| {
+-                        f.owned = false;
+-                        self.tentative.append(self.gpa, .{ .at = m, .kept = k }) catch |err| return self.lost("a prompt's fill", err);
+-                    } else |err| std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ m, @errorName(err) });
+-                    if (s.reuse.hook) |h| h.at(h.ptr, s, m);
+-                    f.at = m;
+-                    self.startSegment(s, l, f) catch |err| return self.lost("a prompt's fill", err);
+-                    continue;
++                const f = l.fill orelse return error.NotFilling;
++                const done: usize = if (f.lazy) s.reuse.at else f.fl.start;
++                const left: i64 = @intCast(s.prompt().len -| done);
++                const score = left - @as(i64, @intCast(f.waited *| self.fill_aging));
++                if (score < best_score) {
++                    best_score = score;
++                    best = i;
+                 }
+-                _ = self.take(f.fl.first);
++            }
++            for (streams, 0..) |s, i| {
++                const f = &(self.lanes.get(s).?.fill.?);
++                if (i == best) f.waited = 0 else f.waited += 1;
++            }
++            return best;
++        }
++
++        /// Whether some lane has its prompt in (a decoder a slice would stall).
++        fn anyDecoding(self: *const Self) bool {
++            var it = self.lanes.valueIterator();
++            while (it.next()) |l| if (l.*.fill == null) return true;
++            return false;
++        }
++
++        /// `fill_layers` more layers of one filling prompt; a segment that ends keeps its mark's state and
++        /// starts the next; a prompt that is in draws its first token (`first` returns it).
++        fn stepOne(self: *Self, s: *lanes.Stream, st: *be.FillState) !void {
++            const l = self.lanes.get(s) orelse return error.UnknownStream;
++            if ((l.fill orelse return error.NotFilling).lazy) {
++                // the begin made now that this prompt owns the buffers
++                l.fill = null;
++                self.beginFill(s, l) catch |err| return err;
++            }
++            const f = &(l.fill orelse return error.NotFilling);
++            const layers = if (self.fair and !self.anyDecoding()) 1 << 16 else self.fill_layers; // no decoder to stall: a chunk a step
++            const done = self.e.fillStep(f.fl, layers) catch |err| return self.lost("a prompt's fill", err);
++            if (!done) return;
++            if (!f.final) {
++                const m: u32 = @intCast(f.fl.prompt.len);
++                const snap = f.fl.kept orelse return self.lost("a prompt's fill", error.NoStateKept);
++                f.fl.kept = null; // the pass's now
+                 self.e.fillFree(f.fl);
+                 if (f.owned) self.e.freeSnapshot(f.cur.?);
+-                l.fill = null;
+-                self.endPass();
+-                st.* = .done;
++                f.cur = snap;
++                f.owned = true;
++                if (self.keep(l, snap, m)) |k| {
++                    f.owned = false;
++                    self.tentative.append(self.gpa, .{ .at = m, .kept = k, .owner = if (self.fair) l else null }) catch |err| return self.lost("a prompt's fill", err);
++                } else |err| std.log.warn("prompt cache: no state kept at {d} tokens ({s})", .{ m, @errorName(err) });
++                if (s.reuse.hook) |h| h.at(h.ptr, s, m);
++                f.at = m;
++                self.startSegment(s, l, f) catch |err| return self.lost("a prompt's fill", err);
++                return;
+             }
++            _ = self.take(f.fl.first);
++            self.e.fillFree(f.fl);
++            if (f.owned) self.e.freeSnapshot(f.cur.?);
++            l.fill = null;
++            if (self.fair) self.endPassOf(l) else self.endPass();
++            st.* = .done;
+         }
+ 
+         fn stopFill(self: *Self, l: *Lane) void {
+             if (comptime !@hasDecl(E, "fillBegin")) return; // an engine without fills never starts one
+             const f = l.fill orelse return;
++            if (f.lazy) {
++                l.fill = null;
++                return;
++            }
+             self.e.fillFree(f.fl);
+             if (f.owned) self.e.freeSnapshot(f.cur.?);
+             l.fill = null;
+@@ -619,13 +697,19 @@ pub fn Lanes(comptime E: type) type {
+         /// The pass ended: rank 0 (or one rank) frees what the store did not adopt and tells rank 1 which it did;
+         /// rank 1 keeps them all until that note.
+         fn endPass(self: *Self) void {
++            self.endPassOf(null);
++        }
++
++        /// The pass of one lane ended (fair fills hold several passes at once; null: the one-at-a-time pass, every
++        /// tentative state): the same as endPass for the states that lane made.
++        fn endPassOf(self: *Self, owner: ?*Lane) void {
+             if (self.follower) return;
+             if (self.notes) |n| if (self.tentative.items.len > 0) {
+                 var buf: [1 + 4 + 64 * 12]u8 = undefined;
+                 var len: usize = 5;
+                 buf[0] = @backingInt(Note.pass);
+                 var count: u32 = 0;
+-                for (self.tentative.items) |t| if (t.adopted and len + 12 <= buf.len) {
++                for (self.tentative.items) |t| if (t.adopted and len + 12 <= buf.len and (owner == null or t.owner == owner)) {
+                     std.mem.writeInt(u32, buf[len..][0..4], t.at, .little);
+                     std.mem.writeInt(u64, buf[len + 4 ..][0..8], t.kept.key, .little);
+                     len += 12;
+@@ -634,7 +718,7 @@ pub fn Lanes(comptime E: type) type {
+                 std.mem.writeInt(u32, buf[1..5], count, .little);
+                 n.send(n.ptr, buf[0..len]);
+             };
+-            self.dropTentative();
++            if (owner == null) self.dropTentative() else self.dropTentativeOf(owner);
+         }
+ 
+         /// The last pass's states the store did not adopt.
+@@ -643,6 +727,21 @@ pub fn Lanes(comptime E: type) type {
+             self.tentative.clearRetainingCapacity();
+         }
+ 
++        /// One lane's tentative states (null: those of no lane, a pass that ran whole): the unadopted ones freed, the
++        /// others forgotten here (the store holds them). Other lanes' states stay for their own passes.
++        fn dropTentativeOf(self: *Self, owner: ?*Lane) void {
++            var i: usize = 0;
++            while (i < self.tentative.items.len) {
++                const t = self.tentative.items[i];
++                if (t.owner != owner) {
++                    i += 1;
++                    continue;
++                }
++                if (!t.adopted) self.freeKept(t.kept);
++                _ = self.tentative.orderedRemove(i);
++            }
++        }
++
+         fn keptOf(self: *Self, saved: ?*anyopaque) ?*Kept {
+             const p = saved orelse return null;
+             for (self.kept.items) |k| if (@as(*anyopaque, @ptrCast(k)) == p) return if (k.keeper == null) null else k;
+@@ -672,11 +771,16 @@ pub fn Lanes(comptime E: type) type {
+         fn saveFn(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
+             _ = owner;
+             const self = of(ptr);
+-            for (self.tentative.items) |*t| if (t.at == at and !t.adopted) {
++            // the hook runs right after its state is made: the latest unadopted one at `at`
++            var i = self.tentative.items.len;
++            while (i > 0) {
++                i -= 1;
++                const t = &self.tentative.items[i];
++                if (t.at != at or t.adopted) continue;
+                 t.adopted = true;
+                 try self.kept.append(self.gpa, t.kept);
+                 return t.kept;
+-            };
++            }
+             return error.NoStateKept;
+         }
+ 
+@@ -828,11 +932,13 @@ pub fn Lanes(comptime E: type) type {
+         /// chain stopped early on confidence) repeat its last draft: a row is kept only when it equals the
+         /// target's draw, so they cost rows, not bits.
+         fn rlNow(self: *const Self) i96 {
++            if (comptime !@hasField(E, "io")) return 0;
+             if (!self.round_log) return 0;
+             return std.Io.Clock.awake.now(self.e.io).toNanoseconds();
+         }
+ 
+         fn rlAdd(self: *Self, part: usize, t0: i96) void {
++            if (comptime !@hasField(E, "io")) return;
+             if (!self.round_log) return;
+             self.rl_t[part] += std.Io.Clock.awake.now(self.e.io).toNanoseconds() - t0;
+             if (part != 0) return;
+@@ -1026,7 +1132,7 @@ pub fn Lanes(comptime E: type) type {
+             }
+             if (kv.value.fill != null) {
+                 self.stopFill(kv.value); // a cancelled fill (the host discards it between steps, on both ranks)
+-                self.dropTentative();
++                if (self.fair) self.dropTentativeOf(kv.value) else self.dropTentative();
+             }
+             self.reserved -= kv.value.reserved;
+             self.forget(kv.value);
+diff --git a/zig/src/families/flashnext/cuda_native.zig b/zig/src/families/flashnext/cuda_native.zig
+index 9542f28..439ea89 100644
+--- a/zig/src/families/flashnext/cuda_native.zig
++++ b/zig/src/families/flashnext/cuda_native.zig
+@@ -137,6 +137,15 @@ pub fn openOn(comptime M: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const
+     // fill is verified exact on GPUs; both ranks agree on it
+     own.lanes.sliced = if (getenv("TF_FLASHNEXT_FILL")) |v| std.mem.eql(u8, v, "1") else false;
+     if (getenv("TF_FLASHNEXT_FILL_LAYERS")) |v| own.lanes.fill_layers = @max(1, std.fmt.parseInt(usize, v, 10) catch 8);
++    // TF_FLASHNEXT_FILL_FAIR=1: sliced fills with one owner of the prompt buffers at a time, switched only at chunk
++    // boundaries (short prompts first, aged); 2-layer slices unless TF_FLASHNEXT_FILL_LAYERS says otherwise. One rank only.
++    if (o.tp == 1) if (getenv("TF_FLASHNEXT_FILL_FAIR")) |v| if (std.mem.eql(u8, v, "1")) {
++        own.lanes.fair = true;
++        own.lanes.sliced = true;
++        if (comptime @hasField(@TypeOf(own.e.*), "boundary_stop")) own.e.boundary_stop = true;
++        if (getenv("TF_FLASHNEXT_FILL_LAYERS") == null) own.lanes.fill_layers = 2;
++        if (getenv("TF_FLASHNEXT_FILL_AGING")) |a| own.lanes.fill_aging = std.fmt.parseInt(usize, a, 10) catch own.lanes.fill_aging;
++    };
+     errdefer own.lanes.deinit();
+     if (o.drafts) {
+         const ids = try costText(gpa, io, dir);

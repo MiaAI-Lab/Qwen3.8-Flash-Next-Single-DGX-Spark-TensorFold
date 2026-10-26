@@ -1,0 +1,150 @@
+diff --git a/zig/src/server/cli.zig b/zig/src/server/cli.zig
+index e393082..c389eb2 100644
+--- a/zig/src/server/cli.zig
++++ b/zig/src/server/cli.zig
+@@ -83,7 +83,7 @@ pub const flags = [_]Flag{
+ };
+ 
+ /// The variables this binary honours as the Python engine does.
+-pub const env = [_][]const u8{ "TENSORFOLD_API_KEY", "TENSORFOLD_NO_LIVE", "TENSORFOLD_SEED_SALT", "TENSORFOLD_REQUEST_LOG", "TENSORFOLD_NO_UPDATE_CHECK", "HF_HOME", "HF_HUB_CACHE", "HF_HUB_OFFLINE" };
++pub const env = [_][]const u8{ "TENSORFOLD_API_KEY", "TENSORFOLD_NO_LIVE", "TENSORFOLD_SEED_SALT", "TENSORFOLD_RANDOM_SEED", "TENSORFOLD_REQUEST_LOG", "TENSORFOLD_NO_UPDATE_CHECK", "HF_HOME", "HF_HUB_CACHE", "HF_HUB_OFFLINE" };
+ 
+ pub const Args = struct {
+     model: []const u8 = "",
+diff --git a/zig/src/server/serve.zig b/zig/src/server/serve.zig
+index d9793a8..2769d65 100644
+--- a/zig/src/server/serve.zig
++++ b/zig/src/server/serve.zig
+@@ -107,6 +107,13 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+         std.debug.print("tensorfold: TENSORFOLD_SEED_SALT={s}: an integer\n", .{t});
+         return 1;
+     } else 0;
++    const random_seed = if (env(s, "TENSORFOLD_RANDOM_SEED")) |t| blk: {
++        const v = std.mem.trim(u8, t, " ");
++        if (v.len == 0 or std.mem.eql(u8, v, "0")) break :blk false;
++        if (std.mem.eql(u8, v, "1")) break :blk true;
++        std.debug.print("tensorfold: TENSORFOLD_RANDOM_SEED={s}: 0 or 1\n", .{t});
++        return 1;
++    } else false;
+     const config: server_mod.Config = .{
+         .served_name = s.served,
+         .model_ids = ids.items,
+@@ -118,6 +125,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+         .default_sampling = s.sampling,
+         .use_drafts = !args.no_drafts,
+         .seed_salt = salt,
++        .random_seed = random_seed,
+         .request_log = env(s, "TENSORFOLD_REQUEST_LOG"),
+         .dashboard = args.dashboard,
+     };
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index d383b62..5094f15 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -36,6 +36,8 @@ pub const Config = struct {
+     default_sampling: ?Value = null,
+     use_drafts: bool = true,
+     seed_salt: i64 = 0,
++    /// TENSORFOLD_RANDOM_SEED=1: a request without a seed draws a random one, as OpenAI's API does (default: keyed to the prompt).
++    random_seed: bool = false,
+     /// TENSORFOLD_REQUEST_LOG: where chat and completion bodies are appended; null: nowhere.
+     request_log: ?[]const u8 = null,
+     timeouts: http_conn.Timeouts = .{},
+@@ -103,6 +105,13 @@ pub const Server = struct {
+         return fields.coerceEffort(e, srv.effort_levels);
+     }
+ 
++    /// A fresh 63-bit seed, the width ``seedFor`` gives.
++    fn randomSeed(srv: *const Server) u64 {
++        var bytes: [8]u8 = undefined;
++        srv.io.random(&bytes);
++        return std.mem.readInt(u64, &bytes, .little) & ((@as(u64, 1) << 63) - 1);
++    }
++
+     /// ``_resolve_sampling``: omitted or null fields keep the defaults; an omitted seed is keyed to the prompt.
+     pub fn resolveSampling(srv: *Server, cx: *Cx, f: Value, temperature: f64, prompt_ids: []const u32) errors.Refused!?api.Sampling {
+         _ = temperature; // the request's own temperature field decides, as in the Python server
+@@ -111,7 +120,7 @@ pub const Server = struct {
+         try merge(options, cx, try fields.parseNumbers(cx, f));
+         const temp = number(options.get("temperature")) orelse 0;
+         if (temp <= 0) return null;
+-        const seed: u64 = if (options.get("seed")) |s| seedBits(s) else api.seedFor(prompt_ids, srv.config.seed_salt);
++        const seed: u64 = if (options.get("seed")) |s| seedBits(s) else if (srv.config.random_seed) srv.randomSeed() else api.seedFor(prompt_ids, srv.config.seed_salt);
+         return .{
+             .seed = seed,
+             .temperature = @floatCast(temp),
+diff --git a/zig/src/server/stream_preflight_test.zig b/zig/src/server/stream_preflight_test.zig
+index c33defe..9ddb131 100644
+--- a/zig/src/server/stream_preflight_test.zig
++++ b/zig/src/server/stream_preflight_test.zig
+@@ -55,6 +55,8 @@ const TestText = struct {
+ 
+ /// An 8-token window whose engine answers "hi" at once.
+ const HiEngine = struct {
++    seed: ?u64 = null, // the sampling seed of the last request
++
+     fn engine(e: *@This()) api.Engine {
+         return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
+     }
+@@ -63,7 +65,9 @@ const HiEngine = struct {
+         return .{ .context_window = 8 };
+     }
+ 
+-    fn submit(_: *anyopaque, id: api.Id, _: *const api.Request, sink: api.Sink) api.SubmitError!void {
++    fn submit(ctx: *anyopaque, id: api.Id, request: *const api.Request, sink: api.Sink) api.SubmitError!void {
++        const e: *HiEngine = @ptrCast(@alignCast(ctx));
++        e.seed = if (request.sampling) |s| s.seed else null;
+         sink.event(sink.ctx, id, &.{ .prefilled = 0 });
+         sink.event(sink.ctx, id, &.{ .tokens = &.{ 'h', 'i' } });
+         sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop } });
+@@ -90,6 +94,8 @@ const Seen = struct {
+     context_code: bool = false,
+     label: ?enum { exact, greedy } = null,
+     preparing: i64 = 0,
++    random_seed: bool = false, // in: the server draws a seed for a request that has none
++    seed: ?u64 = null, // out: the seed the engine was given
+ 
+     fn out(c: *Seen) openai.Out {
+         return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply } };
+@@ -145,6 +151,7 @@ fn sendTo(route: Route, body: []const u8, start: Seen) !Seen {
+         .model_ids = &.{"test-model"},
+         .enable_thinking = false,
+         .use_drafts = false,
++        .random_seed = start.random_seed,
+     }, null);
+     defer srv.deinit();
+     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+@@ -161,6 +168,7 @@ fn sendTo(route: Route, body: []const u8, start: Seen) !Seen {
+     var seen = start;
+     openai.run(srv, a, seen.out(), .{ .conn = &conn }, true, chat);
+     seen.preparing = srv.preparing.load(.acquire);
++    seen.seed = backend.seed;
+     return seen;
+ }
+ 
+@@ -213,3 +221,25 @@ test "a reply labels a greedy request greedy and a sampled one exact" {
+     try std.testing.expectEqual(.exact, sampled.label.?);
+     try std.testing.expectEqual(@as(i64, 0), sampled.preparing);
+ }
++
++const sampled_body = "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":2,\"temperature\":1.0}";
++
++test "a request without a seed repeats its seed by default, and draws a new one with random_seed" {
++    const a = try send(.chat, sampled_body);
++    const b = try send(.chat, sampled_body);
++    try std.testing.expect(a.seed != null);
++    try std.testing.expectEqual(a.seed, b.seed);
++    const c = try sendTo(.chat, sampled_body, .{ .random_seed = true });
++    const d = try sendTo(.chat, sampled_body, .{ .random_seed = true });
++    try std.testing.expect(c.seed != null and d.seed != null);
++    try std.testing.expect(c.seed.? != d.seed.?);
++    try std.testing.expect(c.seed.? < (@as(u64, 1) << 63));
++}
++
++test "an explicit seed wins over random_seed" {
++    const body = "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":2,\"temperature\":1.0,\"seed\":1234}";
++    const c = try sendTo(.chat, body, .{ .random_seed = true });
++    const d = try sendTo(.chat, body, .{ .random_seed = true });
++    try std.testing.expectEqual(@as(?u64, 1234), c.seed);
++    try std.testing.expectEqual(c.seed, d.seed);
++}

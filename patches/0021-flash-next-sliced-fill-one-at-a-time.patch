@@ -1,0 +1,168 @@
+diff --git a/zig/src/families/flashnext/cuda_engine.zig b/zig/src/families/flashnext/cuda_engine.zig
+--- a/zig/src/families/flashnext/cuda_engine.zig
++++ b/zig/src/families/flashnext/cuda_engine.zig
+@@ -1160,9 +1160,14 @@
+         kept: ?*Snapshot = null,
+         done: bool = false,
+         first: u32 = 0,
++        /// a resume's MTP tail absorb not run yet (it runs in the prompt buffers, which another prompt's open chunk
++        /// may hold when this fill begins): fillBegin parks the snapshot's tail row in last_streams, fillStep absorbs it
++        /// when this fill opens its first chunk.
++        absorb: bool = false,
+     };
+ 
+-    /// prefillWith's start (reset, or restore and the MTP tail absorbed) for a prompt that then fills in slices.
++    /// prefillWith's start (reset, or restore with the MTP tail absorb deferred to the first chunk) for a prompt
++    /// that then fills in slices. Touches no prompt buffer: another prompt's chunk may be open.
+     pub fn fillBegin(e: *Engine, seq: *Seq, prompt: []const u32, sampling: ?lanes.Sampling, o: PrefillOptions) !*Fill {
+         if (prompt.len == 0) return error.EmptyPrompt;
+         if (prompt.len + e.depth + 1 > seq.st.limit) return error.ContextPastWindow;
+@@ -1177,8 +1182,8 @@
+             if (!std.mem.eql(u32, snap.tokens, prompt[0..snap.pos])) return error.ResumeOtherPrompt;
+             try e.restore(seq, snap);
+             if (fl.use_mtp) {
+-                _ = try mtp.forward(&e.f, seq, &e.pbuf, prompt[snap.pos .. snap.pos + 1], snap.tail);
+-                try e.f.setMtpLen(&seq.st, seq.st.mtp_len + 1);
++                try e.f.th.copy(seq.last_streams.?.ptr, snap.tail, e.g.wide() * 2);
++                fl.absorb = true;
+             }
+             fl.start = snap.pos;
+         } else try e.f.reset(seq);
+@@ -1207,6 +1212,11 @@
+             if (!fl.open) {
+                 if (e.pfill != null and e.pfill.? != fl) return error.PromptBuffersBusy;
+                 e.pfill = fl;
++                if (fl.absorb) {
++                    _ = try mtp.forward(&e.f, seq, pb, fl.prompt[fl.start .. fl.start + 1], seq.last_streams.?.ptr);
++                    try e.f.setMtpLen(&seq.st, seq.st.mtp_len + 1);
++                    fl.absorb = false;
++                }
+                 var end = e.chunkEnd(fl.start, fl.prompt.len);
+                 if (fl.keep_at) |k| if (fl.start < k and k < end) {
+                     end = k;
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -303,7 +303,16 @@
+                 try self.stepOne(streams[i], &states[i]);
+                 return;
+             };
+-            for (streams, states) |s, *st| try self.stepOne(s, st);
++            for (streams, states) |s, *st| {
++                // one set of prompt buffers and a chunk spans several slices: while one prompt's chunk is open
++                // (Engine.pfill) the other prompts wait, so prompts that arrive together fill one after another
++                if (comptime @hasField(E, "pfill")) if (self.e.pfill) |held| {
++                    const l = self.lanes.get(s) orelse return error.UnknownStream;
++                    const f = l.fill orelse return error.NotFilling;
++                    if (f.lazy or @intFromPtr(held) != @intFromPtr(f.fl)) continue;
++                };
++                try self.stepOne(s, st);
++            }
+         }
+ 
+         /// Fair fills: the prompt that gets this step's slice. The one whose chunk is open keeps the prompt buffers;
+@@ -1350,6 +1359,9 @@
+     passes: usize = 0,
+     resumed: usize = 0,
+     fills: usize = 0,
++    /// cuda_engine's Engine.pfill: the fill whose chunk holds the one set of prompt buffers (a Fill opens its single
++    /// chunk at its first step and closes it when done)
++    pfill: ?*const Fill = null,
+     bound: ?*Seq = null,
+     window: [max_rows]u32 = undefined,
+     rows: usize = 0,
+@@ -1449,24 +1461,33 @@
+         prompt: []u32,
+         sampling: ?lanes.Sampling,
+         opts: PrefillOptions,
++        /// cuda_engine's Fill.start: the prompt rows already in (pickOwner reads it when pfill exists)
++        start: usize = 0,
+         left: usize = 5,
+         kept: ?*Snapshot = null,
+         first: u32 = 0,
+         done: bool = false,
++        open: bool = false,
+     };
+ 
+     pub fn fillBegin(t: *Toy, q: *Seq, prompt: []const u32, sampling: ?lanes.Sampling, o: PrefillOptions) !*Fill {
+         if (prompt.len == 0 or prompt.len > q.limit) return error.ToyMisuse;
+         const fl = try t.gpa.create(Fill);
+-        fl.* = .{ .seq = q, .prompt = try t.gpa.dupe(u32, prompt), .sampling = sampling, .opts = o };
++        fl.* = .{ .seq = q, .prompt = try t.gpa.dupe(u32, prompt), .sampling = sampling, .opts = o, .start = if (o.resume_from) |snap| snap.pos else 0 };
+         t.fills += 1;
+         return fl;
+     }
+ 
+     pub fn fillStep(t: *Toy, fl: *Fill, layers: usize) !bool {
+         if (fl.done) return true;
++        if (!fl.open) {
++            if (t.pfill) |p| if (p != fl) return error.PromptBuffersBusy;
++            t.pfill = fl;
++            fl.open = true;
++        }
+         fl.left -|= layers;
+         if (fl.left > 0) return false;
++        t.pfill = null;
+         // the slices' effect: the same pass prefillWith makes, on this fill's sequence
+         const keep = t.bound;
+         t.bound = fl.seq;
+@@ -1479,6 +1500,9 @@
+     }
+ 
+     pub fn fillFree(t: *Toy, fl: *Fill) void {
++        if (t.pfill) |p| if (p == fl) {
++            t.pfill = null;
++        };
+         if (fl.kept) |k| t.freeSnapshot(k);
+         t.gpa.free(fl.prompt);
+         t.gpa.destroy(fl);
+@@ -2009,3 +2033,49 @@
+     try std.testing.expectEqual(@as(usize, 0), t.fills);
+     try std.testing.expectEqual(@as(usize, 0), t.seqs - 2); // the two keepers stay with their states
+ }
++
++test "prompts that arrive together fill one after another on the one set of prompt buffers, each equal to serial decoding" {
++    // every stream begins before the first step (the HTTP host admits a burst so) and the first prompt's
++    // chunk holds the prompt buffers for several slices
++    const gpa = std.testing.allocator;
++    var t: Toy = .{ .gpa = gpa };
++    var b = Lanes(Toy).init(gpa, &t, true, 1 << 20, max_rows);
++    defer b.deinit();
++    b.streams = 4;
++    b.sliced = true;
++    b.fill_layers = 2;
++    var costs: [max_rows]lanes.config.Cost = undefined;
++    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 8.0 + 0.3 * @as(f64, @floatFromInt(w)) };
++    b.costs = costs;
++    b.cost_count = max_rows;
++    b.mtp_ms = 0.4;
++    for (b.shared[0..2], [_]usize{ 2, 4 }) |*c, n| c.* = .{ .width = @intCast(n * max_rows), .ms = 9.0 + 0.2 * @as(f64, @floatFromInt(n * max_rows)) };
++    b.shared_count = 2;
++    var cfg = try lanes.Config.init(gpa, b.facts(), max_rows, max_drafts);
++    defer cfg.deinit(gpa);
++    var clock: lanes.fake.FixedClock = .{};
++    var engine = lanes.Engine.init(gpa, &cfg, b.backend(), clock.clock());
++    defer engine.deinit();
++    var long: [300]u32 = undefined;
++    for (&long, 0..) |*x, i| x.* = @intCast((i * 7 + 5) % 41);
++    const cases = [_]Case{
++        .{ .prompt = &long, .max_new = 40 },
++        .{ .prompt = &.{ 3, 1, 4, 1, 5, 9, 2, 6 }, .max_new = 30 },
++        .{ .prompt = &.{ 2, 7, 1, 8, 2, 8 }, .max_new = 30, .sampling = .{ .seed = 9, .temperature = 0.7 } },
++        .{ .prompt = &.{ 6, 6, 1 }, .max_new = 25, .drafts = false },
++    };
++    var streams: [cases.len]lanes.Stream = undefined;
++    for (cases, &streams) |c, *s| s.* = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = c.prompt, .max_new = c.max_new, .sampling = c.sampling, .drafts = c.drafts });
++    defer for (&streams) |*s| s.deinit(gpa);
++    for (&streams) |*s| try std.testing.expect(try engine.beginStream(s));
++    try std.testing.expectEqual(@as(usize, cases.len), engine.fillingCount());
++    while (engine.activeCount() > 0 or engine.fillingCount() > 0) try engine.step();
++    for (cases, &streams) |c, *s| {
++        try std.testing.expect(s.reason != .@"error");
++        const want = try serialTokens(gpa, c);
++        defer gpa.free(want);
++        try std.testing.expectEqualSlices(u32, want, s.emitted());
++    }
++    try std.testing.expectEqual(@as(usize, 0), t.fills);
++    try std.testing.expect(t.pfill == null);
++}

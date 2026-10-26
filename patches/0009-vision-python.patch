@@ -1,0 +1,792 @@
+TensorFold db281878ddb8..453439d10d03 (zig-single): vision-python
+Apply from the checkout root with: git apply 0009-vision-python.patch
+
+ src/tensorfold/cli.py                                  |   5 ++-
+ src/tensorfold/cli_args.py                             |   7 ++--
+ src/tensorfold/cuda/capacity.py                        |   4 ++-
+ src/tensorfold/cuda/server.py                          |   5 ++-
+ src/tensorfold/families/qwen4_exp/__init__.py          |   2 +-
+ src/tensorfold/families/qwen4_exp/cuda/engine.py       |   8 +++--
+ src/tensorfold/families/qwen4_exp/cuda/kv8_multi.py    |  84 ++++++++++++++++++++++++++++++++++++++++++++++++
+ src/tensorfold/families/qwen4_exp/cuda/kvcache.py      |  28 ++++++++++++----
+ src/tensorfold/families/qwen4_exp/cuda/weight_types.py |   3 ++
+ src/tensorfold/families/qwen4_exp/cuda/weights.py      |   6 ++--
+ src/tensorfold/families/qwen4_exp/cuda/yarn.py         | 177 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/tensorfold/vision/native_helper.py                 | 243 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/tensorfold/vision/qwen_cuda.py                     |   3 +-
+ 13 files changed, 556 insertions(+), 19 deletions(-)
+
+diff --git a/src/tensorfold/cli.py b/src/tensorfold/cli.py
+index 0ab7c277831d3bcfba7a4e8bc990d13b94e53c09..725896b4e0401d8502b131a3543b89ff07c2510b 100644
+--- a/src/tensorfold/cli.py
++++ b/src/tensorfold/cli.py
+@@ -199,7 +199,10 @@ def _model_context(model_dir: Path) -> int:
+     config = read_config(model_dir)
+     text = config.get("text_config") or config
+     limit = text.get("max_position_embeddings") or config.get("max_position_embeddings")
+-    return int(limit) if isinstance(limit, int) and limit > 0 else 0
++    limit = int(limit) if isinstance(limit, int) and limit > 0 else 0
++    from tensorfold.families.qwen4_exp.cuda.yarn import window
++
++    return window(text, limit)                   # Flash Next under YaRN: factor x the native window
+ 
+ 
+ def _drafter(family: Any, choice: str, backend: str = "mlx") -> str:
+diff --git a/src/tensorfold/cli_args.py b/src/tensorfold/cli_args.py
+index cf8c9ce21ffb2281c3604b96ab85930026a58b94..1c01e8df2e2cffad4ea1e3ed15245421f5177243 100644
+--- a/src/tensorfold/cli_args.py
++++ b/src/tensorfold/cli_args.py
+@@ -137,9 +137,10 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
+                       help="with --tp 2: this machine's rank; rank 0 serves HTTP, rank 1 follows it")
+     cuda.add_argument("--master", default="", help="with --tp 2: rank 0's address on the link between the machines")
+     cuda.add_argument("--master-port", type=int, default=29551, help="with --tp 2: rank 0's rendezvous port")
+-    cuda.add_argument("--kv-dtype", choices=("bf16", "int8", "int4"), default="bf16",
+-                      help="KV cache: bf16 (the default), int8, or int4. Quantized keys and values use one "
+-                           "fp16 scale per 32 values (changes the output; Flash Next on CUDA only)")
++    cuda.add_argument("--kv-dtype", choices=("bf16", "int8", "int4", "fp8"), default="bf16",
++                      help="KV cache: bf16 (the default), int8, int4 or fp8. int8/int4 keys and values use one "
++                           "fp16 scale per 32 values; fp8 stores e4m3 codes with a power-of-two scale per head row, "
++                           "about half of bf16's bytes (all change the output; Flash Next on CUDA only)")
+     cuda.add_argument("--prefill-fp8", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
+                       help="prompt matmuls take FP8 (e4m3) activations, one scale a row, where the checkpoint has an "
+                            "FP8 prompt kernel (Qwen3.8 27B and Qwen3.6 MLX 4-bit, NVFP4 checkpoints' FP8 and MXFP8 "
+diff --git a/src/tensorfold/cuda/capacity.py b/src/tensorfold/cuda/capacity.py
+index 18730cc73fc1a3126cab0a14fb6fb0317fdbad3b..1918c675ffd64e972b8c057e3e94b47b6aee81ec 100644
+--- a/src/tensorfold/cuda/capacity.py
++++ b/src/tensorfold/cuda/capacity.py
+@@ -337,7 +337,9 @@ def admit(model_dir: str | Path, requested: int | None, explicit: bool | None, t
+                 raise ValueError(f"host staging needs an estimated {host_staging / GIB:.2f} GiB, "
+                                  f"but only {host_free / GIB:.2f} GiB is available after its reserve; "
+                                  "free host memory or use a checkpoint with smaller loading buffers")
+-        plan = make_plan(int(text.get("max_position_embeddings") or 0), requested,
++        from tensorfold.families.qwen4_exp.cuda.yarn import window
++
++        plan = make_plan(window(text, int(text.get("max_position_embeddings") or 0)), requested,
+                          requested is not None if explicit is None else explicit,
+                          available_bytes(torch), weights, geometry, room=page_room(torch))
+     except (OSError, ValueError, KeyError, TypeError, struct.error) as exc:
+diff --git a/src/tensorfold/cuda/server.py b/src/tensorfold/cuda/server.py
+index f0834537b12a8f000bad5f0881e7f430a2172050..00839a87da8322096e6874d7435911e0b1bbe787 100644
+--- a/src/tensorfold/cuda/server.py
++++ b/src/tensorfold/cuda/server.py
+@@ -61,7 +61,10 @@ def _native_context(model_dir: Path) -> int:
+     config = json.loads(path.read_text())
+     text = config.get("text_config") or config
+     limit = text.get("max_position_embeddings") or config.get("max_position_embeddings")
+-    return int(limit) if isinstance(limit, int) and limit > 0 else 0
++    limit = int(limit) if isinstance(limit, int) and limit > 0 else 0
++    from tensorfold.families.qwen4_exp.cuda.yarn import window
++
++    return window(text, limit)                   # Flash Next under YaRN: factor x the native window
+ 
+ 
+ class App:
+diff --git a/src/tensorfold/families/qwen4_exp/__init__.py b/src/tensorfold/families/qwen4_exp/__init__.py
+index 979582b16293fccceff36ab622dc3251809aae50..7c569252fc065a0951fcfb16b560a8532ec0c2e3 100644
+--- a/src/tensorfold/families/qwen4_exp/__init__.py
++++ b/src/tensorfold/families/qwen4_exp/__init__.py
+@@ -163,7 +163,7 @@ def kernel_version(model: Any) -> str:
+ # the CUDA engine reads MLX affine weights of this (bits, group size), or NVFP4 (ModelOpt) routed experts
+ CUDA_QUANTIZATION = (4, 32)
+ # the KV cache dtypes the CUDA engine can allocate (``--kv-dtype``)
+-CUDA_KV_DTYPES = ("bf16", "int8", "int4")
++CUDA_KV_DTYPES = ("bf16", "int8", "int4", "fp8")
+ CUDA_DECODE_SHARE = True           # --parallel rounds size their prompt pass by --decode-share (0: whole passes)
+ CUDA_PREFILL_FP8 = True            # --prefill-fp8: an NVFP4 checkpoint's MXFP8 linears have an FP8 prompt kernel
+ 
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/engine.py b/src/tensorfold/families/qwen4_exp/cuda/engine.py
+index 002ff1fb6e8f7807a685adf48917b7e89340c48b..3d3889f337b1a68c45b051084b12ebb8cf5713ea 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/engine.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/engine.py
+@@ -259,7 +259,9 @@ class FlashNextEngine:
+             how = f"{'locked in memory' if locked else 'read'} in {read_s:.1f}s"
+         if reread_s:
+             how += f", read again after warm-up in {reread_s:.1f}s ({pinned / 2**30:.2f} GiB of pages locked)"
+-        kv = "" if self.kv_dtype == "bf16" else f"; {self.kv_dtype} KV cache (fp16 scale per 32 values)"
++        kv = "" if self.kv_dtype == "bf16" else (
++            "; fp8 KV cache (e4m3, a power-of-two scale per head row)" if self.kv_dtype == "fp8"
++            else f"; {self.kv_dtype} KV cache (fp16 scale per 32 values)")
+         print(f"[tensorfold] Flash Next on CUDA: {rule}; {where}{kv}; n-gram tables {how}; {captured} "
+               f"decode graphs captured; idle prompt pieces {self.prefill_rows} rows; "
+               f"prompt kernels warmed in {warm_s:.1f}s", flush=True)
+@@ -267,12 +269,12 @@ class FlashNextEngine:
+     def _same_settings(self, torch, ids) -> None:
+         """Both ranks must decode with the same rule, context, draft vocabulary and KV cache, or they would fall out of step: refuse to start otherwise."""
+ 
+-        from .kvcache import BITS_OF
++        from .kvcache import DTYPES
+ 
+         total = int(ids.sum()) if ids is not None else -1
+         mine = torch.tensor([self.depth, round(self.confidence * 1e6), self.max_len, self.streams,
+                              int(self.graphs_enabled),
+-                             len(ids) if ids is not None else -1, total, BITS_OF[self.kv_dtype],
++                             len(ids) if ids is not None else -1, total, DTYPES.index(self.kv_dtype),
+                              self.prefill_rows, int(prompt_precision.fp8())], dtype=torch.int64, device="cuda")
+         both = torch.empty((2 * mine.numel(),), dtype=torch.int64, device="cuda")
+         self.comm.all_gather(mine, both)
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/kv8_multi.py b/src/tensorfold/families/qwen4_exp/cuda/kv8_multi.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7e9713916454272316cd0564d9f61e246c0a076c
+--- /dev/null
++++ b/src/tensorfold/families/qwen4_exp/cuda/kv8_multi.py
+@@ -0,0 +1,84 @@
++"""--kv-dtype fp8 in a concurrent step: attn_multi.layer with kv8.py's FP8 rows (Python's multi-stream path).
++
++attn_multi.py's own kernels stay as they are (the Zig engine replays them for bf16 caches); the two that touch keys and
++values have FP8 twins here, calling kv8's row functions with each row's caches found by table: ``_prep_multi8``
++(kv8.prep_row8) and ``_chunks_multi8`` (kv8.chunk8). The pool and the merge are attn_multi's (bf16 indexer keys; no
++rotation, BITS 0). A stream's rows get the bits a one-stream step gives them, so concurrent == solo holds."""
++
++from __future__ import annotations
++
++import torch
++import triton
++import triton.language as tl
++
++from . import attention as attn_mod, kv8
++from .attention import CHUNK
++from .attn_multi import Step, _caches, _merge_multi, _pool_multi, _ptr, _rows_from
++
++
++@triton.jit
++def _prep_multi8(P, POSR, SID, CP, VP, QW, KW, IW, INV, Q, IQ, eps, N, PW: tl.constexpr, NQ: tl.constexpr,
++                 NKV: tl.constexpr, HD: tl.constexpr, NI: tl.constexpr, IHD: tl.constexpr, HALF: tl.constexpr,
++                 VISION: tl.constexpr, S1: tl.constexpr = 11, S2: tl.constexpr = 10):
++    r = tl.program_id(0)
++    s = tl.load(SID + r)
++    rope, delta, length = CP, CP, 0
++    if VISION:
++        rope, delta = _ptr(VP, s, tl.int32), _ptr(VP + N, s, tl.int32)
++        length = tl.load(VP + 2 * N + s).to(tl.int32)
++    kv8.prep_row8(P, tl.load(POSR + r), r, tl.program_id(1), QW, KW, IW, INV, Q, _ptr(CP, s, tl.float8e4nv),
++                  _ptr(CP + N, s, tl.float8e4nv), _ptr(CP, s, tl.float32), IQ, _ptr(CP + 4 * N, s, tl.bfloat16), eps,
++                  PW, NQ, NKV, HD, NI, IHD, HALF, ROPE=rope, DELTA=delta, length=length, MODE=2 if VISION else 0,
++                  S1=S1, S2=S2)
++
++
++@triton.jit
++def _chunks_multi8(Q, CP, POSR, SID, PO, PM, PL, IDS, NKR, N, H: tl.constexpr, HK: tl.constexpr, D: tl.constexpr,
++                   G: tl.constexpr, CH: tl.constexpr, NCH: tl.constexpr, SCALE: tl.constexpr, IDW: tl.constexpr,
++                   QSA: tl.constexpr, RATIO: tl.constexpr, TOP: tl.constexpr):
++    r = tl.program_id(0)
++    s = tl.load(SID + r)
++    n = tl.load(POSR + r) + 1
++    sparse = False
++    if QSA:                                          # a row is sparse when its select would mark it (end past TOP)
++        sparse = n // RATIO > TOP
++        n = tl.where(sparse, tl.load(NKR + r), n)
++    kv8.chunk8(Q, _ptr(CP, s, tl.float8e4nv), _ptr(CP + N, s, tl.float8e4nv), _ptr(CP, s, tl.float32), n, sparse, r,
++               tl.program_id(1), tl.program_id(2), PO, PM, PL, IDS, H, HK, D, G, CH, NCH, SCALE, IDW, QSA)
++
++
++def layer(layer, w, b, step: Step, mtp: bool, scale: float) -> torch.Tensor:
++    """attn_multi.layer over FP8 caches: prep, pool, sparse streams' own selects, chunks, merge -> b.attn_o[:R]."""
++
++    c, a, sc = w.cfg, layer.attn, b.attn
++    n, rows, cp = step.n, step.rows, step.ptrs[step.index[layer.index]]
++    heads = c.heads + c.kv_heads + c.index_heads + 1
++    sections = w.cfg.mrope_section
++    _prep_multi8[(rows, heads)](b.pa[:rows], step.posr, step.sid, cp, step.vision_ptrs,
++                                a.q_scale, a.k_scale, a.iq_scale, w.inv_freq,
++                                b.q, b.iq, c.eps, n, PW=b.pa.shape[1], NQ=c.heads, NKV=c.kv_heads, HD=c.head_dim,
++                                NI=c.index_heads, IHD=c.index_dim, HALF=w.inv_freq.numel(),
++                                VISION=step.vision, S1=sections[1], S2=sections[2], num_warps=2)
++    top = sc.budget // sc.ratio
++    if sc.qsa:
++        _pool_multi[(n, step.most // sc.ratio + 2)](cp, step.vision_ptrs, step.first, step.counts,
++                                                    a.ik_scale, w.inv_freq, c.eps, n,
++                                                    DI=c.index_dim, HALF=w.inv_freq.numel(), RATIO=sc.ratio,
++                                                    VISION=step.vision, S1=sections[1], S2=sections[2],
++                                                    num_warps=1)
++        for (st, a0, a1), end in zip(step.segs, step.ends):
++            if end // sc.ratio > top:                # this stream has sparse rows: its own select
++                _, _, pooled, pos, _ = _caches(layer, st, mtp)
++                attn_mod.qsa_rows(b.iq[a0:a1], pooled, pos, _rows_from(sc, a0), a1 - a0, context=end)
++    keys = max(step.ends)
++    if sc.qsa:
++        keys = min(keys, (top + 1) * sc.ratio - 1)
++    chunks = min(sc.nch, triton.cdiv(keys, CHUNK))
++    hk = c.kv_heads
++    g = c.heads // hk
++    _chunks_multi8[(rows, hk, chunks)](b.q, cp, step.posr, step.sid, sc.po, sc.pm, sc.pl, sc.ids, sc.nk, n,
++                                       H=c.heads, HK=hk, D=c.head_dim, G=g, CH=CHUNK, NCH=sc.nch, SCALE=scale,
++                                       IDW=sc.idw, QSA=sc.qsa, RATIO=sc.ratio, TOP=top, num_warps=4, num_stages=1)
++    _merge_multi[(rows, hk)](sc.po, sc.pm, sc.pl, step.posr, b.attn_o, sc.nk, H=c.heads, HK=hk, D=c.head_dim, G=g,
++                             CH=CHUNK, NCH=sc.nch, QSA=sc.qsa, BITS=0, RATIO=sc.ratio, TOP=top, num_warps=4)
++    return b.attn_o[:rows]
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/kvcache.py b/src/tensorfold/families/qwen4_exp/cuda/kvcache.py
+index 61e8a28acf6abb29b102a65e00cb4ba11e3d01cd..0f5cd3203416452ac12659df12885e8d7d9acd35 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/kvcache.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/kvcache.py
+@@ -1,4 +1,4 @@
+-"""Flash Next's CUDA key/value caches: bf16, or ExLlamaV3's -cq 8 / -cq 4 codes (H32-rotated groups of 32, fp16 absmax scales, midpoint grid) kept rotated."""
++"""Flash Next's CUDA key/value caches: bf16, ExLlamaV3's -cq 8 / -cq 4 codes (H32-rotated groups of 32, fp16 absmax scales, midpoint grid) kept rotated, or FP8 e4m3 rows with a power-of-two scale a head row (kv8.py)."""
+ 
+ from __future__ import annotations
+ 
+@@ -6,10 +6,12 @@ import math
+ 
+ import torch
+ 
++from . import kv8
++
+ GROUP = 32                      # values per scale (ExLlamaV3's cache-quant group)
+ SCALE_DTYPE = torch.float16     # ExLlamaV3 stores the group absmax as a half (__float2half_rn)
+-DTYPES = ("bf16", "int8", "int4")
+-BITS_OF = {"bf16": 16, "int8": 8, "int4": 4}
++DTYPES = ("bf16", "int8", "int4", "fp8")
++BITS_OF = {"bf16": 16, "int8": 8, "int4": 4, "fp8": 8}   # fp8: admission sizes it as int8 (16 bytes a head row more than kv8.row_bytes)
+ R32 = 1.0 / math.sqrt(32)
+ 
+ 
+@@ -26,16 +28,18 @@ def row_bytes(kv_heads: int, head_dim: int, dtype: str) -> int:
+ 
+     if dtype == "bf16":
+         return 2 * kv_heads * head_dim * 2
++    if dtype == "fp8":
++        return kv8.row_bytes(kv_heads, head_dim)
+     return 2 * kv_heads * (head_dim if dtype == "int8" else head_dim // 2) + 2 * kv_heads * (head_dim // GROUP) * 2
+ 
+ 
+ # -- storage -------------------------------------------------------------------------------------------
+ class KVCache:
+-    """One attention layer's keys and values ``[capacity, kv_heads, head_dim]`` (int4: head_dim / 2 bytes); a bf16 cache keeps one-element scales so every kernel takes one argument list."""
++    """One attention layer's keys and values ``[capacity, kv_heads, head_dim]`` (int4: head_dim / 2 bytes; fp8: uint8 key rows of head_dim + 16 bytes holding both scales, value rows of head_dim, kv8.py); bf16 and fp8 caches keep one-element scales so every kernel takes one argument list."""
+ 
+     def __init__(self, capacity: int, kv_heads: int, head_dim: int, device, dtype: str = "bf16") -> None:
+         check(dtype)
+-        if dtype != "bf16" and head_dim % GROUP:
++        if dtype in ("int8", "int4") and head_dim % GROUP:
+             raise ValueError(f"a quantized KV cache needs a head dim that is a multiple of {GROUP}, not {head_dim}")
+         self.dtype = dtype
+         self.bits = BITS_OF[dtype]
+@@ -54,6 +58,12 @@ class KVCache:
+             groups = (int(capacity), int(kv_heads), int(head_dim) // GROUP)
+             self.ks = torch.zeros(groups, dtype=SCALE_DTYPE, device=device)
+             self.vs = torch.zeros(groups, dtype=SCALE_DTYPE, device=device)
++        elif dtype == "fp8":
++            self.k = torch.zeros((int(capacity), int(kv_heads), kv8.key_bytes(int(head_dim))), dtype=torch.uint8,
++                                 device=device)
++            self.v = torch.zeros(shape, dtype=torch.uint8, device=device)
++            self.ks = torch.zeros((1,), dtype=SCALE_DTYPE, device=device)
++            self.vs = torch.zeros((1,), dtype=SCALE_DTYPE, device=device)
+         else:
+             self.k = torch.zeros(shape, dtype=torch.bfloat16, device=device)
+             self.v = torch.zeros_like(self.k)
+@@ -62,7 +72,13 @@ class KVCache:
+ 
+     @property
+     def quantized(self) -> bool:
+-        return self.dtype != "bf16"
++        """int8 / int4: codes with per-group scale tensors and the H32 rotation (the kernels' BITS path)."""
++        return self.dtype in ("int8", "int4")
++
++    @property
++    def fp8(self) -> bool:
++        """FP8 rows (kv8.py's kernels; scales inside the key rows)."""
++        return self.dtype == "fp8"
+ 
+     @property
+     def nbytes(self) -> int:
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/weight_types.py b/src/tensorfold/families/qwen4_exp/cuda/weight_types.py
+index 6043ec8c67327e8e0bb9bdb6b5b193b3a3375b8d..0491d0b587f82c14f69b69ab15905fe9a78b6e9a 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/weight_types.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/weight_types.py
+@@ -16,6 +16,7 @@ from ..host_table import BF16Table, HostTable
+ from ..ssd_table import SSDTable
+ from .ngram import NGram
+ from .qmm import Q4
++from .yarn import Yarn, read as read_yarn
+ 
+ 
+ def stop_ids(configured: Any, generation: Path) -> tuple[int, ...]:
+@@ -76,6 +77,7 @@ class Config:
+     quant: str = "mlx"                 # "mlx" (affine 4-bit everywhere) or "modelopt" (NVFP4 routed experts)
+     mrope_section: tuple[int, int, int] = (11, 11, 10)   # interleaved t/h/w rotary pairs
+     nvfp4_group: int = 16              # the NVFP4 block size (the checkpoint's config_groups weights.group_size)
++    yarn: Yarn | None = None           # YaRN past the native window (yarn.py; None: the default rope)
+ 
+     @classmethod
+     def read(cls, model_dir: str | Path) -> "Config":
+@@ -115,6 +117,7 @@ class Config:
+             eos=eos, group_size=int(quant.get("group_size", 32)), bits=int(quant.get("bits", 4)),
+             quant=method, nvfp4_group=group,
+             mrope_section=tuple(int(x) for x in rope.get("mrope_section", (11, 11, 10))),
++            yarn=read_yarn(t),
+         )
+ 
+     @property
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/weights.py b/src/tensorfold/families/qwen4_exp/cuda/weights.py
+index 5159a73f34cb6d7b7e45ef92253a413aa62f6f96..3da1d96f8d5a70e9965cda63ed066ad4c4e77bf4 100644
+--- a/src/tensorfold/families/qwen4_exp/cuda/weights.py
++++ b/src/tensorfold/families/qwen4_exp/cuda/weights.py
+@@ -12,6 +12,7 @@ from .bf16 import b16_from_rows, quantize4, stack_b16
+ from tensorfold.cuda import experts as grouped
+ 
+ from .qmm import Q4, dequantize, make_q4, stack_q4
++from . import yarn
+ from .reader import _DT, _Reader, _groups, _rows, _rows_at, norms_around_one  # noqa: F401
+ from .weight_types import (
+     AttnW, Config, GDNW, HC, LayerW, MoEW, MTPW, PLEW, Weights, draft_token_ids, stop_ids)  # noqa: F401 (re-exported)
+@@ -40,7 +41,8 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
+ 
+     model_dir = Path(model_dir)
+     if exl3.is_exl3(model_dir):                       # an EXL3 pack: its own loader, the same dataclasses
+-        return exl3.load(model_dir, device, mtp=mtp, tp=tp, draft_vocab=draft_vocab, table_reads=table_reads)
++        return yarn.apply(exl3.load(model_dir, device, mtp=mtp, tp=tp, draft_vocab=draft_vocab,
++                                    table_reads=table_reads))
+     full = Config.read(model_dir)
+     rank, world = tp if tp is not None else (0, 1)
+     cfg = full if world == 1 else replace(full, heads=full.heads // world, kv_heads=full.kv_heads // world,
+@@ -444,4 +446,4 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
+     rd.release()
+     torch.cuda.empty_cache()
+     w.meta["load_seconds"] = time.time() - t0
+-    return w
++    return yarn.apply(w)
+diff --git a/src/tensorfold/families/qwen4_exp/cuda/yarn.py b/src/tensorfold/families/qwen4_exp/cuda/yarn.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..550b1bc47e2139341e00f24c792f981a559d2c0b
+--- /dev/null
++++ b/src/tensorfold/families/qwen4_exp/cuda/yarn.py
+@@ -0,0 +1,177 @@
++"""YaRN on Flash Next's 64 rotary dims: Qwen's recipe past the native 262,144 tokens (rope_type yarn, factor 4).
++
++The semantics are Transformers' ``_compute_yarn_parameters``: each rotary pair's frequency blends the native one
++(extrapolation) and the native one over ``factor`` (interpolation) along a linear ramp over the pairs, from the
++correction dim of ``beta_fast`` (32) rotations to that of ``beta_slow`` (1) rotation in
++``original_max_position_embeddings`` positions (floor and ceil with ``truncate``, the default); and the cos/sin of
++the rotary dims are multiplied by the attention factor, 0.1 ln(factor) + 1 unless the config gives one.
++
++Here the frequencies are computed in fp64 and stored fp32, like the default ones (``weights.load``), and the
++attention factor is folded into the fp32 gammas of the four RMSNorms whose outputs are rotated (q_norm, k_norm and
++the indexer's q_layernorm and k_layernorm, in every attention layer and the MTP layer): RoPE is linear, so scaling a
++normalized head's rotary dims before the rotation is scaling cos and sin. The main attention, the QSA indexer (its
++queries and its pooled keys) and the MTP layer share the one rotary embedding, as in Transformers and vLLM.
++
++Off unless the config's ``rope_parameters`` say yarn or ``TF_FLASHNEXT_YARN`` gives a factor (``0``/``off`` turns a
++config's yarn off). The Zig engine computes the same bits (zig/src/families/flashnext/cuda_rope.zig).
++"""
++
++from __future__ import annotations
++
++import math
++import os
++from dataclasses import dataclass
++
++ENV = "TF_FLASHNEXT_YARN"                         # a factor > 1 (4.0: 1,048,576 tokens), or 0 / off
++ENV_RAMP = "TF_FLASHNEXT_YARN_RAMP_POSITIONS"     # the ramp's positions (default original_max_position_embeddings;
++                                                  # vLLM's MRotaryEmbedding passes 4x that)
++TEXT_TYPES = ("qwen4_exp", "qwen4_exp_text")
++OFF = ("0", "off", "no", "false", "none", "default")
++
++
++def _mscale(scale: float, mscale: float = 1.0) -> float:
++    return 1.0 if scale <= 1 else 0.1 * mscale * math.log(scale) + 1.0
++
++
++@dataclass(frozen=True)
++class Yarn:
++    factor: float
++    original: int                    # original_max_position_embeddings: the trained window
++    beta_fast: float = 32.0
++    beta_slow: float = 1.0
++    attention: float = 0.0           # the attention factor (0: derived from factor)
++    truncate: bool = True
++    ramp_positions: int = 0          # the positions the correction dims count rotations in (0: original)
++
++    @property
++    def window(self) -> int:
++        return int(self.factor * self.original)
++
++    @property
++    def scale(self) -> float:
++        """The attention factor multiplying cos and sin of the rotary dims (fp64)."""
++
++        return float(self.attention) if self.attention else _mscale(self.factor)
++
++    def bounds(self, rotary_dim: int, theta: float) -> tuple[float, float]:
++        """The ramp's first and last rotary pair (Transformers' find_correction_range)."""
++
++        positions = self.ramp_positions or self.original
++
++        def dim(rotations: float) -> float:
++            return rotary_dim * math.log(positions / (rotations * 2 * math.pi)) / (2 * math.log(theta))
++
++        low, high = dim(self.beta_fast), dim(self.beta_slow)
++        if self.truncate:
++            low, high = math.floor(low), math.ceil(high)
++        return max(low, 0), min(high, rotary_dim - 1)
++
++
++def read(text: dict) -> Yarn | None:
++    """The YaRN settings of a text config (``rope_parameters``), with ``TF_FLASHNEXT_YARN`` over them."""
++
++    rope = dict(text.get("rope_parameters") or {})
++    native = int(text.get("max_position_embeddings") or 0)
++    env = os.environ.get(ENV, "").strip().lower()
++    if env in OFF:
++        return None
++    if env:
++        try:
++            factor = float(env)
++        except ValueError:
++            raise ValueError(f"{ENV}={env!r}: a YaRN factor above 1 (4.0 for 1,048,576 tokens), or off") from None
++        rope = {**rope, "rope_type": "yarn", "factor": factor}
++    if str(rope.get("rope_type", rope.get("type", "default"))) != "yarn":
++        return None
++    original = int(rope.get("original_max_position_embeddings") or native)
++    factor = rope.get("factor")
++    factor = float(factor) if factor is not None else (native / original if original else 0.0)
++    if not factor > 1.0 or original <= 0:
++        raise ValueError(f"YaRN needs a factor above 1 and original_max_position_embeddings; got factor {factor}, "
++                         f"original {original}")
++    attention = rope.get("attention_factor")
++    mscale, mscale_all = rope.get("mscale"), rope.get("mscale_all_dim")
++    if attention is None and mscale and mscale_all:
++        attention = _mscale(factor, float(mscale)) / _mscale(factor, float(mscale_all))
++    ramp = os.environ.get(ENV_RAMP, "").strip()
++    return Yarn(factor=factor, original=original, beta_fast=float(rope.get("beta_fast") or 32),
++                beta_slow=float(rope.get("beta_slow") or 1), attention=float(attention or 0.0),
++                truncate=bool(rope.get("truncate", True)), ramp_positions=int(ramp) if ramp else 0)
++
++
++def window(text: dict, limit: int) -> int:
++    """A Flash Next config's window: ``factor * original`` under YaRN, else ``limit`` (max_position_embeddings)."""
++
++    if str(text.get("model_type", "")) not in TEXT_TYPES:
++        return limit
++    yarn = read(text)
++    return max(int(limit or 0), yarn.window) if yarn is not None else limit
++
++
++def inv_freq(theta: float, rotary_dim: int, yarn: Yarn | None):
++    """The fp32 frequencies of the rotary pairs, computed in fp64 (the default ones are weights.load's bits)."""
++
++    import torch
++
++    half = rotary_dim // 2
++    native = torch.tensor(theta, dtype=torch.float64) ** (-torch.arange(0, half, dtype=torch.float64) / half)
++    if yarn is None:
++        return native.to(torch.float32)
++    low, high = yarn.bounds(rotary_dim, theta)
++    if low == high:
++        high += 0.001
++    ramp = ((torch.arange(half, dtype=torch.float64) - low) / (high - low)).clamp(0, 1)
++    keep = 1 - ramp                                   # 1: the native frequency, 0: the native one over factor
++    return ((native / yarn.factor) * (1 - keep) + native * keep).to(torch.float32)
++
++
++def scale32(yarn: Yarn | None) -> float:
++    """The attention factor rounded to fp32, as it multiplies the fp32 gammas."""
++
++    import numpy as np
++
++    return 1.0 if yarn is None else float(np.float32(yarn.scale))
++
++
++def fold(gamma, rotary_dim: int, scale: float) -> None:
++    """gamma[:rotary_dim] = fp32(gamma * scale) in place: one IEEE fp32 multiply (the fp64 product is exact)."""
++
++    import torch
++
++    head = gamma[:rotary_dim]
++    head.copy_((head.to(torch.float64) * float(scale)).to(torch.float32))
++
++
++def apply(w):
++    """YaRN on loaded weights: the frequencies and the attention factor folded into the rotated norms' gammas."""
++
++    cfg = w.cfg
++    yarn = getattr(cfg, "yarn", None)
++    if yarn is None:
++        return w
++    import torch
++
++    if w.inv_freq.dtype != torch.float32 or w.inv_freq.numel() != cfg.rotary_dim // 2:
++        raise ValueError("YaRN expects the fp32 rotary frequencies of the loaded weights")
++    w.inv_freq = inv_freq(cfg.rope_theta, cfg.rotary_dim, yarn).to(w.inv_freq.device)
++    m = scale32(yarn)
++    layers = [layer for layer in w.layers if layer.attn is not None]
++    if w.mtp is not None and w.mtp.layer.attn is not None:
++        layers.append(w.mtp.layer)
++    seen: set[int] = set()
++    for layer in layers:
++        a = layer.attn
++        for gamma in (a.q_scale, a.k_scale, a.iq_scale, a.ik_scale):
++            if gamma.dtype != torch.float32 or gamma.numel() < cfg.rotary_dim:
++                raise ValueError("YaRN folds its attention factor into fp32 norm gammas of the rotary dims")
++            if gamma.data_ptr() in seen:              # a gamma shared between heads is folded once
++                continue
++            seen.add(gamma.data_ptr())
++            fold(gamma, cfg.rotary_dim, m)
++    low, high = yarn.bounds(cfg.rotary_dim, cfg.rope_theta)
++    w.meta["yarn"] = dict(factor=yarn.factor, original=yarn.original, window=yarn.window, attention=m,
++                          ramp=(low, high), ramp_positions=yarn.ramp_positions or yarn.original)
++    print(f"[tensorfold] Flash Next YaRN: factor {yarn.factor:g} over {yarn.original} positions "
++          f"({yarn.window}-token window), ramp pairs {low}..{high}, attention factor {m:.9g} folded into the "
++          f"q/k and indexer norms of {len(layers)} attention layers", flush=True)
++    return w
+diff --git a/src/tensorfold/vision/native_helper.py b/src/tensorfold/vision/native_helper.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8e3e886a5bc5f68a075a26f27e91192f83c95892
+--- /dev/null
++++ b/src/tensorfold/vision/native_helper.py
+@@ -0,0 +1,243 @@
++"""The Zig engine's vision helper: Python TensorFold's own image and video path, as a child process of
++``tensorfold-native serve --vision``.
++
++The Zig server renders the chat template (image and video parts as ``{"type": "image"}`` / ``{"type": "video"}``)
++and sends each media request here; this process runs exactly what ``tensorfold.server.prompts.prepare_images`` runs
++after its ``split_images``: the sources' checks, ``load_images`` (Pillow), ``load_videos`` (PyAV), the processor's
++``prepare`` (transformers' image processor, the HF tokenizer, the rotary positions) and ``QwenCudaVision.encode``
++(the 27-layer tower on the GPU). So the token ids, positions and visual embeddings are Python's bits by
++construction; the Zig engine only moves them into the prompt rows.
++
++Frames on stdin / stdout, little endian. Request: u32 length, then JSON
++``{"prompt": str, "media": [{"kind": "image"|"video", "url": str, "detail": str}], "max_prompt_tokens": int|null}``.
++Reply: u32 header length, the header JSON, u64 payload length, the payload: token ids u32 [n], feature rows u32 [k]
++(prompt positions, ascending), rotary positions i32 [n, 3], features bf16 [k, width]. An error reply is a header
++``{"ok": false, "status": 400|503, "error": message}`` and an empty payload. The first frame written is the
++ready header (``{"ready": true, ...}``) once the tower is loaded and warm. Logs go to stderr.
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import struct
++import sys
++import time
++from dataclasses import replace
++
++# Flash Next's request limits (the single-Spark recipe's patches 0008 and 0009 by MiaAI-Lab): up to 50 images
++# sharing 16,384 visual tokens (each at most 4,096), 10 MB an image, 64 MB and 128 Mi pixels in all; up to two
++# videos (user messages), 64 MB each, 96 MB in all
++MAX_IMAGES, IMAGE_TOKENS = 50, 16384
++IMAGES_TOTAL_BYTES, IMAGES_TOTAL_PIXELS = 64 * 1024 * 1024, 128 * 1024 * 1024
++VIDEO_BYTES, VIDEOS_TOTAL_BYTES = 64 * 1024 * 1024, 96 * 1024 * 1024
++
++
++def _log(message: str) -> None:
++    print(f"[vision-helper] {message}", file=sys.stderr, flush=True)
++
++
++def _read_exact(stream, n: int) -> bytes | None:
++    data = bytearray()
++    while len(data) < n:
++        chunk = stream.read(n - len(data))
++        if not chunk:
++            return None
++        data += chunk
++    return bytes(data)
++
++
++def _write(out, header: dict, payload: list[bytes] = ()) -> None:
++    head = json.dumps(header, separators=(",", ":")).encode()
++    size = sum(len(p) for p in payload)
++    out.write(struct.pack("<I", len(head)) + head + struct.pack("<Q", size))
++    for p in payload:
++        out.write(p)
++    out.flush()
++
++
++class Helper:
++    def __init__(self, model: str, *, allow_urls: bool, max_images: int, image_tokens: int, workspace: int, max_videos: int = 4) -> None:
++        import torch
++
++        from .images import DEFAULT_LIMITS
++        from .qwen_cuda import QwenCudaVision
++        from .videos import DEFAULT_VIDEO_LIMITS
++
++        self.torch = torch
++        torch.cuda.set_device(0)
++        device = torch.device("cuda", 0)
++        started = time.perf_counter()
++        self.vision = QwenCudaVision(model, device, allow_urls=allow_urls)
++        self.allow_urls = allow_urls
++        self.limits = replace(DEFAULT_LIMITS, max_images=max_images, max_visual_tokens=image_tokens,
++                              max_total_encoded_bytes=IMAGES_TOTAL_BYTES, max_total_pixels=IMAGES_TOTAL_PIXELS)
++        self.video_limits = replace(DEFAULT_VIDEO_LIMITS, max_videos=max_videos, max_encoded_bytes=VIDEO_BYTES,
++                                    max_total_encoded_bytes=VIDEOS_TOTAL_BYTES)
++        if workspace > 0:                   # the caching allocator stays inside the tower and the reserved workspace
++            total = torch.cuda.get_device_properties(0).total_memory
++            cap = self.vision.weight_bytes + workspace + (256 << 20)
++            torch.cuda.set_per_process_memory_fraction(min(1.0, cap / total), 0)
++        self.vision.warm()
++        torch.cuda.empty_cache()
++        self.load_s = time.perf_counter() - started
++
++    def ready(self) -> dict:
++        import numpy
++        import PIL
++        import transformers
++
++        try:
++            import av
++            av_version = av.__version__
++        except ImportError:
++            av_version = None
++        raw = self.vision.frontend.config
++        return {"ready": True, "selftest_sha256": self.selftest(), "pid": os.getpid(), "videos": bool(self.vision.videos),
++                "tower_bytes": int(self.vision.weight_bytes), "width": int(self.vision.config["out_hidden_size"]),
++                "image_token_id": int(raw["image_token_id"]), "video_token_id": int(raw.get("video_token_id", -1)),
++                "load_s": round(self.load_s, 3), "reserved": int(self.torch.cuda.memory_reserved()),
++                "versions": {"torch": self.torch.__version__, "transformers": transformers.__version__,
++                             "pillow": PIL.__version__, "numpy": numpy.__version__, "av": av_version}}
++
++    def selftest(self) -> str:
++        """The features sha of a fixed 96x64 PNG through the whole path (Pillow decode, processor, tower): equal
++        wherever the stack (Python packages, CUDA libraries, GPU) is the reference's."""
++
++        import base64
++        import io
++
++        import numpy as np
++        from PIL import Image
++
++        y, x = np.mgrid[0:64, 0:96]
++        pixels = np.stack([(x * 255 // 95), (y * 255 // 63), ((x + y) * 3) % 256], axis=-1).astype(np.uint8)
++        out = io.BytesIO()
++        Image.fromarray(pixels, "RGB").save(out, format="PNG")
++        front = self.vision.frontend
++        prompt = f"{front.vision_start or ''}{front.image_token}{front.vision_end or ''}What is this?"
++        header, _ = self.handle({"prompt": prompt, "media": [
++            {"kind": "image", "url": "data:image/png;base64," + base64.b64encode(out.getvalue()).decode()}]})
++        return header["features_sha256"]
++
++    def prepare(self, request: dict):
++        """``prepare_images`` after ``split_images``: the same checks, loads, processor call and tower call."""
++
++        from .images import ImageInputError, ImageSource, _check_source, load_images
++        from .videos import load_videos, video_source
++
++        prompt, media = request.get("prompt"), request.get("media") or []
++        if not isinstance(prompt, str) or not isinstance(media, list) or not media:
++            raise ImageInputError("a media request needs its rendered prompt and its images or videos")
++        sources = []
++        for item in media:
++            kind = item.get("kind") if isinstance(item, dict) else None
++            if kind == "image":
++                if sum(isinstance(s, ImageSource) for s in sources) >= self.limits.max_images:
++                    raise ImageInputError(
++                        f"a request supports at most {self.limits.max_images} images across the full message "
++                        "history, including prior turns; remove older image content, start a new conversation, "
++                        "or restart the server with --vision-max-images N to raise the count limit (other image "
++                        "limits still apply)")
++                source = ImageSource(item.get("url") or "", item.get("detail") or "auto")
++                _check_source(source, self.limits, self.allow_urls)
++                sources.append(source)
++            elif kind == "video":
++                if not self.vision.videos:
++                    raise ImageInputError("this checkpoint's frontend encodes images only")
++                if sum(not isinstance(s, ImageSource) for s in sources) >= self.video_limits.max_videos:
++                    raise ImageInputError(f"a request supports at most {self.video_limits.max_videos} videos; send fewer, or restart the server with --vision-max-videos N to raise the count limit")
++                sources.append(video_source({"url": item.get("url")}, self.video_limits, self.allow_urls))
++            else:
++                raise ImageInputError("media parts must be images or videos")
++        images = load_images([s for s in sources if isinstance(s, ImageSource)], limits=self.limits,
++                             allow_urls=self.allow_urls)
++        budget = {"max_visual_tokens": self.limits.max_visual_tokens}
++        clips = [s for s in sources if not isinstance(s, ImageSource)]
++        if clips:
++            budget["videos"] = load_videos(clips, self.vision.video_size, limits=self.video_limits,
++                                           allow_urls=self.allow_urls)
++        limit = request.get("max_prompt_tokens")
++        return self.vision.prepare(prompt, images, max_prompt_tokens=int(limit) if limit else None, **budget)
++
++    def handle(self, request: dict) -> tuple[dict, list[bytes]]:
++        import numpy as np
++
++        t0 = time.perf_counter()
++        prepared = self.prepare(request)
++        t1 = time.perf_counter()
++        encoded = self.vision.encode(prepared, prepared.token_ids)
++        torch = self.torch
++        features = encoded.features.contiguous().view(torch.int16).cpu().numpy().tobytes()
++        positions = encoded.positions.t().contiguous().cpu().numpy().astype("<i4").tobytes()
++        tokens = np.asarray(prepared.token_ids, dtype="<u4").tobytes()
++        rows = np.asarray(encoded.rows, dtype="<u4").tobytes()
++        t2 = time.perf_counter()
++        del encoded
++        torch.cuda.empty_cache()
++        header = {"ok": True, "tokens": len(prepared.token_ids), "rows": len(rows) // 4,
++                  "delta": int(prepared.rope_delta), "width": int(self.vision.config["out_hidden_size"]),
++                  "images": len(prepared.image_spans), "video_groups": len(prepared.video_spans),
++                  "videos": len(prepared.video_hashes), "visual_tokens": int(prepared.visual_tokens),
++                  "features_sha256": hashlib.sha256(features).hexdigest(),
++                  "tokens_sha256": hashlib.sha256(tokens).hexdigest(),
++                  "positions_sha256": hashlib.sha256(positions).hexdigest(),
++                  "prepare_s": round(t1 - t0, 4), "encode_s": round(t2 - t1, 4),
++                  "peak": int(torch.cuda.max_memory_reserved())}
++        torch.cuda.reset_peak_memory_stats()
++        return header, [tokens, rows, positions, features]
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--model", required=True)
++    ap.add_argument("--urls", action="store_true", help="also fetch public https:// images and videos")
++    ap.add_argument("--max-images", type=int, default=int(os.environ.get("TENSORFOLD_MAX_IMAGES") or MAX_IMAGES))
++    ap.add_argument("--max-videos", type=int, default=int(os.environ.get("TENSORFOLD_MAX_VIDEOS") or 4))
++    ap.add_argument("--image-tokens", type=int,
++                    default=int(os.environ.get("TENSORFOLD_IMAGE_TOKENS") or IMAGE_TOKENS))
++    ap.add_argument("--workspace-mib", type=int,
++                    default=int(os.environ.get("TENSORFOLD_VISION_WORKSPACE_MIB") or 4096))
++    a = ap.parse_args()
++    if not 1 <= a.max_videos <= 64 or not 1 <= a.max_images <= 256 or not 1 <= a.image_tokens <= 65536 or not 0 <= a.workspace_mib <= 16384:
++        print("--max-images 1..256, --image-tokens 1..65536, --workspace-mib 0..16384", file=sys.stderr)
++        return 2
++    out = sys.stdout.buffer
++    sys.stdout = sys.stderr                  # nothing but frames on the pipe
++    try:
++        helper = Helper(a.model, allow_urls=a.urls, max_images=a.max_images, max_videos=a.max_videos, image_tokens=a.image_tokens,
++                        workspace=a.workspace_mib << 20)
++    except Exception as exc:  # noqa: BLE001 - the parent reads why
++        _write(out, {"ready": False, "error": f"{type(exc).__name__}: {exc}"})
++        return 1
++    _write(out, helper.ready())
++    _log(f"ready: tower {helper.vision.weight_bytes / 2**30:.2f} GiB, loaded in {helper.load_s:.1f} s")
++    from tensorfold.server.errors import CONTEXT_LIMIT
++
++    from .images_http import ImageInputError
++
++    inp = sys.stdin.buffer
++    while True:
++        raw = _read_exact(inp, 4)
++        if raw is None:
++            return 0
++        body = _read_exact(inp, struct.unpack("<I", raw)[0])
++        if body is None:
++            return 0
++        try:
++            header, payload = helper.handle(json.loads(body))
++        except (ImageInputError, ValueError, ImportError) as exc:
++            message = str(exc)
++            code = "context_length_exceeded" if message.startswith(CONTEXT_LIMIT) else None
++            header, payload = {"ok": False, "status": 400, "error": message, "code": code}, []
++        except Exception as exc:  # noqa: BLE001 - one request fails, the helper serves on
++            helper.torch.cuda.empty_cache()
++            _log(f"request failed: {type(exc).__name__}: {exc}")
++            header, payload = {"ok": False, "status": 503, "error": f"vision processing failed ({type(exc).__name__})"}, []
++        _write(out, header, payload)
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/src/tensorfold/vision/qwen_cuda.py b/src/tensorfold/vision/qwen_cuda.py
+index 80bb3f295f969c78569f935083f9f3f368906a5d..895ce7eac7b714002deb8de913492f90c0bde0a8 100644
+--- a/src/tensorfold/vision/qwen_cuda.py
++++ b/src/tensorfold/vision/qwen_cuda.py
+@@ -44,7 +44,8 @@ class EncodedVision:
+ def vision_config(model_dir: str | Path) -> dict:
+     raw = json.loads((Path(model_dir) / "config.json").read_text())
+     config = raw.get("vision_config")
+-    if not isinstance(config, dict) or config.get("model_type") not in ("qwen3_5", "qwen4_exp"):
++    # NVIDIA's Flash Next NVFP4 checkpoint names its tower ``qwen4_exp_vision`` (the same tower as qwen4_exp's)
++    if not isinstance(config, dict) or config.get("model_type") not in ("qwen3_5", "qwen4_exp", "qwen4_exp_vision"):
+         raise ValueError("CUDA vision requires a Qwen3.5-compatible vision checkpoint")
+     if config.get("deepstack_visual_indexes"):
+         raise ValueError("CUDA Qwen vision does not support deepstack image features")

@@ -1,4 +1,22 @@
-__pycache__/
-*.pyc
+# lab and per-machine files, never part of the repository
+work/
+scripts/local.sh
 .env
-benchmark-results/
+.claude/
+AGENTS.md
+CLAUDE.md
+# agent handoffs, prompts, notes and scratch
+HANDOFF*.md
+*HANDOFF*
+*-PROMPT.md
+*PROMPT*.md
+STATUS.md
+PLAN.md
+SUMMARY*.md
+NOTES*.md
+*.lab
+*.bak
+*.orig
+*.rej
+*.log
+__pycache__/

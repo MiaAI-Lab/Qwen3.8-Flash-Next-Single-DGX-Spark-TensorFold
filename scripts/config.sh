@@ -1,6 +1,7 @@
-# Shared settings for start.sh, stop.sh and scripts/*.sh. Any value can be overridden from the environment,
-# e.g. `PORT=9000 ./start.sh` or `PULL=0 scripts/prepare.sh`, or set in ./.env: KEY=value lines, read here (never
-# run as a script); a variable already set in the environment wins over the file. .env is yours, not the repository's.
+# Shared settings for start.sh, stop.sh and scripts/*.sh. A setting's value comes from the first of these that sets it:
+#   1. the environment: `PORT=9000 ./start.sh`, `PULL=0 scripts/prepare.sh`
+#   2. ./.env (KEY=value lines, read, never run)
+# Settings marked PROVISIONAL follow TensorFold's Zig engine (tensorfold-native) and change when a gated commit lands.
 if [[ -f .env ]]; then
   while IFS= read -r _line || [[ -n "$_line" ]]; do
     [[ "$_line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
@@ -13,116 +14,180 @@ if [[ -f .env ]]; then
     [[ -n "${!_key+set}" ]] || export "$_key=$_value"
   done < .env
 fi
+unset _line _key _value
 
-MODEL_ID="${MODEL_ID:-Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP}"   # MLX 4-bit, group size 32, with the MTP head
-# The patches and start.sh's flags are made for TensorFold v0.6.1 exactly (17c73e1). After changing
-# TF_VERSION, TF_REPO or BASE_IMAGE, run `scripts/prepare.sh --rebuild`.
-TF_VERSION="${TF_VERSION:-v0.6.1}"
+# Checkpoint. The default is NVIDIA's quantization-aware-distilled FP4 (NVFP4 routed experts, MXFP8 and bf16 elsewhere,
+# FP8 n-gram table, MTP head): nvidia/Qwen3.8-Flash-Next-FP4-Local, ~96 GiB. azampatti's INT4-AutoRound (top-5 routing,
+# GPTQ int4 experts, ~122 GiB) stays available: CHECKPOINT=int4 ./start.sh, or set MODEL_ID and MODEL_REVISION yourself.
+# The engine reads the format from the checkpoint. WEIGHTS_GIB is what loading takes of MemAvailable (measured on the Zig engine:
+# 81 GiB for the NVIDIA checkpoint with vision on).
+CHECKPOINT="${CHECKPOINT:-nvfp4}"
+_pin=1; [[ -z "${MODEL_ID:-}" ]] || _pin=0       # a MODEL_ID set by hand takes no preset revision pin
+case "$CHECKPOINT" in
+  nvfp4)
+    : "${MODEL_ID:=nvidia/Qwen3.8-Flash-Next-FP4-Local}"
+    (( ! _pin )) || : "${MODEL_REVISION:=b9ce18a6887e18c089fdea8509a33e63429a3300}"
+    CKPT_GIB=96; WEIGHTS_GIB="${WEIGHTS_GIB:-81}"
+    QUANT_LABEL="NVIDIA FP4 QAD: NVFP4 experts, MXFP8" ;;
+  int4)
+    : "${MODEL_ID:=azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound}"
+    (( ! _pin )) || : "${MODEL_REVISION:=1464274120d36a4d8fcaa934552334a7d83ce0fd}"
+    CKPT_GIB=122; WEIGHTS_GIB="${WEIGHTS_GIB:-66}"
+    QUANT_LABEL="INT4-AutoRound" ;;
+  *) echo "CHECKPOINT is nvfp4 or int4, not $CHECKPOINT" >&2; exit 1 ;;
+esac
+MODEL_REVISION="${MODEL_REVISION:-}"
+unset _pin
+
+# The engine: TensorFold's Zig engine, built from TF_REPO at TF_REF (branch zig-flashnext) with patches/*.patch
+# applied (git apply in the checkout's root), with Zig ZIG_VERSION. Only the Zig build goes into the image.
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
+TF_REF="${TF_REF:-db281878ddb836fd0df510d8771ecb7e0fe47d26}"   # zig-flashnext; patches bring the gated Flash Next CUDA engine
+ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
+ZIG_SHA256="${ZIG_SHA256:-9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
-# Replies mostly in Chinese or Japanese: DRAFT_LANGUAGE=zh or ja (in .env) serves the second image, which adds that
-# language's tokens to the ones MTP drafts may propose (patches/languages/): faster decoding there, the same
-# output. English and code get a little slower with it, so leave it unset otherwise. Also accepted, not measured to help:
-# de, fr, pt, ru, nl (experimental); several: "nl,de". See docs/nl.md for Dutch validation and benchmarks.
-DRAFT_LANGUAGE="${DRAFT_LANGUAGE:-}"
-IMAGE="${IMAGE:-tensorfold-qwen38:${TF_VERSION}${DRAFT_LANGUAGE:+-languages}}"   # the local image prepare.sh builds or pulls
-CONTAINER_NAME="${CONTAINER_NAME:-qwen38-flash-next-tf}"          # the server's container
-# The prebuilt images: prepare.sh pulls $GHCR_IMAGE:<TF_VERSION>-<patches hash>; publish-image.sh pushes it (and
-# :latest, or :languages for the DRAFT_LANGUAGE image).
+TF_TAG="zig-${TF_REF:0:7}"
+IMAGE="${IMAGE:-tensorfold-qwen38:${TF_TAG}}"
+KERNELS_PATH=/opt/tensorfold/share/tensorfold/cuda/sm121
+# Triton's line info records each kernel source's mtime. Pin it so cubins match the reference kernel set.
+KERNEL_SOURCE_MTIME="${KERNEL_SOURCE_MTIME:-1791318675}"
+image_hash() {
+  ( cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
+    cat patches/*.patch 2>/dev/null
+    sed -n "/<<'DOCKERFILE'/,/^DOCKERFILE\$/p" scripts/prepare.sh
+    echo "$TF_REPO $TF_REF zig-$ZIG_VERSION $ZIG_SHA256 $BASE_IMAGE kernel-mtime-$KERNEL_SOURCE_MTIME tp-1"
+  ) | sha256sum | cut -c1-12
+}
 GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold}"
+IMAGE_TAG="${IMAGE_TAG:-}"
+IMAGE_DIGEST="${IMAGE_DIGEST:-}"
+prebuilt_image() {
+  local tag="${TF_TAG}-$(image_hash)"
+  if [[ "$tag" == "$IMAGE_TAG" && -n "$IMAGE_DIGEST" ]]; then echo "$GHCR_IMAGE@$IMAGE_DIGEST"; else echo "$GHCR_IMAGE:$tag"; fi
+}
+CONTAINER_NAME="${CONTAINER_NAME:-qwen38-flash-next-tf}"
 
-SERVED_NAME="${SERVED_NAME:-Qwen3.8-Flash-Next}"   # the model id clients see in /v1/models and replies (tensorfold --name)
+SERVED_NAME="${SERVED_NAME:-Qwen3.8-Flash-Next}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
-# Serving defaults (./start.sh arguments come after them and win). All streams share one memory pool (~103-104 GiB
-# budget on a 128 GB Spark, 75 GiB of it weights), so window x streams x KV bytes must fit: 4 streams x 262,144 tokens
-# at int8 KV is ~97.8 GiB, 5 streams ~102.6 GiB (~4.5 GiB a stream). Other fits: 3 streams bf16 at 262k, 6 streams
-# int4 at 262k, 8 streams int4 at ~250k (tight), 6 streams int8 at ~220k. int4 and bf16 KV change the output slightly.
-PARALLEL="${PARALLEL:-5}"          # requests decoded together (streams)
-CONTEXT="${CONTEXT:-262144}"       # prompt + reply window per stream (the model's native maximum)
-KV_DTYPE="${KV_DTYPE:-int8}"       # bf16 | int8 | int4
-PLE_ON_SSD="${PLE_ON_SSD:-1}"      # 1: read the 29.8 GiB n-gram tables from SSD, leaving that RAM to the KV cache
-# Image input (TensorFold's Flash Next vision; video and many images from patch 0002): the model's own vision tower,
-# 0.84 GiB. Its ~0.8 GiB of scratch is taken only while an image or video encodes and handed back right after, so
-# startup reserves none for it. VISION=0: text only.
-VISION="${VISION:-1}"
-VISION_URLS="${VISION_URLS:-0}"    # 1: also accept public https:// image and video URLs (default: data URLs only)
-# Images a request may carry (--vision-max-images; a chat's turns all count). They share TENSORFOLD_IMAGE_TOKENS.
-# Empty: TensorFold's own limit (4).
-VISION_MAX_IMAGES="${VISION_MAX_IMAGES-${TENSORFOLD_MAX_IMAGES:-50}}"
-# MTP drafting: at most MTP_DRAFTS drafts a round, a chain stopping before a draft under MTP_CONFIDENCE.
-# Swept 2026-09-29 (identical output in every arm): 6/0.60 beat the stock 6/0.30 by ~3% on
-# prose and ~4% on code, the best balance of both; 4/0.50, 3/0.30 and 7/0.75 matched it on prose but not on code.
-MTP_DRAFTS="${MTP_DRAFTS:-6}"
-MTP_CONFIDENCE="${MTP_CONFIDENCE:-0.60}"
-# Thinking mode (Qwen's recommended sampling): temperature 1.0, top_p 0.95, top_k 20. A request's own values win.
-# min_p 0.0, presence_penalty 0.0 and repetition_penalty 1.0 are what TensorFold always does (it has no such
-# settings: those values mean "off"). THINKING=0 serves without a think block by default; a request can still set
-# "chat_template_kwargs": {"enable_thinking": true|false}.
+# Native window 262,144. Past it the engine applies Qwen's YaRN (factor 4) when TF_FLASHNEXT_YARN=4, up to 1,048,576.
+# On one Spark a full 1M-token fp8 cache is 17.46 GiB (bf16 is 30.06 GiB) on top of the weights (~66 GiB INT4, ~81 NVIDIA FP4); a full 1M
+# prompt's scratch on top of that is not the default. The default stays the native window.
+CONTEXT="${CONTEXT:-262144}"
+if [[ "$CONTEXT" =~ ^[0-9]+$ ]] && (( CONTEXT > 262144 )); then _yarn=4; else _yarn=0; fi
+export TF_FLASHNEXT_YARN="${TF_FLASHNEXT_YARN:-$_yarn}"
+unset _yarn
+# Requests decoded together. The engine admits each one inside its own budget (MemAvailable after load, less
+# TENSORFOLD_MEMORY_RESERVE_GIB, and with VISION=1 less another 2 GiB kept for the vision helper) and refuses one
+# that would not fit. The pool is shared: streams grow on demand, so PARALLEL is a cap, not a promise that every
+# stream can sit at a full 262,144-token window at once. Measured on a 121 GiB Spark (NVIDIA FP4, fp8 KV, vision on): the
+# engine reports a 24.3 GiB sequence pool after load, one full 262,144 window is 4.4 GiB, so 5 streams x 262,144 fit
+# (21.9 GiB); 8 streams at full windows do not (35 GiB), they share the pool. 5 is the default for that reason.
+PARALLEL="${PARALLEL:-5}"
+# MTP: up to this many drafts a round, kept while confidence stays at least this. Drafts are checked, so replies match
+# serial decoding. 6 drafts: on the NVIDIA FP4 checkpoint deeper chains (the engine's 15) cost verify rows and lose 5 to 20%
+# at 3 to 5 streams (measured, 1 to 5 streams, depths 4 to 15); 4 to 8 are within noise of each other.
+export TF_FLASHNEXT_DEPTH="${TF_FLASHNEXT_DEPTH:-6}"
+# Unset TF_FLASHNEXT_CONFIDENCE: the engine uses the running product (-0.4) while at most
+# TF_FLASHNEXT_PRODUCT_STREAMS streams are live, and confidence 0.5 above that. Setting
+# TF_FLASHNEXT_CONFIDENCE=0.5 forces the per-draft rule at every width. 5 (= PARALLEL's default): the product at every
+# width the default serves.
+export TF_FLASHNEXT_PRODUCT_STREAMS="${TF_FLASHNEXT_PRODUCT_STREAMS:-5}"
+export TF_FLASHNEXT_PREFILL_TAIL="${TF_FLASHNEXT_PREFILL_TAIL:-512}"
+# Prompt experts as a shared-memory tile (patch 0014): the routed experts of prompt chunks of 1024 rows or more run
+# through a 64-pair tile kernel that gives bit-identical results to the older kernels and cold prefill +14% (16k prompt).
+# 2 = gate/up and down, 1 = gate/up only, 0 = the older kernels. (Decode and chunks under 1024 rows are not affected.)
+export TF_FLASHNEXT_PROMPT_EXPERT_TILE="${TF_FLASHNEXT_PROMPT_EXPERT_TILE:-2}"
+# Fair prefill (patch 0015), OFF by default: with several long prompts queued, prompts are filled in slices, shortest first,
+# so a short request waits ~2 s (not minutes) behind five 100k prompts and running decoders keep a ~0.15 s gap. Costs ~20% on
+# the total time of a mixed load (five 100k prompts + shorts: 280 s -> 342 s); idle prefill is unchanged. One rank only.
+# Opt in: TF_FLASHNEXT_FILL_FAIR=1 (TF_FLASHNEXT_FILL_LAYERS slice size, default 2; TF_FLASHNEXT_FILL_AGING rows, default 1024).
+# Prompt cache room (patch 0029), ON by default, one rank only. Kept prompt states share the sequence pool with live requests;
+# without this a prompt that does not fit is refused (NoRoom) even when idle kept states hold the room it needs.
+# TF_FLASHNEXT_ADMIT_RECLAIM: admission frees kept states (superseded first, else least recently used, never the prompt's
+# own resume) when, and only when, that makes the prompt fit. TF_FLASHNEXT_SUPERSEDE: a conversation's next turn frees the
+# state it resumed once it keeps a longer one. 0 turns either off. Freeing a sequence always waits for the GPU's queued work.
+export TF_FLASHNEXT_ADMIT_RECLAIM="${TF_FLASHNEXT_ADMIT_RECLAIM:-1}"
+export TF_FLASHNEXT_SUPERSEDE="${TF_FLASHNEXT_SUPERSEDE:-1}"
+# Image prompts in the prompt cache (patch 0030), ON by default, one rank only: a conversation with images keeps and
+# resumes its prompt states like a text one, each image told apart by a hash of its bytes, so a repeated image turn
+# prefills only its new rows. Videos are not kept. TF_FLASHNEXT_MEDIA_REUSE=0 restores the old rule (image prompts
+# prefill from their start every turn).
+export TF_FLASHNEXT_MEDIA_REUSE="${TF_FLASHNEXT_MEDIA_REUSE:-1}"
+# KV cache (--kv-dtype). fp8 is the default: about 1.84x the pool of bf16, and lossy (~98.8% top-1 agreement with a
+# bf16 cache, so a free-running reply can differ). bf16 is exact: KV_DTYPE=bf16. FP8 works together with --vision.
+KV_DTYPE="${KV_DTYPE:-fp8}"
+MAX_TOKENS="${MAX_TOKENS:-32768}"
+THINKING="${THINKING:-1}"
+DRAFTS="${DRAFTS:-1}"
+# Sampling defaults (a request's own values win). The Zig server honours these flags.
 TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-0.95}"
 TOP_K="${TOP_K:-20}"
-THINKING="${THINKING:-1}"
-# Reply length for a request that sets no max_tokens (or max_completion_tokens). TensorFold's own default, 4,096,
-# can end a thinking reply before it answers (finish_reason "length", no content or tool call). The value is clamped
-# to the room left in the stream's window and reserves no memory; a request's own max_tokens wins.
-MAX_TOKENS="${MAX_TOKENS:-32768}"
-# TensorFold switches (start.sh passes every TENSORFOLD_* variable into the container).
-# Prompt piece rows. Unset, TensorFold v0.6.1 picks 2,048 with vision and 4,096 without (while nothing decodes,
-# if memory allows). With the n-gram tables on SSD (PLE_ON_SSD=1) 4,096 measured 10-30% slower from 5k to 16k
-# tokens and ~3% slower at 31k (2026-10-02), so this recipe keeps 2,048 there. TENSORFOLD_PREFILL_ROWS=N (256 to
-# 16,384, patch 0002) forces N-row pieces, admitted with the window; empty: TensorFold's choice.
-if [[ "$PLE_ON_SSD" == 1 ]]; then export TENSORFOLD_PREFILL_ROWS="${TENSORFOLD_PREFILL_ROWS-2048}"; fi
-# What startup reserves for the vision tower's scratch (MiB); 0: it comes from the system reserve while it encodes.
-export TENSORFOLD_VISION_WORKSPACE_MIB="${TENSORFOLD_VISION_WORKSPACE_MIB:-0}"
-# The tokens a request's images share (VISION_MAX_IMAGES above), each image at most 4,096 (one image is sized as
-# before). The tower encodes them 16,384 patches at a time, the scratch one image needs.
+# Image and video. VISION=1 (default) passes --vision: rank 0 starts the Python helper (Pillow, PyAV, the 27-layer
+# tower). VISION=0 is text only and returns the 2 GiB workspace to the KV budget. VISION_URLS=1 also accepts public
+# https:// URLs; the default is data URLs only.
+VISION="${VISION:-1}"
+VISION_URLS="${VISION_URLS:-0}"
+export TENSORFOLD_MAX_IMAGES="${TENSORFOLD_MAX_IMAGES:-50}"
+MAX_VIDEOS="${MAX_VIDEOS:-4}"                                          # videos a request (--vision-max-videos)
 export TENSORFOLD_IMAGE_TOKENS="${TENSORFOLD_IMAGE_TOKENS:-16384}"
-# The whole video's token budget (Qwen3-VL's per-frame sizing; 2 frames a second, at most 256 frames).
 export TENSORFOLD_VIDEO_TOKENS="${TENSORFOLD_VIDEO_TOKENS:-16384}"
-# Startup reserve (since v0.6.0): GiB left out of MemAvailable. Unset, TensorFold takes max(4 GiB, a tenth of RAM)
-# and refuses 5 x 262,144. The knob's floor is 2 GiB; that still fits the measured ~102.5 GiB admission.
-export TENSORFOLD_MEMORY_RESERVE_GIB="${TENSORFOLD_MEMORY_RESERVE_GIB:-2}"
-# Prompt-lookup drafts ahead of MTP (patch 0007; with PARALLEL >= 2): +6% on replies that repeat the prompt, prose and
-# code unchanged. 0: off.
-export TENSORFOLD_MTP_COPY="${TENSORFOLD_MTP_COPY:-1}"
-# The draft list the language image serves (DRAFT_LANGUAGE above).
-[[ -z "$DRAFT_LANGUAGE" ]] || export TENSORFOLD_DRAFT_VOCAB="$DRAFT_LANGUAGE"
-# No "is there a newer TensorFold" call to GitHub at each start: the patches are for v0.6.1 anyway. 0: check.
+export TENSORFOLD_VISION_WORKSPACE_MIB="${TENSORFOLD_VISION_WORKSPACE_MIB:-2048}"
+# The engine keeps this much MemAvailable free when it sizes the KV pool. prepare.sh and start.sh refuse a Spark
+# that has less than this free.
+export TENSORFOLD_MEMORY_RESERVE_GIB="${TENSORFOLD_MEMORY_RESERVE_GIB:-10}"
 export TENSORFOLD_NO_UPDATE_CHECK="${TENSORFOLD_NO_UPDATE_CHECK:-1}"
 
+# There is no int8 cache and no SSD n-gram reader: the FP8 n-gram table is loaded with the weights (WEIGHTS_GIB,
+# table included: 65.7 GiB measured for INT4-AutoRound, about 81 measured for the NVIDIA checkpoint: MemAvailable fell from 117.3 to 36.3 GiB at load with vision on and 8 slots, which includes the 0.84 GiB vision tower and kernels).
+# Memory at start. Weights WEIGHTS_GIB. One full window's cache is kv_gib below. Prefill scratch is outside the engine's
+# cache budget; 8 GiB here is slack for a 2048-row chunk, not a measured 1M-prompt peak. MEM_FLOOR_GIB is the line
+# start.sh stops the server at while it loads, and the line prepare.sh refuses to start below. MEM_CHECK=0 turns
+# both into a warning.
+MEM_NEED_GIB="${MEM_NEED_GIB:-}"
+MEM_FLOOR_GIB="${MEM_FLOOR_GIB:-$TENSORFOLD_MEMORY_RESERVE_GIB}"
+# kv_gib <tokens>: one sequence at TP=1, from State.cacheBytes (cuda_state.zig).
+# bf16: 30,784 bytes a token. fp8: 17,888 (keys carry both scales, values are codes, indexer and pooled stay bf16).
+kv_gib() {
+  local ctx=${1:-$CONTEXT} bytes=30784
+  [[ "$ctx" =~ ^[0-9]+$ ]] || ctx=$CONTEXT
+  [[ "$KV_DTYPE" == fp8 ]] && bytes=17888
+  echo $(( (bytes * ctx + 1073741823) / 1073741824 ))
+}
+# mem_need_gib <context>: MemAvailable a start needs: weights, one full window, scratch slack, the vision workspace
+# when VISION=1, floor, 2 GiB.
+mem_need_gib() {
+  local ctx=${1:-$CONTEXT} vision=0
+  [[ "$VISION" == 1 ]] && vision=2
+  echo $(( WEIGHTS_GIB + $(kv_gib "$ctx") + 8 + vision + MEM_FLOOR_GIB + 2 ))
+}
+
 HF_CACHE="${HF_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}}"
-# Persists compiled CUDA kernels (torch extensions + triton) so only the first start pays the compile.
 KERNEL_CACHE="${KERNEL_CACHE:-$HOME/.cache/tensorfold-qwen38}"
+STATE_DIR="${STATE_DIR:-$HOME/.local/state/qwen38-flash-next-tf}"
+LOG_DIR="${LOG_DIR:-$HOME/.cache/tensorfold-qwen38/logs}"
+LOG_KEEP="${LOG_KEEP:-10}"
+MIN_FREE_GB="${MIN_FREE_GB:-$((CKPT_GIB + 18))}"
+IMAGE_FREE_GB="${IMAGE_FREE_GB:-40}"
 
-MIN_FREE_GB="${MIN_FREE_GB:-125}"   # free disk the checkpoint download needs (it is ~114 GB)
-IMAGE_FREE_GB="${IMAGE_FREE_GB:-35}"   # free disk under Docker's root that pulling or building the image needs
-
-# Colours only on a terminal.
 _c() { [[ -t "$1" ]] && printf '\033[%sm' "$2" || true; }
 log()  { printf '%s[%s]%s %s\n' "$(_c 1 '1;36')" "$(basename "$0")" "$(_c 1 0)" "$*"; }
 warn() { printf '%s[%s] WARN:%s %s\n' "$(_c 2 '1;33')" "$(basename "$0")" "$(_c 2 0)" "$*" >&2; }
 die()  { printf '%s[%s] ERROR:%s %s\n' "$(_c 2 '1;31')" "$(basename "$0")" "$(_c 2 0)" "$*" >&2; exit 1; }
 
+[[ -z "${HF_TOKEN:-}" ]] || export HF_TOKEN
 model_cache_dir() { echo "$HF_CACHE/hub/models--${MODEL_ID//\//--}"; }
-
-# start.sh and scripts/*.sh (not stop.sh, which must stop the server whatever the settings) check DRAFT_LANGUAGE.
-check_draft_language() {
-  local one='(de|fr|ja|nl|pt|ru|zh)'
-  [[ -z "$DRAFT_LANGUAGE" || "$DRAFT_LANGUAGE" =~ ^$one(,$one)*$ ]] || \
-    die "DRAFT_LANGUAGE=$DRAFT_LANGUAGE: zh or ja (recommended), de, fr, nl (experimental), pt or ru, or several like nl,de"
+snapshot_rev() {
+  if [[ -n "$MODEL_REVISION" ]]; then echo "$MODEL_REVISION"
+  else cat "$(model_cache_dir)/refs/main" 2>/dev/null; fi
 }
-# The patches baked into $IMAGE, in order: patches/*.patch, plus patches/languages/*.patch for DRAFT_LANGUAGE.
-patch_files() { ls patches/*.patch; [[ -z "$DRAFT_LANGUAGE" ]] || ls patches/languages/*.patch; }
-patches_hash() { patch_files 2>/dev/null | xargs -r cat | sha256sum | cut -c1-12; }
 
-# What scripts/prepare.sh last left ready (it writes this line to PREPARED_MARKER when it succeeds); start.sh runs
-# prepare.sh again whenever the current line differs: a missing or stale image, new patches, another model.
-PREPARED_MARKER="$KERNEL_CACHE/.prepared"
+PREPARED_MARKER="$STATE_DIR/prepared"
 prepared_state() {
-  local hash label model=missing
-  hash=$(patches_hash)
-  label=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || echo missing)
-  ls -d "$(model_cache_dir)"/snapshots/*/ >/dev/null 2>&1 && model=present
-  echo "model=$MODEL_ID($model) image=$IMAGE($label) patches=$hash"
+  local hash label rev
+  hash=$(image_hash)
+  label=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo missing)
+  rev=$(snapshot_rev)
+  echo "model=$MODEL_ID@$rev image=$label patches=$hash"
 }

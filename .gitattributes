@@ -1,4 +1,0 @@
-*.sh text eol=lf
-*.patch text eol=lf
-*.py text eol=lf
-*.txt text eol=lf

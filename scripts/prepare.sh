@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
-# Prepare everything needed to serve Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP with TensorFold on one DGX Spark:
-#   1. preflight checks (docker, GPU runtime, disk space)
-#   2. the image: TensorFold plus patches/*.patch (and patches/languages/*.patch with DRAFT_LANGUAGE) on NVIDIA's
-#      PyTorch container, pulled prebuilt from $GHCR_IMAGE when a matching tag is reachable (PULL=0 skips that), else
-#      built locally
-#   3. download the checkpoint into the Hugging Face cache (~106 GiB, resumable)
-#   4. verify the checkpoint with `tensorfold info`
+# Prepare this Spark to serve Qwen3.8-Flash-Next ($QUANT_LABEL; see CHECKPOINT in scripts/config.sh) with TensorFold's Zig engine (tensorfold-native, one GPU):
+#   1. preflight: docker, the GPU, disk
+#   2. the image: tensorfold-native built from TensorFold (TF_REF) plus patches/*.patch with Zig, on NVIDIA's
+#      PyTorch container, with the TP=1 kernel set; pulled prebuilt when a matching tag is reachable (PULL=0 skips
+#      that), else built locally
+#   3. the checkpoint in the Hugging Face cache (~96 GiB for the NVIDIA FP4 default, ~122 GiB for CHECKPOINT=int4), at its pinned revision
+#   4. verify it: every shard its index names is there, and it is a checkpoint format this engine serves (ModelOpt NVFP4 or GPTQ int4)
 # ./start.sh runs this by itself when needed. Safe to re-run: every step skips work that is already done.
 # Pass --rebuild to rebuild the image from scratch.
 set -euo pipefail
-cd "$(dirname "$(readlink -f "$0")")/.."     # the repository root
+cd "$(dirname "$(readlink -f "$0")")/.."
 source ./scripts/config.sh
-check_draft_language
 
 REBUILD=0
 for arg in "$@"; do
@@ -22,125 +21,206 @@ for arg in "$@"; do
   esac
 done
 
-# ---------------------------------------------------------------- 1. preflight
-mkdir -p "$KERNEL_CACHE"
-exec 9>"$KERNEL_CACHE/.prepare.lock"
-flock -n 9 || die "another prepare.sh is already running (it holds the download locks); wait for it or stop it: pgrep -af prepare.sh"
+mkdir -p "$KERNEL_CACHE" "$STATE_DIR" "$HF_CACHE/hub"
+exec 9>"$STATE_DIR/prepare.lock"
+flock -n 9 || die "another prepare.sh is already running; wait for it or stop it"
+
 log "Preflight checks"
+_mem_here=$(awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo)
+if (( _mem_here < MEM_FLOOR_GIB )); then
+  _msg="only ${_mem_here} GiB MemAvailable (the floor is MEM_FLOOR_GIB=$MEM_FLOOR_GIB): stop other work first"
+  if [[ "${MEM_CHECK:-1}" == 0 ]]; then warn "$_msg"; else die "$_msg (MEM_CHECK=0 continues anyway)"; fi
+fi
+log "Memory: ${_mem_here} GiB MemAvailable (floor $MEM_FLOOR_GIB)"
 command -v docker >/dev/null || die "docker is not installed"
 docker info >/dev/null 2>&1 || die "cannot talk to the docker daemon (is your user in the docker group?)"
-if ! command -v nvidia-smi >/dev/null; then warn "nvidia-smi not found on the host"
-elif ! nvidia-smi -L; then warn "nvidia-smi failed: is the NVIDIA driver working?"; fi
+if ! command -v nvidia-smi >/dev/null; then warn "nvidia-smi not found"
+elif ! nvidia-smi -L >/dev/null 2>&1; then warn "nvidia-smi failed: is the NVIDIA driver working?"; fi
 docker info 2>/dev/null | grep -qi nvidia || warn "docker does not list an nvidia runtime; --gpus all may fail"
 
-mkdir -p "$HF_CACHE/hub" "$KERNEL_CACHE/torch_extensions" "$KERNEL_CACHE/triton"
-
-mkdir -p patches
-PATCHES_HASH=$(patches_hash)
+PATCHES_HASH=$(image_hash)
 built_hash=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || true)
-
-# Disk: the checkpoint (~114 GB) if it is not downloaded yet, and the image (~24 GB, more while it unpacks) if it is
-# not built from these patches yet; both on one filesystem when Docker's root shares it with the HF cache.
 free_gb() { df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc '0-9'; }
-fs_of()   { df --output=target "$1" 2>/dev/null | tail -1; }
-need_model=0; need_image=0
-[[ -d "$(model_cache_dir)/snapshots" ]] || need_model=$MIN_FREE_GB
-[[ $REBUILD -eq 0 && "$built_hash" == "$PATCHES_HASH" ]] || need_image=$IMAGE_FREE_GB
-docker_root=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || true)
-if [[ -z "$docker_root" || "$(fs_of "$docker_root")" == "$(fs_of "$HF_CACHE")" ]]; then
-  need=$((need_model + need_image)); have=$(free_gb "$HF_CACHE")
-  (( need == 0 || have >= need )) || die "only ${have} GB free under $HF_CACHE, need ~${need} GB (checkpoint ${need_model} + image ${need_image})"
-else
-  have=$(free_gb "$HF_CACHE")
-  (( need_model == 0 || have >= need_model )) || die "only ${have} GB free under $HF_CACHE, the checkpoint needs ~${need_model} GB"
-  have_img=$(free_gb "$docker_root")
-  (( need_image == 0 || ${have_img:-0} >= need_image )) || die "only ${have_img} GB free under $docker_root, the image needs ~${need_image} GB"
-fi
-log "Disk: $(free_gb "$HF_CACHE") GB free under $HF_CACHE"
 
-# ---------------------------------------------------------------- 2. image
-# Local fixes in ./patches (unified diffs against site-packages, applied with patch -p0) are baked into the image.
-# The image is rebuilt when they change; the TensorFold install layer stays cached, so that takes seconds.
-prebuilt="$GHCR_IMAGE:${TF_VERSION}-${PATCHES_HASH}"
-if [[ $REBUILD -eq 0 && "${PULL:-1}" == 1 && "$built_hash" != "$PATCHES_HASH" ]]; then
-  log "Pulling the prebuilt image $prebuilt (~11 GB; PULL=0 builds instead)"
-  if docker pull "$prebuilt" && \
-     [[ "$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$prebuilt")" == "$PATCHES_HASH" ]]; then
-    docker tag "$prebuilt" "$IMAGE"
-    built_hash=$PATCHES_HASH
-    log "Using $prebuilt as $IMAGE"
-  else
-    warn "could not pull $prebuilt (no image for these patches, the package is not public, or no network): building it locally"
-  fi
-fi
-if [[ $REBUILD -eq 1 ]] || ! docker image inspect "$IMAGE" >/dev/null 2>&1 || [[ "$built_hash" != "$PATCHES_HASH" ]]; then
-  docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 && [[ $REBUILD -eq 0 ]] || { log "Pulling base image $BASE_IMAGE"; docker pull "$BASE_IMAGE"; }
-
-  log "Building $IMAGE (TensorFold $TF_VERSION, patches $PATCHES_HASH: $(patch_files 2>/dev/null | xargs -rn1 basename | paste -sd' ' || true))"
-  nocache=(); [[ $REBUILD -eq 1 ]] && nocache=(--no-cache)
-  # the build context: this image's patches, side by side in the order they apply
-  context=$(mktemp -d)
-  trap 'rm -rf -- "$context"' EXIT
-  patch_files | xargs -r cp -t "$context"
-  docker build "${nocache[@]}" -t "$IMAGE" \
-    --build-arg BASE_IMAGE="$BASE_IMAGE" \
-    --build-arg TF_SPEC="git+${TF_REPO}@${TF_VERSION}" \
-    --build-arg PATCHES_HASH="$PATCHES_HASH" \
-    -f - "$context" <<'DOCKERFILE'
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
-FROM ${BASE_IMAGE}
-ARG TF_SPEC
-# transformers (the vision tower's modules) and PyAV (video decoding) for --vision
-RUN pip install --no-cache-dir --upgrade "${TF_SPEC}" && pip install --no-cache-dir "transformers==5.17.0" av && \
-    tensorfold --version
-COPY . /opt/tf-patches
-RUN cd "$(python -c 'import os, tensorfold; print(os.path.dirname(os.path.dirname(tensorfold.__file__)))')" && \
-    for p in /opt/tf-patches/*.patch; do [ -e "$p" ] || continue; echo "applying $p"; patch -p0 --forward < "$p" || exit 1; done && \
-    python -c "import tensorfold.cuda.server, tensorfold.vision.qwen_cuda, tensorfold.vision.videos, av; \
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel"
-ARG PATCHES_HASH
-LABEL tf.patches=${PATCHES_HASH}
-ENV HF_HOME=/root/.cache/huggingface \
-    TORCH_EXTENSIONS_DIR=/cache/torch_extensions \
-    TRITON_CACHE_DIR=/cache/triton
-WORKDIR /workspace
-DOCKERFILE
-else
-  log "Image $IMAGE already built with patches $PATCHES_HASH (use --rebuild to force)"
-fi
-docker run --rm --entrypoint tensorfold "$IMAGE" --version 2>/dev/null | tail -1
-
-# Run tensorfold inside the image with the HF cache and kernel cache mounted (no GPU, and without NVIDIA's entrypoint
-# banner: these steps only read files, and the GPU memory may belong to a running server).
-tf_run() {
-  # a token only by name, and only when set (never on the command line); else huggingface_hub finds the token file
-  # in the mounted cache. The model is public, so none is needed.
-  local token=(); [[ -n "${HF_TOKEN:-}" ]] && token=(-e HF_TOKEN)
-  docker run --rm --ipc=host --network host --entrypoint tensorfold "${token[@]}" \
-    -v "$HF_CACHE":/root/.cache/huggingface \
-    -v "$KERNEL_CACHE":/cache \
-    "$IMAGE" "$@"
+HUB_MISSING_PY='
+import math, os, sys
+from huggingface_hub import HfApi
+hub, repo, rev = sys.argv[1], sys.argv[2], sys.argv[3]
+blobs = os.path.join(hub, "models--" + repo.replace("/", "--"), "blobs")
+missing = 0
+for f in HfApi().model_info(repo, revision=rev or None, files_metadata=True).siblings:
+    lfs = f.lfs
+    name = (getattr(lfs, "sha256", None) or lfs["sha256"]) if lfs else f.blob_id
+    size = (getattr(lfs, "size", None) or lfs["size"]) if lfs else (f.size or 0)
+    p = os.path.join(blobs, name)
+    missing += 0 if os.path.isfile(p) and os.path.getsize(p) == size else size
+print(math.ceil(missing / 2**30))'
+hub_missing_gb() {
+  local py out tried=""
+  for py in "$(command -v python3)" "$(sed -n '1s/^#! *\(\/[^ ]*python[0-9.]*\)$/\1/p' "$(command -v hf || echo /dev/null)" 2>/dev/null)"; do
+    [[ -n "$py" && -x "$py" && "$py" != "${tried:-}" ]] || continue
+    tried=$py
+    out=$(timeout 30 "$py" -c "$HUB_MISSING_PY" "$HF_CACHE/hub" "$MODEL_ID" "$MODEL_REVISION" 2>/dev/null) && [[ "$out" =~ ^[0-9]+$ ]] &&
+      { echo "$out"; return 0; }
+  done
+  return 1
 }
 
-# ---------------------------------------------------------------- 3. download
-log "Downloading $MODEL_ID into $HF_CACHE/hub (resumes if interrupted)"
-if command -v hf >/dev/null; then
-  # Host CLI: resumable, parallel, writes the standard HF cache layout.
-  hf download "$MODEL_ID" --cache-dir "$HF_CACHE/hub"
+DOCKER_ROOT=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)
+rev=$(snapshot_rev)
+if missing=$(hub_missing_gb); then
+  need_ckpt=0; (( missing == 0 )) || need_ckpt=$((missing + 5))
+  ckpt_what="the download needs ~${missing} GB that the cache does not hold yet"
 else
-  warn "host 'hf' CLI not found, downloading from inside the container"
+  need_ckpt=0
+  [[ -f "$(model_cache_dir)/snapshots/$rev/config.json" ]] || need_ckpt=$MIN_FREE_GB
+  ckpt_what="the checkpoint needs MIN_FREE_GB (the Hub's file list could not be read)"
 fi
-# `tensorfold pull` is the documented path; with the files already cached it only checks/completes them.
-tf_run pull "$MODEL_ID"
+(( need_ckpt )) || ckpt_what="nothing to download"
+need_img=0; [[ $REBUILD -eq 0 && "$built_hash" == "$PATCHES_HASH" ]] || need_img=$IMAGE_FREE_GB
+if [[ "$(stat -c %d "$HF_CACHE")" == "$(stat -c %d "$DOCKER_ROOT" 2>/dev/null)" ]]; then
+  have=$(free_gb "$HF_CACHE"); (( have >= need_ckpt + need_img )) ||
+    die "only ${have} GB free under $HF_CACHE (also Docker's root), ~$((need_ckpt + need_img)) GB needed: $ckpt_what; the image needs ${need_img} GB"
+else
+  have=$(free_gb "$HF_CACHE"); (( have >= need_ckpt )) || die "only ${have} GB free under $HF_CACHE, ~${need_ckpt} GB needed: $ckpt_what"
+  have=$(free_gb "$DOCKER_ROOT"); (( have >= need_img )) ||
+    die "only ${have} GB free under Docker's root ($DOCKER_ROOT); the image needs ~${need_img} GB"
+fi
+log "Disk: $(free_gb "$HF_CACHE") GB free under $HF_CACHE ($ckpt_what)"
 
-snapshot=$(ls -d "$(model_cache_dir)"/snapshots/*/ 2>/dev/null | head -1)
-[[ -n "$snapshot" ]] || die "no snapshot found under $(model_cache_dir)"
-log "Checkpoint: $snapshot ($(du -shL "$snapshot" | cut -f1))"
+prebuilt=$(prebuilt_image)
+if [[ $REBUILD -eq 0 && "${PULL:-1}" == 1 && "$built_hash" != "$PATCHES_HASH" ]]; then
+  log "Pulling the prebuilt image $prebuilt (PULL=0 builds instead)"
+  if docker pull "$prebuilt" &&
+     [[ "$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$prebuilt")" == "$PATCHES_HASH" ]]; then
+    docker tag "$prebuilt" "$IMAGE"; built_hash=$PATCHES_HASH
+    log "Using $prebuilt as $IMAGE"
+  else
+    warn "could not pull $prebuilt: building it locally"
+  fi
+fi
+if [[ $REBUILD -eq 1 || "$built_hash" != "$PATCHES_HASH" ]]; then
+  docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 && [[ $REBUILD -eq 0 ]] || { log "Pulling base image $BASE_IMAGE"; docker pull "$BASE_IMAGE"; }
+  log "Building $IMAGE (TensorFold ${TF_REF:0:12}, Zig $ZIG_VERSION, patches $PATCHES_HASH, TP=1 kernel set)"
+  ctx=$(mktemp -d "$STATE_DIR/build.XXXXXX")
+  trap 'rm -rf -- "$ctx"' EXIT
+  mkdir -p "$ctx/patches"
+  compgen -G 'patches/*.patch' >/dev/null && cp -- patches/*.patch "$ctx/patches/"
+  nocache=(); [[ $REBUILD -eq 1 ]] && nocache=(--no-cache)
+  docker build ${DOCKER_BUILD_ARGS:-} "${nocache[@]}" -t "$IMAGE" --build-arg BASE_IMAGE="$BASE_IMAGE" \
+    --build-arg TF_REPO="$TF_REPO" --build-arg TF_REF="$TF_REF" \
+    --build-arg ZIG_VERSION="$ZIG_VERSION" --build-arg ZIG_SHA256="$ZIG_SHA256" \
+    --build-arg PATCHES_HASH="$PATCHES_HASH" --build-arg KERNEL_SOURCE_MTIME="$KERNEL_SOURCE_MTIME" \
+    -f - "$ctx" <<'DOCKERFILE'
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
+FROM ${BASE_IMAGE} AS build
+ARG ZIG_VERSION
+ARG ZIG_SHA256
+RUN curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" && \
+    echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c - && \
+    mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1 && rm /tmp/zig.tar.xz && \
+    /opt/zig/zig version
+ARG TF_REPO
+ARG TF_REF
+RUN git init -q /tensorfold && cd /tensorfold && git remote add origin "${TF_REPO}" && \
+    git fetch -q --depth 1 origin "${TF_REF}" && git checkout -q --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${TF_REF}"
+COPY patches /opt/tf-patches
+RUN cd /tensorfold && \
+    for p in /opt/tf-patches/*.patch; do [ -e "$p" ] || continue; echo "applying $p"; git apply --check "$p" && git apply "$p" || exit 1; done
+RUN cd /tensorfold && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Doptimize=fast --prefix /opt/tensorfold \
+      -j"$(nproc)" fatbins install native && \
+    test -x /opt/tensorfold/native/bin/tensorfold-native
+RUN mkdir -p /opt/tensorfold/share/doc/tensorfold && cd /tensorfold && \
+    for f in LICENSE LICENSE.md LICENSES NOTICE THIRD_PARTY_NOTICES.md; do \
+      if [ -e "$f" ]; then cp -a "$f" /opt/tensorfold/share/doc/tensorfold/ || exit 1; fi; done
+ARG KERNEL_SOURCE_MTIME
+RUN cd /tensorfold && python -B -c 'import json, os, sys; t = int(sys.argv[1]); \
+      [os.utime(os.path.join("src", f), (t, t)) for f in sorted({k["source"]["file"] for k in \
+       json.load(open("zig/tests/cuda/flashnext/kernels.json"))["kernels"]})]' "${KERNEL_SOURCE_MTIME}" && \
+    PYTHONPATH=/tensorfold/src python -B tools/zig/flashnext_aot.py build \
+      --spec zig/tests/cuda/flashnext/kernels.json --jit zig/tests/cuda/flashnext/jit.json --tp 1 \
+      --out /opt/tensorfold/share/tensorfold/cuda/sm121 > /tmp/aot.log || true && \
+    cat /tmp/aot.log && \
+    grep -q 'kernels ->' /tmp/aot.log && \
+    bad=$(grep PROBLEM /tmp/aot.log | grep -v 'cubin sha256' || true) && \
+    test -z "$bad" && \
+    test -f /opt/tensorfold/share/tensorfold/cuda/sm121/aot.json
 
-# ---------------------------------------------------------------- 4. verify
-log "Verifying checkpoint with tensorfold info"
-tf_run info "$MODEL_ID"
+FROM ${BASE_IMAGE}
+COPY --from=build /opt/tensorfold /opt/tensorfold
+COPY --from=build /tensorfold/src/tensorfold /opt/tensorfold/python/tensorfold
+RUN ln -s /opt/tensorfold/native/bin/tensorfold-native /usr/local/bin/tensorfold-native && \
+    pip install --no-cache-dir "huggingface_hub>=1.0" && \
+    pip install --no-cache-dir --no-deps "transformers==5.17.0" "av==19.0.1"
+ARG PATCHES_HASH
+LABEL tf.patches=${PATCHES_HASH} tf.kernels=present
+ENV HF_HOME=/root/.cache/huggingface TENSORFOLD_CUDA_KERNELS=/opt/tensorfold/share/tensorfold/cuda/sm121 \
+    CUDA_CACHE_PATH=/cache/nv \
+    TENSORFOLD_VISION_PYTHONPATH=/opt/tensorfold/python
+WORKDIR /workspace
+DOCKERFILE
+  rm -rf -- "$ctx"; trap - EXIT
+else
+  log "Image $IMAGE already built with patches $PATCHES_HASH"
+fi
+docker run --rm --network none --entrypoint test "$IMAGE" -x /opt/tensorfold/native/bin/tensorfold-native ||
+  die "$IMAGE has no tensorfold-native"
+log "Image $IMAGE: tensorfold-native, kernel set present"
 
+command -v hf >/dev/null || warn "host 'hf' CLI not found, downloading from inside the container"
+download() {
+  if command -v hf >/dev/null; then
+    hf download "$1" ${2:+--revision "$2"} --cache-dir "$HF_CACHE/hub" >/dev/null
+  else
+    docker run --rm --user "$(id -u):$(id -g)" --network host --entrypoint python ${HF_TOKEN:+-e HF_TOKEN} \
+      ${HF_HUB_OFFLINE:+-e HF_HUB_OFFLINE} \
+      -v "$HF_CACHE":/hf -e HF_HOME=/hf -e HOME=/tmp "$IMAGE" -c \
+      'import sys; from huggingface_hub import snapshot_download; snapshot_download(sys.argv[1], revision=sys.argv[2] or None)' "$1" "$2"
+  fi
+}
+dir=$(model_cache_dir)
+pin=$MODEL_REVISION
+had=0; [[ -n "$pin" && -f "$dir/snapshots/$pin/config.json" ]] && had=1
+log "Downloading $MODEL_ID${pin:+ @ ${pin:0:8}} into $HF_CACHE/hub"
+if ! download "$MODEL_ID" "$pin"; then
+  [[ -n "$pin" && -f "$dir/snapshots/$pin/config.json" ]] || die "$MODEL_ID: the download failed"
+  warn "$MODEL_ID: could not reach Hugging Face; using the snapshot already here (${pin:0:8})"
+fi
+(( had )) || [[ -z "$pin" || -f "$dir/refs/main" ]] || { mkdir -p "$dir/refs"; printf %s "$pin" > "$dir/refs/main"; }
+rev=$(snapshot_rev)
+[[ -n "$rev" && -d "$dir/snapshots/$rev" ]] || die "$MODEL_ID: no snapshot after the download"
+log "Checkpoint: $dir/snapshots/$rev ($(du -shL "$dir/snapshots/$rev" | cut -f1))"
+
+log "Verifying the checkpoint"
+CHECK_PY='
+import glob, json, os, sys
+d = sys.argv[1]
+cfg = json.load(open(os.path.join(d, "config.json")))
+if cfg.get("model_type") != "qwen4_exp":
+    sys.exit("model_type is %r, not qwen4_exp" % cfg.get("model_type"))
+q = cfg.get("quantization_config") or {}
+kind = str(q.get("quant_method", "")).lower()
+if kind == "modelopt":
+    algos = {str(v.get("quant_algo")) for v in (q.get("quantized_layers") or {}).values()}
+    if "NVFP4" not in algos:
+        sys.exit("ModelOpt checkpoint without NVFP4 layers (quant_algo %s)" % sorted(algos))
+    what = "ModelOpt %s (%s)" % (q.get("quant_algo"), "+".join(sorted(algos)))
+elif kind == "gptq" and q.get("bits") == 4:
+    table = [f for f in glob.glob(os.path.join(d, "ple-table", "*.safetensors")) if os.path.getsize(f) > 0]
+    if not table:
+        sys.exit("no n-gram table files in ple-table/")
+    what = "AutoRound int4 g%s, %d n-gram table files" % (q.get("group_size"), len(table))
+else:
+    sys.exit("neither a ModelOpt NVFP4 nor a GPTQ-format int4 checkpoint (quant_method %r, bits %r)" % (kind, q.get("bits")))
+idx = json.load(open(os.path.join(d, "model.safetensors.index.json")))
+shards = sorted(set(idx["weight_map"].values()))
+bad = [s for s in shards if not os.path.isfile(os.path.join(d, s)) or os.path.getsize(os.path.join(d, s)) == 0]
+if bad:
+    sys.exit("missing or empty shards: " + ", ".join(bad[:5]))
+print("qwen4_exp, %s, %d tensors in %d shards" % (what, len(idx["weight_map"]), len(shards)))'
+snap="$dir/snapshots/$rev"
+info=$(python3 -I -c "$CHECK_PY" "$snap" 2>&1) || die "the checkpoint at $snap is not ready: $info"
+log "Checkpoint OK: $info"
 prepared_state > "$PREPARED_MARKER"
 log "Done. Start the server with ./start.sh (port $PORT)."
-log "The first start compiles CUDA kernels for GB10 (a few minutes); they are cached in $KERNEL_CACHE."

@@ -1,0 +1,76 @@
+Qwen3.8-Flash-Next on one DGX Spark with TensorFold
+Copyright 2026 MiaAI-Lab
+
+This project's own code, scripts and documentation are licensed under the MIT License (see LICENSE).
+
+This project builds on third-party work that keeps its own license:
+
+TensorFold
+  https://github.com/ashhart/TensorFold (branch zig-flashnext)
+  Copyright 2026 TensorFold contributors. Apache License, Version 2.0 from 0.6.0; code written before 0.6.0 keeps its
+  MIT notice (below). TensorFold's NOTICE reads: "TensorFold / Copyright 2026 TensorFold contributors /
+  https://github.com/ashhart/TensorFold".
+  scripts/prepare.sh builds TensorFold's Zig engine (tensorfold-native) from TensorFold's source at the commit pinned
+  in scripts/config.sh; the image carries that build in /opt/tensorfold and TensorFold's LICENSE, LICENSES/, NOTICE and
+  THIRD_PARTY_NOTICES.md in /opt/tensorfold/share/doc/tensorfold. The files in patches/ modify TensorFold's source and
+  are applied to it with git apply before the build. The changes in patches/ are this project's work under the MIT
+  License; the TensorFold code they modify, and quote as diff context, stays under TensorFold's licenses: Apache-2.0,
+  and for code written before 0.6.0 also its MIT notice (TensorFold's LICENSES/MIT.txt), so keep TensorFold's NOTICE
+  and this copyright and permission notice with any copy of a patched tree:
+
+    Copyright (c) 2026 TensorFold contributors
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+  The Zig engine's CUDA serving path through tensorfold-native and its CUDA family registry were authored by Jürgen
+  Schmied (jschmied, https://github.com/jschmied) in TensorFold pull request #443
+  (https://github.com/ashhart/TensorFold/pull/443, commit 59e77e8f4b875ce0e863a8c896fc8e424bc539ac), part of
+  TensorFold under its licenses above.
+
+Zig
+  https://ziglang.org
+  Copyright (c) Zig contributors. The MIT License (Expat). Zig is developed by the Zig Software Foundation and the
+  Zig contributors.
+  The image build downloads Zig 0.17.0 (zig-aarch64-linux-0.17.0.tar.xz, checked against its sha256) to compile
+  TensorFold's Zig engine; the compiler is used in the build stage only and is not part of the published image.
+
+Model files (downloaded from Hugging Face by scripts/prepare.sh; not included in this repository or its image)
+  The checkpoint this recipe serves by default, nvidia/Qwen3.8-Flash-Next-FP4-Local, is NVIDIA's quantization-aware-distilled
+  FP4 export (NVIDIA Model Optimizer) of Qwen/Qwen3.8-Flash-Next by the Qwen team (Alibaba). Its use is governed by the NVIDIA Open
+  Model Agreement (https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-agreement/); the base model is under the
+  Qwen Community License 1.0 (https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE).
+  The optional checkpoint (CHECKPOINT=int4), azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound, is by azampatti (the
+  top-5 expert cut and the shared-expert healing), built on Intel's AutoRound int4 quantization
+  (Intel/Qwen3.8-Flash-Next-W4A16-AutoRound) and on Saren-Arterius's hybrid checkpoint and FP8 n-gram table
+  (Saren/Qwen3.8-Flash-Next-ple-table-fp8), of Qwen/Qwen3.8-Flash-Next. Per its model card, it is under the Qwen license
+  (https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE).
+
+Third-party software in the image
+  The image scripts/prepare.sh builds is based on NVIDIA's PyTorch container nvcr.io/nvidia/pytorch:26.07-py3,
+  redistributed as a value-added runtime image. The NVIDIA software in it is governed by the NVIDIA Software License
+  Agreement (https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/) and the
+  Product-Specific Terms for NVIDIA AI Products
+  (https://www.nvidia.com/en-us/agreements/enterprise-software/product-specific-terms-for-ai-products/), which the
+  container prints at every start; by pulling or running the image you accept them. The image also contains
+  huggingface_hub (Apache 2.0, for the checkpoint download), and for the vision helper Hugging Face transformers
+  (Apache 2.0), PyAV (BSD-3-Clause) with its bundled FFmpeg libraries (LGPL), Pillow, and TensorFold's Python source
+  (under TensorFold's licenses, above). This project's MIT License covers its own work only, not the software in the
+  image.
+
+See CREDITS.md for everyone this project builds on.

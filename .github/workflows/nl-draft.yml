@@ -1,4 +1,4 @@
-name: Dutch draft CPU validation
+name: Dutch Zig draft vocabulary validation
 on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
@@ -10,18 +10,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install numpy
-      - name: Apply full patch stack to pinned engine, without fuzz
+      - name: Check base and Dutch ID invariants
+        run: python3 tools/nl_draft_vocab.py --check
+      - name: Run deterministic CPU tests
+        run: python3 -m unittest discover -s tools -p 'test_nl_draft_vocab.py' -v
+      - name: Python syntax and whitespace
         run: |
-          git clone https://github.com/ashhart/TensorFold.git /tmp/tensorfold
-          git -C /tmp/tensorfold checkout 17c73e189f5e6a5304cda7ea37f086f9c49b4788
-          cd /tmp/tensorfold/src
-          for p in "$GITHUB_WORKSPACE"/patches/*.patch "$GITHUB_WORKSPACE"/patches/languages/*.patch; do
-            patch --batch --fuzz=0 -p0 < "$p"
-          done
-      - name: Config syntax and real loader tests
-        env:
-          TF_SRC: /tmp/tensorfold/src
-        run: |
-          bash -n scripts/config.sh scripts/prepare.sh start.sh
-          python tools/test_nl_draft.py
+          python3 -m py_compile tools/nl_draft_vocab.py tools/test_nl_draft_vocab.py tools/prepare_nl_corpus.py tools/build_nl_draft_vocab.py
+          git diff --check

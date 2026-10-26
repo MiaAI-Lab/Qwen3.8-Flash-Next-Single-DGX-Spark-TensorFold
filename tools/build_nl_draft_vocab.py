@@ -65,31 +65,27 @@ def coverage(counts, keep):
     return sum(n for i, n in counts.items() if i in keep) / sum(counts.values())
 
 
-def extension_patch(ids):
-    if not ids:
-        raise ValueError("no extension IDs selected")
-    path = "tensorfold/families/qwen4_exp/cuda/draft_vocab_nl.txt"
-    return f"--- /dev/null\n+++ {path}\n@@ -0,0 +1,{len(ids)} @@\n" + "".join(f"+{i}\n" for i in ids)
-
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--tokenizer", type=Path, required=True)
-    ap.add_argument("--base", type=Path, required=True)
+    ap.add_argument("--base", type=Path, help="optional standalone baseline ID file (defaults to the current Zig patch)")
     ap.add_argument("--train", type=Path, required=True)
     ap.add_argument("--holdout", type=Path, required=True)
     ap.add_argument("--provenance", type=Path, required=True)
-    ap.add_argument("--max-size", type=int, default=100000, help="total base + extension budget (v0.6.1 base is 79,591)")
+    ap.add_argument("--max-size", type=int, default=100000, help="maximum total baseline + extension vocabulary size")
     ap.add_argument("--coverage", type=float, default=.995, help="training selection target, not a speed claim")
     ap.add_argument("--output-dir", type=Path, default=Path("data/nl"))
-    ap.add_argument("--patch", type=Path, default=Path("patches/languages/0011-flash-next-draft-nl.patch"))
     args = ap.parse_args()
     if args.train.resolve() == args.holdout.resolve() or sha(args.train) == sha(args.holdout):
         ap.error("training and holdout must be different files")
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(str(args.tokenizer))
     spec = json.loads(args.tokenizer.read_text(encoding="utf-8"))
-    base = read_ids(args.base, tok.get_vocab_size())
+    from nl_draft_vocab import default_ids_from_patch, DEFAULT_PATCH
+    base = read_ids(args.base, tok.get_vocab_size()) if args.base else set(default_ids_from_patch(DEFAULT_PATCH))
+    if any(i < 0 or i >= tok.get_vocab_size() for i in base):
+        raise ValueError("Zig baseline contains IDs outside tokenizer vocabulary")
     pinned = {t["id"] for t in spec.get("added_tokens", [])}
     pinned |= {i for piece, i in tok.get_vocab().items() if len(piece) == 1 or
                (piece.startswith("<0x") and piece.endswith(">"))}
@@ -102,14 +98,11 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     vocab = args.output_dir / "draft_vocab_nl.txt"
     vocab.write_text("".join(f"{i}\n" for i in ids), encoding="utf-8", newline="\n")
-    args.patch.parent.mkdir(parents=True, exist_ok=True)
-    args.patch.write_text(extension_patch(ids), encoding="utf-8", newline="\n")
     report = {
         "schema": 1, "provenance": json.loads(args.provenance.read_text(encoding="utf-8")),
         "sha256": {"tokenizer": sha(args.tokenizer),
                    "base_ids_lf": hashlib.sha256("".join(f"{i}\n" for i in sorted(base)).encode()).hexdigest(),
-                   "train": sha(args.train), "holdout": sha(args.holdout), "extension": sha(vocab),
-                   "patch": sha(args.patch)},
+                   "train": sha(args.train), "holdout": sha(args.holdout), "extension": sha(vocab)},
         "tokenizer_vocab_size": tok.get_vocab_size(), "base_size": len(base),
         "extension_size": len(ids), "union_size": len(keep), "max_size": args.max_size,
         "selection_target": args.coverage, "training_target_reached": train_coverage >= args.coverage,
@@ -118,7 +111,7 @@ def main():
         "holdout": {"documents": holdout_docs, "tokens": sum(holdout.values()),
                     "base_coverage": coverage(holdout, base), "nl_coverage": coverage(holdout, keep)},
         "split_overlap": 0,
-        "status": "Wikipedia seed vocabulary; model-output coverage and DGX Spark speed unmeasured",
+        "status": "Wikipedia seed vocabulary; current Zig runtime performance not measured",
     }
     (args.output_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8", newline="\n")
     print(json.dumps(report, indent=2))

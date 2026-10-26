@@ -1,0 +1,1585 @@
+TensorFold db281878ddb8..453439d10d03 (zig-single): build-registry-server
+Apply from the checkout root with: git apply 0001-build-registry-server.patch
+
+ tests/test_native_contract.py       |   2 +
+ zig/build/cuda.zig                  |  55 ++++++++++++++++++++++-----
+ zig/src/cli/cuda_main.zig           |   3 ++
+ zig/src/core/engine_api.zig         |  22 ++++++++++-
+ zig/src/cuda/graph.zig              |  15 ++++++--
+ zig/src/cuda/kernels.zig            |  18 +++++++++
+ zig/src/families/flashnext/cuda.zig |  62 ++++++++++++++++++++++++++++++
+ zig/src/native/cuda.zig             |  88 +++++++++++++++++++++++++++++++++++++++---
+ zig/src/native/metal.zig            |   4 ++
+ zig/src/server/chat.zig             |   5 ++-
+ zig/src/server/cli.zig              |  60 ++++++++++++++++++++++++-----
+ zig/src/server/engines.zig          |   6 +++
+ zig/src/server/hf_text.zig          |   7 ++--
+ zig/src/server/http_body.zig        |   3 +-
+ zig/src/server/main.zig             |  27 +++++++++++++
+ zig/src/server/messages.zig         | 181 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ zig/src/server/openai.zig           |   6 ++-
+ zig/src/server/prompt.zig           |  44 ++++++++++++++++++++-
+ zig/src/server/request_log.zig      |  10 ++---
+ zig/src/server/serve.zig            |  11 ++++++
+ zig/src/server/server.zig           |  32 +++++++++++++++-
+ zig/src/server/vision.zig           | 325 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 22 files changed, 943 insertions(+), 43 deletions(-)
+
+diff --git a/tests/test_native_contract.py b/tests/test_native_contract.py
+index 6e15ce60ae2334793b611ebc2cbf119642912f48..c7a7f89755e067b17b37a3110f1f84a3bd4607ce 100644
+--- a/tests/test_native_contract.py
++++ b/tests/test_native_contract.py
+@@ -95,6 +95,8 @@ def test_the_checker_runs_only_the_keywords_it_implements():
+     ({"text_config": {"model_type": "x"}}, "unquantized"),
+     ({"quantization_config": {"quant_method": "exl3", "bits": 4}}, "exl3-b4"),
+     ({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"}}, "modelopt-nvfp4"),
++    ({"quantization_config": {"quant_method": "gptq", "bits": 4, "group_size": 128, "sym": True}}, "gptq-b4"),
++    ({"quantization_config": {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION"}}, "modelopt-mixed-precision"),
+ ])
+ def test_weight_formats_differ_wherever_the_kernels_would(config, expected):
+     name = contract.weight_format(config)
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+index a7975e5bfeb8ad0af645e0904a8abd1906f3b94c..3ac2240679f8e0424bb4eef3505810f66b7a2c70 100644
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -25,6 +25,26 @@ const kernels = [_]Kernel{
+     .{ .name = "torch_indexing", .src = "torch_ops/indexing", .flags = torch_ops },
+     .{ .name = "torch_movement", .src = "torch_ops/movement", .flags = torch_ops },
+     .{ .name = "torch_nemotron_constants", .src = "torch_ops/nemotron_constants", .flags = torch_ops },
++    // Flash Next (qwen4_exp): copies of its extensions' device code (zig/tests/cuda/copies.py), the same flags
++    .{ .name = "fn_gdn", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn.py, tensorfold_qwen4_exp_gdn
++    .{ .name = "fn_gdn_io", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn_io.py, tensorfold_qwen4_exp_gdn_io
++    .{ .name = "fn_gdn_prefill", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2
++    .{ .name = "fn_gdn_tree", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2
++    .{ .name = "fn_nvfp4_experts", .flags = &.{"-O3"} }, // cuda/nvfp4/linear.py, tensorfold_nvfp4_v3
++    .{ .name = "fn_qmm", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
++    .{ .name = "fn_qmm_prefill", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
++    .{ .name = "fn_pack", .flags = &.{"-O3"} }, // ours: the n-gram table's GPU gather (flashnext/cuda_weights.zig)
++    .{ .name = "torch_fn_ops", .src = "torch_ops/fn_ops", .flags = torch_ops }, // ours: Flash Next torch ops (SwiGLU, sampler packing)
++    .{ .name = "torch_fn_logsumexp", .src = "torch_ops/fn_logsumexp", .flags = torch_ops }, // ours: torch.logsumexp in ATen's order
++    .{ .name = "fn_experts_prompt", .flags = &.{"-O3"} }, // ours: routed NVFP4 experts reading weights once a prompt call (fn_nvfp4_experts' bits)
++    // INT4-AutoRound checkpoint (GPTQ int4 experts and head, 128x128-block FP8 dense linears)
++    .{ .name = "fn_qmmf", .flags = &.{"-O3"} }, // cuda/nvfp4/qmmf.cu (FP8G lane matmul), tensorfold_nvfp4_v3
++    .{ .name = "fn_int4", .flags = &.{"-O3"} }, // ours: GPTQ int4 g128 routed experts and lm_head (W4A16, fp32 sums)
++    .{ .name = "fn_qmmf_ld", .flags = &.{"-O3"} }, // fn_qmmf.cu with an output row stride (tools/zig/flashnext_qmmf_ld.py)
++    .{ .name = "fn_nvfp4_shape", .flags = &.{"-O3"} }, // ours (decode D3): fn_nvfp4_experts' unit arithmetic in other launch shapes
++    .{ .name = "fn_qmm_cluster", .flags = &.{"-O3"} }, // ours (decode D5): qmm_kernel's K-slice cluster forms for the MTP head in 4-bit
++    .{ .name = "fn_roce", .flags = &.{"-O3"} }, // ours (decode D1): the one-shot RoCE all-gather's GPU half (cuda/roce.zig)
++    .{ .name = "fn_qsa_scores", .flags = &.{"-O3"} }, // ours: attention._scores' bits from row tiles (the prompt indexer)
+ };
+ 
+ /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
+@@ -50,12 +70,16 @@ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
+     options.addOption(bool, "with_kernels", with);
+     const cuda = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     cuda.addOptions("kernel_options", options);
++    // the one-shot RoCE all-gather's proxy (decode D1): plain C over libibverbs' header, the library opened at run time
++    // (roce_proxy_stub.c, which refuses every open, where /usr/include has no infiniband/verbs.h)
++    const verbs = if (std.Io.Dir.accessAbsolute(b.graph.io, "/usr/include/infiniband/verbs.h", .{})) |_| true else |_| false;
++    cuda.addCSourceFile(.{ .file = b.path(if (verbs) "zig/src/cuda/roce_proxy.c" else "zig/src/cuda/roce_proxy_stub.c"), .flags = &.{ "-std=gnu11", "-O2", "-idirafter", "/usr/include" } });
+     cuda.addImport("stagger", stagger(b, target, optimize));
+     if (with) for (kernels, images) |k, image| cuda.addAnonymousImport(b.fmt("fatbin_{s}", .{k.name}), .{ .root_source_file = image.? });
+     return cuda;
+ }
+ 
+-fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, tokenizer: *std.Build.Module } {
++fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, flashnext: *std.Build.Module, tokenizer: *std.Build.Module } {
+     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     core.addImport("tokenizer", tokenizer);
+@@ -65,7 +89,12 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
+     nemotron.addImport("core", core);
+     nemotron.addImport("lanes", lanes);
+     nemotron.addImport("nemotron_draft_ids", draft_ids);
+-    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer };
++    // Flash Next on CUDA: its root sits beside the Metal family's host files (config.zig), which it shares
++    const flashnext = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
++    flashnext.addImport("cuda", cuda);
++    flashnext.addImport("core", core);
++    flashnext.addImport("lanes", lanes);
++    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .flashnext = flashnext, .tokenizer = tokenizer };
+ }
+ 
+ /// Linux targets: fatbins (-Dnvcc builds them, -Dfatbins embeds prebuilt ones), `tensorfold` and `tf-cuda-test`.
+@@ -96,29 +125,36 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+     cli.addImport("core", mods.core);
+     cli.addImport("lanes", mods.lanes);
+     cli.addImport("nemotron", mods.nemotron);
++    cli.addImport("flashnext", mods.flashnext);
+     b.installArtifact(b.addExecutable(.{ .name = "tensorfold", .root_module = cli }));
+     const runner = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+     runner.addImport("cuda", cuda);
+     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
+-    nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.tokenizer);
++    nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.flashnext, mods.tokenizer);
++    // Flash Next's two-rank transport test (zig/tests/cuda/flashnext/box/comm.sh): its own step, not in `install`
++    const comm_test = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/flashnext/comm_test.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "flashnext", .module = mods.flashnext } } });
++    b.step("flashnext-comm", "tf-flashnext-comm RANK MASTER PORT: two-rank all-gathers, exact and timed").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-flashnext-comm", .root_module = comm_test }), .{}).step);
++    // Flash Next's weights against the oracle's digests (zig/tests/cuda/flashnext/weights_check.zig): its own step
++    const weights_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/flashnext/weights_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "flashnext", .module = mods.flashnext } } });
++    b.step("flashnext-weights", "tf-flashnext-weights SNAPSHOT [WEIGHTS.json]: the loaded weights' digests against the oracle's").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-flashnext-weights", .root_module = weights_check }), .{}).step);
+ }
+ 
+ /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
+-fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
++fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, flashnext: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
+     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
+     const mod = b.createModule(.{
+         .root_source_file = b.path("zig/src/native/cuda.zig"),
+         .target = target,
+         .optimize = optimize,
+         .link_libc = true,
+-        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron", .module = nemotron } },
++        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron", .module = nemotron }, .{ .name = "flashnext", .module = flashnext } },
+     });
+     return .{ .api = api, .engines = mod };
+ }
+ 
+ /// `zig build native`: tensorfold-native with the CUDA engines into zig-out/native/bin, as the Metal build makes it.
+-fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, tokenizer: *std.Build.Module) void {
+-    const m = engines(b, target, optimize, cuda, lanes, nemotron);
++fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, flashnext: *std.Build.Module, tokenizer: *std.Build.Module) void {
++    const m = engines(b, target, optimize, cuda, lanes, nemotron, flashnext);
+     // the HTTP side keeps its safety checks; the engine below it runs at `optimize` (the tokenizer is the family's)
+     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
+     const exe = b.addExecutable(.{ .name = "tensorfold-native", .root_module = b.createModule(.{
+@@ -137,13 +173,14 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
+     const host = b.graph.host;
+     const cuda = runtime(b, host, .debug, &.{});
+     const mods = family(b, host, .debug, cuda, draft_ids);
+-    const native = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron).engines;
+-    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
++    const native = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron, mods.flashnext).engines;
++    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.flashnext, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
+     cli.addImport("cuda", cuda);
+     cli.addImport("core", mods.core);
+     cli.addImport("lanes", mods.lanes);
+     cli.addImport("nemotron", mods.nemotron);
++    cli.addImport("flashnext", mods.flashnext);
+     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli })).step);
+ }
+ 
+diff --git a/zig/src/cli/cuda_main.zig b/zig/src/cli/cuda_main.zig
+index 012a18e3f98186de2afb6b3d23069812dd9a1b19..aa0c863d26b1bbea3605e989e0054716d282ee4b 100644
+--- a/zig/src/cli/cuda_main.zig
++++ b/zig/src/cli/cuda_main.zig
+@@ -8,6 +8,7 @@ const lanes = @import("lanes");
+ const checks = @import("cuda_checks.zig");
+ const lanes_cli = @import("cuda_lanes.zig");
+ const segments_cli = @import("cuda_segments.zig");
++const flashnext_cli = @import("flashnext_cuda.zig");
+ const decode = nemotron.decode;
+ 
+ const usage =
+@@ -35,6 +36,8 @@ pub fn main(init: std.process.Init) !u8 {
+         std.debug.print("{s}", .{usage});
+         return 2;
+     }
++    // Flash Next (qwen4_exp) checkpoints take their own commands (flashnext_cuda.zig)
++    if (flashnext_cli.wants(gpa, init.io, args[2])) return flashnext_cli.main(init, args);
+     var opts = Options{ .model = args[2] };
+     var positional: std.ArrayList([]const u8) = .empty;
+     defer positional.deinit(gpa);
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 21d77be3cf41769d65cdf6c0d821707b7a42fd1d..ec26b4a95f8ab73847ca0c30715c9dbbe60fa47f 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -28,6 +28,16 @@ pub const CallGate = struct {
+     names: []const []const u8 = &.{},
+     think_open: ?u32 = null,
+     think_end: ?u32 = null,
++    /// Token text the decode loop uses to finish a named call (Python's blank / decode / encode).
++    lex: CallLex,
++};
++
++/// Same signatures as lanes/call_gate.zig Lex. Kept here so this file stays in one module.
++pub const CallLex = struct {
++    ctx: *anyopaque,
++    blank: *const fn (ctx: *anyopaque, token: u32) bool,
++    text: *const fn (ctx: *anyopaque, a: Allocator, token: u32) anyerror![]const u8,
++    encode: *const fn (ctx: *anyopaque, a: Allocator, text: []const u8) anyerror![]const u32,
+ };
+ 
+ /// response_format and the guided_* fields: every token keeps the reply inside this grammar.
+@@ -39,6 +49,9 @@ pub const Structure = struct {
+     after: ?u32 = null,
+ };
+ 
++/// A prompt's images and video frames, prepared by the vision frontend (rows, rotary positions, features).
++pub const Media = lanes.Media;
++
+ /// A reply to decode. The request and every slice in it stay valid until its ``finished`` event.
+ pub const Request = struct {
+     prompt: []const u32,
+@@ -67,6 +80,8 @@ pub const Request = struct {
+     structure: ?Structure = null,
+     /// Stop a short exact cycle while the think block is open.
+     loop_guard: bool = false,
++    /// The prompt's images and videos (``Info.media`` engines only); such a prompt is never kept or resumed.
++    media: ?*const Media = null,
+ };
+ 
+ pub const Reason = enum { stop, length, cancelled, failed };
+@@ -117,16 +132,19 @@ pub const Info = struct {
+     structures: bool = false,
+     /// Prompt rows a prefill chunk at most, for the server's chunk starts (0: the engine cuts prompts itself).
+     prefill_step: u32 = 0,
++    /// The engine takes ``Request.media`` (image and video rows with their rotary positions).
++    media: bool = false,
+ };
+ 
+ /// A checkpoint family an engine reads: its config ``model_type`` and weight formats, as gate entries name them.
+ pub const Family = struct { model_type: []const u8, formats: []const []const u8 };
+ 
+ /// What a server asks of the engine it opens: the checkpoint, and the serve flags an engine reads.
+-pub const Open = struct { dir: []const u8, model_type: []const u8, context: ?i64 = null, lanes: u32 = 8, drafts: bool = true, speed_up: ?[]const u8 = null, prompt_cache_gib: ?f64 = null, prompt_cache_over_cap: bool = false };
++pub const Open = struct { dir: []const u8, model_type: []const u8, context: ?i64 = null, lanes: u32 = 8, drafts: bool = true, speed_up: ?[]const u8 = null, prompt_cache_gib: ?f64 = null, prompt_cache_over_cap: bool = false, tp: u32 = 1, rank: u32 = 0, master: []const u8 = "", master_port: u16 = 29551, kv_dtype: []const u8 = "bf16", vision: bool = false };
+ 
+ /// An opened engine; ``close`` stops its thread and frees its backend.
+-pub const Opened = struct { engine: Engine, close: *const fn (ctx: *anyopaque) void, ctx: *anyopaque };
++/// ``follow``: a rank other than 0 runs it instead of serving, until rank 0 stops (two-rank engines only).
++pub const Opened = struct { engine: Engine, close: *const fn (ctx: *anyopaque) void, ctx: *anyopaque, follow: ?*const fn (ctx: *anyopaque) anyerror!void = null };
+ 
+ pub const Memory = struct { active: u64 = 0, cache: u64 = 0, peak: u64 = 0 };
+ 
+diff --git a/zig/src/cuda/graph.zig b/zig/src/cuda/graph.zig
+index a5ad3e1bd548d72a842f843ca616b1ea6a4b6f14..7d8ebd5d5f12c3f8e9ec19f8ff6c11c16d905c6f 100644
+--- a/zig/src/cuda/graph.zig
++++ b/zig/src/cuda/graph.zig
+@@ -10,15 +10,22 @@ const launch = @import("launch.zig");
+ 
+ pub const Node = abi.GraphNode;
+ 
++/// A check for the graph calls a caller recovers from (capture end, instantiate, upload): a warning, not an error.
++fn soft(d: *const Driver, res: abi.Result, what: []const u8) Error!void {
++    if (res == abi.success) return;
++    std.log.warn("{s}: {s} ({d}) {s}", .{ what, d.errorName(res), res, d.errorText(res) });
++    return if (res == 2) error.OutOfDeviceMemory else error.CudaFailed;
++}
++
+ /// Starts capturing `stream`; every launch on it is recorded until `endCapture`, nothing runs.
+ pub fn beginCapture(stream: Stream, mode: abi.CaptureMode) Error!void {
+-    try stream.d.check(stream.d.api.cuStreamBeginCapture_v2(stream.handle, mode), "cuStreamBeginCapture");
++    try soft(stream.d, stream.d.api.cuStreamBeginCapture_v2(stream.handle, mode), "cuStreamBeginCapture");
+ }
+ 
+ /// Ends the capture; an invalidated capture returns an error and no graph.
+ pub fn endCapture(stream: Stream) Error!Graph {
+     var g: abi.Graph = null;
+-    try stream.d.check(stream.d.api.cuStreamEndCapture(stream.handle, &g), "cuStreamEndCapture");
++    try soft(stream.d, stream.d.api.cuStreamEndCapture(stream.handle, &g), "cuStreamEndCapture");
+     return .{ .d = stream.d, .handle = g };
+ }
+ 
+@@ -95,7 +102,7 @@ pub const Graph = struct {
+ 
+     pub fn instantiate(self: Graph) Error!Exec {
+         var e: abi.GraphExec = null;
+-        try self.d.check(self.d.api.cuGraphInstantiateWithFlags(&e, self.handle, 0), "cuGraphInstantiateWithFlags");
++        try soft(self.d, self.d.api.cuGraphInstantiateWithFlags(&e, self.handle, 0), "cuGraphInstantiateWithFlags");
+         return .{ .d = self.d, .handle = e };
+     }
+ };
+@@ -111,7 +118,7 @@ pub const Exec = struct {
+ 
+     /// Moves the graph's work to the device ahead of the first launch, so that launch pays no setup.
+     pub fn upload(self: Exec, stream: Stream) Error!void {
+-        try self.d.check(self.d.api.cuGraphUpload(self.handle, stream.handle), "cuGraphUpload");
++        try soft(self.d, self.d.api.cuGraphUpload(self.handle, stream.handle), "cuGraphUpload");
+     }
+ 
+     pub fn launchOn(self: Exec, stream: Stream) Error!void {
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 7881d97b11af1525603ad4b6dff93dfff7f6832f..b719c7c73f786e8a2588397843b6735e313fc6f7 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -28,6 +28,24 @@ pub const torch_pointwise: []const u8 = if (available) &Blob("fatbin_torch_point
+ pub const torch_indexing: []const u8 = if (available) &Blob("fatbin_torch_indexing").bytes else &.{};
+ pub const torch_movement: []const u8 = if (available) &Blob("fatbin_torch_movement").bytes else &.{};
+ pub const torch_nemotron_constants: []const u8 = if (available) &Blob("fatbin_torch_nemotron_constants").bytes else &.{};
++pub const fn_gdn: []const u8 = if (available) &Blob("fatbin_fn_gdn").bytes else &.{};
++pub const fn_gdn_io: []const u8 = if (available) &Blob("fatbin_fn_gdn_io").bytes else &.{};
++pub const fn_gdn_prefill: []const u8 = if (available) &Blob("fatbin_fn_gdn_prefill").bytes else &.{};
++pub const fn_gdn_tree: []const u8 = if (available) &Blob("fatbin_fn_gdn_tree").bytes else &.{};
++pub const fn_nvfp4_experts: []const u8 = if (available) &Blob("fatbin_fn_nvfp4_experts").bytes else &.{};
++pub const fn_qmm: []const u8 = if (available) &Blob("fatbin_fn_qmm").bytes else &.{};
++pub const fn_qmm_prefill: []const u8 = if (available) &Blob("fatbin_fn_qmm_prefill").bytes else &.{};
++pub const fn_pack: []const u8 = if (available) &Blob("fatbin_fn_pack").bytes else &.{};
++pub const torch_fn_ops: []const u8 = if (available) &Blob("fatbin_torch_fn_ops").bytes else &.{};
++pub const torch_fn_logsumexp: []const u8 = if (available) &Blob("fatbin_torch_fn_logsumexp").bytes else &.{};
++pub const fn_experts_prompt: []const u8 = if (available) &Blob("fatbin_fn_experts_prompt").bytes else &.{};
++pub const fn_qmmf: []const u8 = if (available) &Blob("fatbin_fn_qmmf").bytes else &.{};
++pub const fn_int4: []const u8 = if (available) &Blob("fatbin_fn_int4").bytes else &.{};
++pub const fn_qmmf_ld: []const u8 = if (available) &Blob("fatbin_fn_qmmf_ld").bytes else &.{};
++pub const fn_qmm_cluster: []const u8 = if (available) &Blob("fatbin_fn_qmm_cluster").bytes else &.{};
++pub const fn_roce: []const u8 = if (available) &Blob("fatbin_fn_roce").bytes else &.{};
++pub const fn_nvfp4_shape: []const u8 = if (available) &Blob("fatbin_fn_nvfp4_shape").bytes else &.{};
++pub const fn_qsa_scores: []const u8 = if (available) &Blob("fatbin_fn_qsa_scores").bytes else &.{};
+ 
+ /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
+ pub const gdn_symbols = struct {
+diff --git a/zig/src/families/flashnext/cuda.zig b/zig/src/families/flashnext/cuda.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..fb9fc622af00ed889ffb37b982d6737aeaa1ce1c
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda.zig
+@@ -0,0 +1,62 @@
++//! Flash Next (qwen4_exp) on CUDA in Zig: the Python 0.6.5 engine's kernels and layouts for NVIDIA's ModelOpt NVFP4
++//! export, so tokens match it bit for bit on one GPU, and the same arithmetic split over two ranks (work/PLAN.md).
++//! The Metal family's host files (config.zig, affine.zig, ...) reach core by relative paths, so this module reads the
++//! checkpoint through its own cuda_*.zig files and the `core` module.
++
++pub const native = @import("cuda_native.zig");
++pub const ngram = @import("cuda_ngram.zig");
++pub const rope = @import("cuda_rope.zig");
++pub const sampler = @import("cuda_sampler.zig");
++pub const link = @import("cuda_link.zig");
++pub const comm = @import("cuda_comm.zig");
++pub const kernels = @import("cuda_kernels.zig");
++pub const state = @import("cuda_state.zig");
++pub const decode = @import("cuda_decode.zig");
++pub const triton = @import("cuda_triton.zig");
++pub const torch_ops = @import("cuda_torch_ops.zig");
++pub const config = @import("cuda_config.zig");
++pub const layouts = @import("cuda_layouts.zig");
++pub const weights = @import("cuda_weights.zig");
++pub const forward = @import("cuda_forward.zig");
++pub const vmm = @import("cuda_vmm.zig");
++pub const nucleus = @import("cuda_nucleus.zig");
++pub const mtp = @import("cuda_mtp.zig");
++pub const mtp_q4 = @import("cuda_mtp_q4.zig");
++pub const engine = @import("cuda_engine.zig");
++pub const prompt = @import("cuda_prompt.zig");
++pub const fp4_serial = @import("cuda_fp4_serial.zig");
++pub const prof = @import("cuda_prof.zig");
++pub const moe_prompt = @import("cuda_moe_prompt.zig");
++pub const fp8 = @import("cuda_fp8.zig");
++pub const int4 = @import("cuda_int4.zig");
++pub const int4_check = @import("cuda_int4_check.zig");
++pub const Engine = engine.Engine;
++
++test {
++    _ = native;
++    _ = ngram;
++    _ = rope;
++    _ = sampler;
++    _ = link;
++    _ = comm;
++    _ = kernels;
++    _ = state;
++    _ = decode;
++    _ = triton;
++    _ = torch_ops;
++    _ = fp4_serial;
++    _ = config;
++    _ = layouts;
++    _ = weights;
++    _ = forward;
++    _ = vmm;
++    _ = nucleus;
++    _ = mtp;
++    _ = engine;
++    _ = prompt;
++    _ = prof;
++    _ = moe_prompt;
++    _ = fp8;
++    _ = int4;
++    _ = int4_check;
++}
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index b0667987210f041b8a4e58338f7f2e3daba28e54..f1af70cdae24c017b1a39986d23a323c13871fe8 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -5,10 +5,11 @@ const cuda = @import("cuda");
+ const api = @import("engine_api");
+ const lanes = @import("lanes");
+ const nemotron = @import("nemotron");
++const flashnext = @import("flashnext");
+ const Allocator = std.mem.Allocator;
+ 
+ /// The CUDA families: namespaces with `model_type`, `formats`, `default_context`, `prefill_step` and `open`.
+-const registry = .{nemotron.native};
++const registry = .{ nemotron.native, flashnext.native };
+ 
+ pub const backends: []const []const u8 = &.{"cuda"};
+ pub const families: []const api.Family = blk: {
+@@ -65,12 +66,16 @@ const Host = struct {
+     ctx: cuda.Context,
+     family: *anyopaque,
+     release: *const fn (*anyopaque) void,
++    follow_fn: ?*const fn (*anyopaque) anyerror!void = null, // a following rank's loop (two-rank families)
+     inner: lanes.backend.Backend,
+     vtable: lanes.backend.Backend.VTable,
+     cfg: lanes.Config,
+     clock: lanes.backend.WallClock,
+     core: lanes.Engine,
+     host: api.LaneHost,
++    /// kept prompt states, for families whose backend keeps them (Loaded.cache)
++    store: ?api.prompt_cache.Store = null,
++    store_vt: api.prompt_cache.Snapshots.VTable = undefined,
+ 
+     fn close(p: *anyopaque) void {
+         const h: *Host = @ptrCast(@alignCast(p));
+@@ -78,12 +83,18 @@ const Host = struct {
+         h.core.deinit();
+         h.cfg.deinit(h.gpa);
+         h.ctx.makeCurrent() catch {};
++        if (h.store) |*st| st.deinit(); // its states go back to the family before the family goes
+         h.release(h.family);
+         h.ctx.deinit();
+         h.driver.close();
+         h.gpa.destroy(h);
+     }
+ 
++    fn follow(p: *anyopaque) anyerror!void {
++        const h: *Host = @ptrCast(@alignCast(p));
++        return h.follow_fn.?(h.family);
++    }
++
+     fn bind(p: *anyopaque) *Host {
+         const h: *Host = @ptrCast(@alignCast(p));
+         if (bound != &h.ctx) {
+@@ -169,11 +180,36 @@ const Host = struct {
+                     x.inner.vtable.release(x.inner.ptr, s);
+                 }
+             }.f,
++            .prefill_begin = if (v.prefill_begin != null) struct {
++                fn f(p: *anyopaque, s: *lanes.Stream) anyerror!void {
++                    const x = bind(p);
++                    return x.inner.vtable.prefill_begin.?(x.inner.ptr, s);
++                }
++            }.f else null,
++            .prefill_step = if (v.prefill_step != null) struct {
++                fn f(p: *anyopaque, ss: []const *lanes.Stream, states: []lanes.backend.FillState) anyerror!void {
++                    const x = bind(p);
++                    return x.inner.vtable.prefill_step.?(x.inner.ptr, ss, states);
++                }
++            }.f else null,
++            .prefill_many = if (v.prefill_many != null) struct {
++                fn f(p: *anyopaque, ss: []const *lanes.Stream) anyerror!void {
++                    const x = bind(p);
++                    return x.inner.vtable.prefill_many.?(x.inner.ptr, ss);
++                }
++            }.f else null,
+         };
+         return .{ .ptr = h, .vtable = &h.vtable };
+     }
+ };
+ 
++/// `text` as family F's KV cache format (its Options.kv_dtype), or null when F does not serve it; a family without
++/// the option serves "bf16" only.
++fn kvDtype(comptime F: type, text: []const u8) ?(if (@hasField(F.Options, "kv_dtype")) @FieldType(F.Options, "kv_dtype") else void) {
++    if (@hasField(F.Options, "kv_dtype")) return std.meta.stringToEnum(@FieldType(F.Options, "kv_dtype"), text);
++    return if (std.mem.eql(u8, text, "bf16")) {} else null;
++}
++
+ /// The engine for `o.dir`, or null with `problem` set when no CUDA family reads the checkpoint.
+ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
+     inline for (registry) |F| {
+@@ -184,17 +220,24 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
+ }
+ 
+ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
+-    const native = modelContext(a, io, o.dir);
++    // a family may serve past config.json's window (Flash Next with YaRN): its modelWindow says how far
++    const native = if (@hasDecl(F, "modelWindow")) F.modelWindow(a, io, o.dir) else modelContext(a, io, o.dir);
+     const window: i64 = o.context orelse @min(F.default_context, if (native > 0) native else F.default_context);
+     if (window <= 0 or (native > 0 and window > native)) {
+         problem.* = try std.fmt.allocPrint(a, "--context {d} exceeds this model's {d}-token window", .{ window, native });
+         return null;
+     }
++    // the KV cache's format: a family whose options name it serves its formats; the others serve bf16 only
++    const kv = kvDtype(F, o.kv_dtype) orelse {
++        problem.* = try std.fmt.allocPrint(a, "--kv-dtype {s}: the native CUDA engine serves {s} with a bf16 KV cache; serve with --engine python", .{ o.kv_dtype, o.model_type });
++        return null;
++    };
+     const h = try gpa.create(Host);
+     errdefer gpa.destroy(h);
+     h.gpa = gpa;
+     h.driver = cuda.Driver.open() catch |e| {
+         problem.* = try std.fmt.allocPrint(a, "no CUDA driver ({s})", .{@errorName(e)});
++        gpa.destroy(h); // a null return runs no errdefer
+         return null;
+     };
+     errdefer h.driver.close();
+@@ -202,12 +245,39 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     errdefer h.ctx.deinit();
+     bound = &h.ctx;
+     const kernels = try kernelDir(a, io, try h.ctx.capability());
+-    const loaded = F.open(gpa, io, &h.ctx, o.dir, kernels, .{ .context = @intCast(window), .drafts = o.drafts }) catch |e| {
++    // two ranks only for families whose options take them
++    const two_rank = @hasField(F.Options, "tp");
++    if (o.tp > 1 and !two_rank) {
++        problem.* = try std.fmt.allocPrint(a, "--tp {d}: the native CUDA engine serves {s} on one GPU only", .{ o.tp, o.model_type });
++        h.ctx.deinit();
++        h.driver.close();
++        gpa.destroy(h);
++        return null;
++    }
++    var fo: F.Options = .{ .context = @intCast(window), .drafts = o.drafts };
++    if (@hasField(F.Options, "kv_dtype")) fo.kv_dtype = kv;
++    // a family whose backend shares forwards between streams sizes them by --parallel
++    if (@hasField(F.Options, "parallel")) fo.parallel = o.lanes;
++    if (@hasField(F.Options, "prompt_cache_gib")) fo.prompt_cache_gib = o.prompt_cache_gib;
++    if (@hasField(F.Options, "vision")) fo.vision = o.vision;
++    if (two_rank) {
++        fo.tp = o.tp;
++        fo.rank = o.rank;
++        fo.master = o.master;
++        fo.master_port = o.master_port;
++    }
++    const loaded = F.open(gpa, io, &h.ctx, o.dir, kernels, fo) catch |e| {
+         problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot load {s} with kernels {s} ({s})", .{ o.dir, kernels, @errorName(e) });
++        // a null return runs no errdefer: the host, its context and driver go here (they leaked before)
++        bound = null;
++        h.ctx.deinit();
++        h.driver.close();
++        gpa.destroy(h);
+         return null;
+     };
+     h.family = loaded.ctx;
+     h.release = loaded.deinit;
++    h.follow_fn = if (@hasField(@TypeOf(loaded), "follow")) loaded.follow else null;
+     errdefer h.release(h.family);
+     h.inner = loaded.backend;
+     h.cfg = try lanes.Config.init(gpa, loaded.facts, loaded.rows, loaded.rows - 1);
+@@ -215,9 +285,16 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     h.clock = .{ .io = io };
+     h.core = lanes.Engine.init(gpa, &h.cfg, h.backend(), h.clock.clock());
+     errdefer h.core.deinit();
+-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = F.prefill_step });
++    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = o.lanes, .context_window = @intCast(window), .prefill_step = F.prefill_step, .call_gates = true, .media = @hasDecl(F, "media") and F.media });
++    h.store = null;
++    if (@hasField(@TypeOf(loaded), "cache")) if (loaded.cache) |c| if (c.budget > 0) {
++        // the family keeps and restores the states; the store picks them (exact reuse, core/prompt_cache.zig)
++        h.store_vt = .{ .bytes = c.bytes, .save = c.save, .restore = c.restore, .drop = c.drop };
++        h.store = api.prompt_cache.Store.init(gpa, .{ .ptr = c.ptr, .vtable = &h.store_vt }, if (@hasDecl(F, "cache_rules")) .{ .lookahead = F.cache_rules.lookahead, .planned = F.cache_rules.planned } else .{}, c.budget);
++        h.host.cache = &h.store.?;
++    };
+     try h.host.start();
+-    return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
++    return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h, .follow = if (h.follow_fn != null) Host.follow else null };
+ }
+ 
+ test "chip classes name the compute capability" {
+@@ -230,4 +307,5 @@ test "chip classes name the compute capability" {
+ test "every registered family is listed for capabilities" {
+     try std.testing.expectEqual(@as(usize, registry.len), families.len);
+     try std.testing.expectEqualStrings("nemotron_h", families[0].model_type);
++    try std.testing.expectEqualStrings("qwen4_exp", families[1].model_type);
+ }
+diff --git a/zig/src/native/metal.zig b/zig/src/native/metal.zig
+index e60d25ce526baefd5597b344b8866f3e549dca65..8ac18683be828f5d697a2c1bf88909726b540c28 100644
+--- a/zig/src/native/metal.zig
++++ b/zig/src/native/metal.zig
+@@ -80,6 +80,10 @@ const Host = struct {
+ 
+ /// The engine for `o.dir`, or null with `problem` set when no Metal engine reads the checkpoint.
+ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
++    if (!std.mem.eql(u8, o.kv_dtype, "bf16")) {
++        problem.* = try std.fmt.allocPrint(a, "--kv-dtype {s} is a CUDA engine option: the Metal engine caches keys and values as bf16", .{o.kv_dtype});
++        return null;
++    }
+     if (std.mem.eql(u8, o.model_type, "qwen4_exp")) return openFlashNext(a, gpa, io, o, problem);
+     if (!std.mem.eql(u8, o.model_type, "nemotron_h")) {
+         problem.* = try std.fmt.allocPrint(a, "the native engine has no backend for {s} checkpoints yet; serve with --engine python", .{o.model_type});
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 4e01a415ac18c5f5dee6d80831ca0f6e8b3d5513..81b63c16f54bfd46689ae58c2ee7c71227cdaa3a 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -29,6 +29,8 @@ pub const Input = struct {
+     fields: Value,
+     /// The reply's id as its client gets it, so the server's lines for the request carry the same id.
+     id: []const u8 = "",
++    /// The request's own messages when they hold image or video parts (--vision): rendered by prompt.prepareMedia.
++    media: ?Value = null,
+ };
+ 
+ /// A streamed piece: content text (a string) or a delta object (reasoning or tool calls).
+@@ -160,7 +162,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+         if (input.max_tokens != null and limit > room) return cx.fail(.context_length, "{s} {d} tokens, but the rendered prompt has {d} tokens and requests {d} reply tokens, which exceeds the context window. Reduce the prompt to at most {d} prompt tokens or request at most {d} reply tokens, including chat template and thinking tokens.", .{ errors.context_limit, window, n, limit, @max(0, window - limit), room });
+         limit = @min(limit, room);
+     }
+-    const system_len: usize = if (input.prompt != null) 0 else prompt_mod.systemPrefixLen(srv, cx, input.messages, input.tools, rendered.ids, thinking, effort);
++    const system_len: usize = if (input.prompt != null or rendered.media != null) 0 else prompt_mod.systemPrefixLen(srv, cx, input.messages, input.tools, rendered.ids, thinking, effort);
+     var shared: std.ArrayList(u32) = .empty;
+     if (system_len > 0) for ([_]i64{ @as(i64, @intCast(system_len)) - 2048, @as(i64, @intCast(system_len)) - 512, @intCast(system_len) }) |cut| {
+         if (cut >= 512) try shared.append(a, @intCast(cut));
+@@ -179,6 +181,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+         .shared_prefixes = shared.items,
+         .chunks = try srv.chunks.starts(a, rendered.ids),
+         .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
++        .media = rendered.media,
+     };
+     try srv.checkFeatures(cx, f, input.tools.len > 0, thinking, rendered.ids, input.tools, &request);
+     if (thinking) {
+diff --git a/zig/src/server/cli.zig b/zig/src/server/cli.zig
+index 80a5ccb9575b9aa5f742f4ec917ada0aefdb22bc..e39308218a506949cde524a8fb68f09b5ac64a1d 100644
+--- a/zig/src/server/cli.zig
++++ b/zig/src/server/cli.zig
+@@ -33,11 +33,12 @@ pub const flags = [_]Flag{
+     .{ .name = "--api-key-file", .native = true },
+     .{ .name = "--metrics-open", .kind = .store_true, .native = true },
+     .{ .name = "--dashboard", .kind = .store_true, .native = true },
+-    .{ .name = "--vision", .kind = .store_true },
+-    .{ .name = "--vision-urls", .kind = .store_true },
++    .{ .name = "--vision", .kind = .store_true, .native = true },
++    .{ .name = "--vision-urls", .kind = .store_true, .native = true },
+     .{ .name = "--vision-offload", .kind = .store_true },
+-    .{ .name = "--vision-max-images" },
+-    .{ .name = "--vision-image-tokens" },
++    .{ .name = "--vision-max-images", .native = true },
++    .{ .name = "--vision-max-videos", .native = true },
++    .{ .name = "--vision-image-tokens", .native = true },
+     .{ .name = "--context", .native = true },
+     .{ .name = "--speed-up", .native = true },
+     .{ .name = "--max-tokens", .native = true },
+@@ -71,11 +72,11 @@ pub const flags = [_]Flag{
+     .{ .name = "--ple-on-ssd", .kind = .store_true },
+     .{ .name = "--no-update-check", .kind = .store_true, .native = true },
+     .{ .name = "--backend", .choices = &.{ "auto", "mlx", "cuda" }, .native = true, .native_values = backend_values },
+-    .{ .name = "--tp", .choices = &.{ "1", "2" } },
+-    .{ .name = "--rank", .choices = &.{ "0", "1" } },
+-    .{ .name = "--master" },
+-    .{ .name = "--master-port" },
+-    .{ .name = "--kv-dtype", .choices = &.{ "bf16", "int8", "int4" } },
++    .{ .name = "--tp", .choices = &.{ "1", "2" }, .native = true },
++    .{ .name = "--rank", .choices = &.{ "0", "1" }, .native = true },
++    .{ .name = "--master", .native = true },
++    .{ .name = "--master-port", .native = true },
++    .{ .name = "--kv-dtype", .choices = &.{ "bf16", "int8", "int4", "fp8" }, .native = true, .native_values = &.{ "bf16", "fp8" } },
+     .{ .name = "--prefill-fp8", .kind = .store_true },
+     .{ .name = "--no-prefill-fp8", .kind = .store_true },
+     .{ .name = "--precision", .choices = &.{ "checkpoint", "full" } },
+@@ -110,6 +111,19 @@ pub const Args = struct {
+     no_drafts: bool = false,
+     parallel: []const u8 = "auto",
+     backend: []const u8 = "auto",
++    // two ranks: rank 0 serves the API and leads, rank 1 follows it over the link to --master:--master-port
++    tp: u32 = 1,
++    rank: u32 = 0,
++    master: []const u8 = "",
++    master_port: u16 = 29551,
++    // --vision: image and video input (a helper process runs Python TensorFold's frontend and tower)
++    vision: bool = false,
++    vision_urls: bool = false,
++    vision_max_images: ?i64 = null,
++    vision_max_videos: ?i64 = null,
++    vision_image_tokens: ?i64 = null,
++    // the attention caches' format: bf16 (exact, the default) or fp8 (e4m3 rows, about half the bytes)
++    kv_dtype: []const u8 = "bf16",
+ };
+ 
+ /// A usage error's message (argparse's ``error:`` line); the caller exits 2.
+@@ -160,6 +174,22 @@ pub fn parse(a: Allocator, argv: []const []const u8, u: *Usage) error{ Usage, Ou
+         try apply(a, &out, name, value, u, &alias, &keys);
+     }
+     out.model = model orelse return fail(u, a, "the following arguments are required: model", .{});
++    if (out.rank >= out.tp) return fail(u, a, "argument --rank: {d} is not below --tp {d}", .{ out.rank, out.tp });
++    if (out.tp > 1 and out.master.len == 0) return fail(u, a, "--tp {d} needs --master, the address rank 0 listens on for the other rank", .{out.tp});
++    // serve_options.check: the image options need --vision
++    if (out.vision_urls and !out.vision) return fail(u, a, "--vision-urls needs --vision", .{});
++    if (out.vision_max_images) |n| {
++        if (n < 1 or n > 256) return fail(u, a, "--vision-max-images must be a positive integer (at most 256)", .{});
++        if (!out.vision) return fail(u, a, "--vision-max-images needs --vision", .{});
++    }
++    if (out.vision_max_videos) |n| {
++        if (n < 1 or n > 64) return fail(u, a, "--vision-max-videos must be a positive integer (at most 64)", .{});
++        if (!out.vision) return fail(u, a, "--vision-max-videos needs --vision", .{});
++    }
++    if (out.vision_image_tokens) |n| {
++        if (n < 1 or n > 65536) return fail(u, a, "--vision-image-tokens is a number of tokens from 1 to 65,536", .{});
++        if (!out.vision) return fail(u, a, "--vision-image-tokens needs --vision", .{});
++    }
+     out.alias = alias.items;
+     out.api_key = keys.items;
+     return out;
+@@ -191,7 +221,11 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
+         const p = try int(u, a, name, v);
+         if (p < 0 or p > 65535) return fail(u, a, "argument --port: invalid port: '{s}'", .{v});
+         out.port = @intCast(p);
+-    } else if (is(name, "--name")) out.name = v else if (is(name, "--alias")) try alias.append(a, v) else if (is(name, "--api-key")) try keys.append(a, v) else if (is(name, "--api-key-file")) out.api_key_file = v else if (is(name, "--metrics-open")) out.metrics_open = true else if (is(name, "--dashboard")) out.dashboard = true else if (is(name, "--context")) out.context = try int(u, a, name, v) else if (is(name, "--speed-up")) out.speed_up = v else if (is(name, "--prompt-cache-gib")) out.prompt_cache_gib = try gib(u, a, name, v) else if (is(name, "--prompt-cache-over-cap")) out.prompt_cache_over_cap = true else if (is(name, "--max-tokens")) out.max_tokens = try int(u, a, name, v) else if (is(name, "--temperature")) out.temperature = try float(u, a, name, v) else if (is(name, "--top-p")) out.top_p = try float(u, a, name, v) else if (is(name, "--top-k")) out.top_k = try int(u, a, name, v) else if (is(name, "--min-p")) out.min_p = try float(u, a, name, v) else if (is(name, "--thinking")) out.thinking = true else if (is(name, "--no-thinking")) out.thinking = false else if (is(name, "--reasoning-effort")) out.reasoning_effort = v else if (is(name, "--thinking-budget")) out.thinking_budget = try int(u, a, name, v) else if (is(name, "--loop-guard")) out.loop_guard = true else if (is(name, "--no-drafts")) out.no_drafts = true else if (is(name, "--parallel")) out.parallel = v else if (is(name, "--backend")) out.backend = v;
++    } else if (is(name, "--name")) out.name = v else if (is(name, "--alias")) try alias.append(a, v) else if (is(name, "--api-key")) try keys.append(a, v) else if (is(name, "--api-key-file")) out.api_key_file = v else if (is(name, "--metrics-open")) out.metrics_open = true else if (is(name, "--dashboard")) out.dashboard = true else if (is(name, "--context")) out.context = try int(u, a, name, v) else if (is(name, "--speed-up")) out.speed_up = v else if (is(name, "--prompt-cache-gib")) out.prompt_cache_gib = try gib(u, a, name, v) else if (is(name, "--prompt-cache-over-cap")) out.prompt_cache_over_cap = true else if (is(name, "--max-tokens")) out.max_tokens = try int(u, a, name, v) else if (is(name, "--temperature")) out.temperature = try float(u, a, name, v) else if (is(name, "--top-p")) out.top_p = try float(u, a, name, v) else if (is(name, "--top-k")) out.top_k = try int(u, a, name, v) else if (is(name, "--min-p")) out.min_p = try float(u, a, name, v) else if (is(name, "--thinking")) out.thinking = true else if (is(name, "--no-thinking")) out.thinking = false else if (is(name, "--reasoning-effort")) out.reasoning_effort = v else if (is(name, "--thinking-budget")) out.thinking_budget = try int(u, a, name, v) else if (is(name, "--loop-guard")) out.loop_guard = true else if (is(name, "--no-drafts")) out.no_drafts = true else if (is(name, "--parallel")) out.parallel = v else if (is(name, "--backend")) out.backend = v else if (is(name, "--tp")) out.tp = @intCast(try int(u, a, name, v)) else if (is(name, "--rank")) out.rank = @intCast(try int(u, a, name, v)) else if (is(name, "--master")) out.master = v else if (is(name, "--vision")) out.vision = true else if (is(name, "--vision-urls")) out.vision_urls = true else if (is(name, "--vision-max-images")) out.vision_max_images = try int(u, a, name, v) else if (is(name, "--vision-max-videos")) out.vision_max_videos = try int(u, a, name, v) else if (is(name, "--vision-image-tokens")) out.vision_image_tokens = try int(u, a, name, v) else if (is(name, "--kv-dtype")) out.kv_dtype = v else if (is(name, "--master-port")) {
++        const p = try int(u, a, name, v);
++        if (p <= 0 or p > 65535) return fail(u, a, "argument --master-port: invalid port: '{s}'", .{v});
++        out.master_port = @intCast(p);
++    }
+ }
+ 
+ /// ``--parallel``: "auto" is up to 8 requests at once; a number caps it.
+@@ -252,6 +286,12 @@ test "parse and capabilities share the table" {
+     try std.testing.expectEqual(@as(usize, 2), args.api_key.len);
+     try std.testing.expect(!args.thinking);
+     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--drafter", "x" }, &u));
++    const two = try parse(a, &.{ "m", "--tp", "2", "--rank", "1", "--master", "10.0.22.1", "--master-port", "29551" }, &u);
++    try std.testing.expectEqual(@as(u32, 2), two.tp);
++    try std.testing.expectEqual(@as(u32, 1), two.rank);
++    try std.testing.expectEqualStrings("10.0.22.1", two.master);
++    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--tp", "2" }, &u)); // no --master
++    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--rank", "1" }, &u)); // rank 1 of 1
+     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--reasoning-effort", "max" }, &u));
+     try std.testing.expectEqual(@as(?f64, 12.5), (try parse(a, &.{ "m", "--prompt-cache-gib", "12.5" }, &u)).prompt_cache_gib);
+     try std.testing.expectEqual(@as(?f64, 0), (try parse(a, &.{ "m", "--prompt-cache-gib", "0" }, &u)).prompt_cache_gib);
+diff --git a/zig/src/server/engines.zig b/zig/src/server/engines.zig
+index 30024f846f5ca3818c23272f21fa1324b3c9546a..82e42b03be0a98db6dcfed8541c926a9e96fa668 100644
+--- a/zig/src/server/engines.zig
++++ b/zig/src/server/engines.zig
+@@ -23,5 +23,11 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, dir: []const u8, model_typ
+         .speed_up = args.speed_up,
+         .prompt_cache_gib = args.prompt_cache_gib,
+         .prompt_cache_over_cap = args.prompt_cache_over_cap,
++        .tp = args.tp,
++        .rank = args.rank,
++        .master = args.master,
++        .master_port = args.master_port,
++        .vision = args.vision,
++        .kv_dtype = args.kv_dtype,
+     }, problem);
+ }
+diff --git a/zig/src/server/hf_text.zig b/zig/src/server/hf_text.zig
+index 30aeda1c6fd78ce2d0c9941eab9eeac85de4e4ea..4bcc5838043d038a3e1f17d84f0a7af02535852c 100644
+--- a/zig/src/server/hf_text.zig
++++ b/zig/src/server/hf_text.zig
+@@ -115,7 +115,8 @@ pub const HfText = struct {
+         return .{ .object = out };
+     }
+ 
+-    /// config.json's eos_token_id (one or a list), else the tokenizer's eos_token.
++    /// config.json's eos_token_id (one or a list) and the tokenizer's eos_token, as Python's tokenizer wrapper
++    /// stops on both (Qwen3.8 Flash Next: config 248044 <|endoftext|>, tokenizer 248046 <|im_end|>).
+     fn eosIds(t: *HfText, a: Allocator, model_config: std.json.Value, config: std.json.Value) ![]const u32 {
+         var out: std.ArrayList(u32) = .empty;
+         if (model_config == .object) {
+@@ -127,7 +128,7 @@ pub const HfText = struct {
+                     .array => |list| for (list.items) |x| if (x == .integer) try out.append(a, @intCast(x.integer)),
+                     else => {},
+                 }
+-                if (out.items.len > 0) return out.items;
++                if (out.items.len > 0) break;
+             }
+         }
+         if (config == .object) if (config.object.get("eos_token")) |e| {
+@@ -136,7 +137,7 @@ pub const HfText = struct {
+                 .object => |o| if (o.get("content")) |c| (if (c == .string) c.string else "") else "",
+                 else => "",
+             };
+-            if (t.tok.specialTokenId(piece)) |id| try out.append(a, id);
++            if (t.tok.specialTokenId(piece)) |id| if (std.mem.indexOfScalar(u32, out.items, id) == null) try out.append(a, id);
+         };
+         return out.items;
+     }
+diff --git a/zig/src/server/http_body.zig b/zig/src/server/http_body.zig
+index ad2951ebcca7997a540a5a475be1c0626f25a56e..0ad95e75ac0c5ac7f9135fc074ee5dfd0f501024 100644
+--- a/zig/src/server/http_body.zig
++++ b/zig/src/server/http_body.zig
+@@ -5,7 +5,8 @@ const errors = @import("errors.zig");
+ const Conn = @import("http_conn.zig").Conn;
+ const Allocator = std.mem.Allocator;
+ 
+-pub const limit = 32 * 1024 * 1024;
++/// 32 MiB; 96 MiB with --vision (base64 data URLs are a third larger than the files: the single-Spark recipe's limit)
++pub var limit: usize = 32 * 1024 * 1024;
+ const metadata_limit = 65536;
+ 
+ /// A body, or the refusal a RequestError carries (the connection then closes).
+diff --git a/zig/src/server/main.zig b/zig/src/server/main.zig
+index 94e792fd20db761463df39776a133af0a4bf9f6a..3cef0f4eccd5f7976186e735f34b39941b0cf4ce 100644
+--- a/zig/src/server/main.zig
++++ b/zig/src/server/main.zig
+@@ -7,6 +7,7 @@ const hub = @import("hub.zig");
+ const engines = @import("engines.zig");
+ const serve = @import("serve.zig");
+ const hf_text = @import("hf_text.zig");
++const vision = @import("vision.zig");
+ 
+ const usage_line = "usage: tensorfold serve [-h] [--host HOST] [--port PORT] [--name NAME] [--alias ALIAS] [--api-key API_KEY] [--api-key-file API_KEY_FILE] [--metrics-open] [--dashboard] [--context CONTEXT] [--speed-up SETTINGS] [--prompt-cache-gib PROMPT_CACHE_GIB] [--prompt-cache-over-cap] [--max-tokens MAX_TOKENS] [--temperature TEMPERATURE] [--top-p TOP_P] [--top-k TOP_K] [--min-p MIN_P] [--thinking | --no-thinking] [--reasoning-effort {low,medium,high,xhigh}] [--thinking-budget THINKING_BUDGET] [--loop-guard] [--no-drafts] [--parallel PARALLEL] [--no-update-check] [--backend {auto,mlx,cuda}] model\n";
+ 
+@@ -40,8 +41,33 @@ pub fn main(init: std.process.Init) !u8 {
+     const text = hf_text.HfText.load(gpa, io, dir, &problem) catch return fail(problem);
+     defer text.deinit();
+     const model_type = modelType(a, io, dir);
++    // --vision (rank 0): the helper loads and warms the tower on this GPU before the engine reads its memory
++    // budget, so the tower and the helper's context stay outside the caches' share
++    var helper: ?*vision.Helper = null;
++    defer if (helper) |h| h.stop(io);
++    if (args.vision and args.rank == 0) {
++        const env_int = struct {
++            fn of(m: *const std.process.Environ.Map, name: []const u8, default: u32) u32 {
++                const t = m.get(name) orelse return default;
++                return std.fmt.parseInt(u32, std.mem.trim(u8, t, " "), 10) catch default;
++            }
++        };
++        const settings: vision.Settings = .{
++            .allow_urls = args.vision_urls,
++            .max_images = if (args.vision_max_images) |n| @intCast(n) else env_int.of(init.environ_map, "TENSORFOLD_MAX_IMAGES", 50),
++            .max_videos = if (args.vision_max_videos) |n| @intCast(n) else env_int.of(init.environ_map, "TENSORFOLD_MAX_VIDEOS", 4),
++            .image_tokens = if (args.vision_image_tokens) |n| @intCast(n) else env_int.of(init.environ_map, "TENSORFOLD_IMAGE_TOKENS", 16384),
++        };
++        helper = vision.Helper.start(gpa, io, dir, settings, init.environ_map, &problem) catch return fail(problem);
++    }
+     const opened = try engines.open(a, gpa, io, dir, model_type, args, &problem) orelse return fail(problem);
+     defer opened.close(opened.ctx);
++    if (args.rank != 0) {
++        // a following rank serves no API: it runs rank 0's requests in step until rank 0 stops
++        const follow = opened.follow orelse return fail("this engine has no follower for --rank 1");
++        follow(opened.ctx) catch |e| return fail(try std.fmt.allocPrint(a, "rank {d} stopped: {s}", .{ args.rank, @errorName(e) }));
++        return 0;
++    }
+     return serve.run(gpa, io, args, .{
+         .engine = opened.engine,
+         .text = text.text(),
+@@ -49,6 +75,7 @@ pub fn main(init: std.process.Init) !u8 {
+         .sampling = try sampling(a, io, dir, args),
+         .environ = init.environ_map,
+         .started = started,
++        .vision = helper,
+     });
+ }
+ 
+diff --git a/zig/src/server/messages.zig b/zig/src/server/messages.zig
+index 71bc3ee545e2e4fa6c4dd77a5cf19843f072ee52..d13ca5294d19f204c7b395b6a50001da7aa1bda2 100644
+--- a/zig/src/server/messages.zig
++++ b/zig/src/server/messages.zig
+@@ -21,9 +21,128 @@ fn withField(cx: *Cx, o: *const json.Object, key: []const u8, value: Value) !*js
+     return copy;
+ }
+ 
++/// ``has_images``: a message whose content holds an image_url or video_url part.
++pub fn hasVisual(messages: ?Value) bool {
++    const list = messages orelse return false;
++    if (list != .array) return false;
++    for (list.array) |m| {
++        const content = m.get("content") orelse continue;
++        if (content != .array) continue;
++        for (content.array) |part| if (part.typeIs("image_url") or part.typeIs("video_url")) return true;
++    }
++    return false;
++}
++
++const media_keys = [_][]const u8{ "image", "images", "image_url", "input_image", "audio", "input_audio", "video", "video_url" };
++
++fn mediaBesides(part: Value, keep: []const u8) bool {
++    for (media_keys) |k| if (!std.mem.eql(u8, k, keep) and json.truthyField(part, k)) return true;
++    return false;
++}
++
++/// Media limits ``split_images`` checks: Flash Next's (the single-Spark recipe's patches 0008 and 0009).
++pub const MediaLimits = struct {
++    max_images: u32 = 50,
++    max_videos: u32 = 4,
++    image_bytes: usize = 10 * 1024 * 1024,
++    video_bytes: usize = 64 * 1024 * 1024,
++    max_url_chars: usize = 4096,
++    allow_urls: bool = false,
++};
++
++/// A request's messages for the template and its media in order (``split_images`` with videos on): each
++/// image_url part (user and tool messages) becomes ``{"type": "image", "detail": d}``, each video_url part (user
++/// messages) ``{"type": "video"}``; text parts stay as they are. Python's checks and messages.
++pub fn splitMedia(cx: *Cx, messages: ?Value, limits: MediaLimits, sources: *std.ArrayList(@import("vision.zig").Source)) errors.Refused!Value {
++    const list = messages orelse return cx.refuse("messages must be a non-empty list");
++    if (list != .array or list.array.len == 0) return cx.refuse("messages must be a non-empty list");
++    var out: std.ArrayList(Value) = .empty;
++    var images: u32 = 0;
++    var videos: u32 = 0;
++    for (list.array) |message| {
++        if (message != .object) return cx.refuse("each message must be an object");
++        const role = message.get("role");
++        if (!isRole(role)) return cx.refuse("invalid message role");
++        for (media_keys) |k| if (json.truthyField(message, k)) return cx.refuse("images must be image_url parts in user or tool message content");
++        const content = message.get("content");
++        if (content == null or content.? == .null or content.? == .string) {
++            try out.append(cx.a, message);
++            continue;
++        }
++        if (content.? != .array) return cx.refuse("message content must be text or an array of content parts");
++        var parts: std.ArrayList(Value) = .empty;
++        for (content.?.array) |part| {
++            if (part != .object) return cx.refuse("each content part must be an object");
++            if (part.typeIs("text")) {
++                const t = part.get("text");
++                if (t == null or t.? != .string or mediaBesides(part, "")) return cx.refuse("text parts must contain a text string without media");
++                try parts.append(cx.a, part);
++            } else if (part.typeIs("video_url")) {
++                if (!std.mem.eql(u8, role.?.string, "user")) return cx.refuse("video_url parts are supported only in user messages");
++                if (mediaBesides(part, "video_url")) return cx.refuse("video_url parts cannot contain other media");
++                if (videos >= limits.max_videos) return cx.fail(.request, "a request supports at most {d} videos; send fewer, or restart the server with --vision-max-videos N to raise the count limit", .{limits.max_videos});
++                const v = part.get("video_url");
++                const url = if (v) |x| x.strField("url") else null;
++                if (url == null or url.?.len == 0) return cx.refuse("video_url must contain a non-empty url string");
++                if (std.mem.startsWith(u8, url.?, "data:")) {
++                    if (url.?.len > limits.video_bytes * 3 / 2 + 256) return cx.refuse("video data URL exceeds the encoded byte limit");
++                } else if (!std.mem.startsWith(u8, url.?, "https://")) {
++                    return cx.refuse("videos require data URLs or public HTTPS URLs");
++                } else if (!limits.allow_urls) {
++                    return cx.refuse("video URLs are off on this server; send the video as a data URL, or start the server with --vision-urls");
++                } else if (url.?.len > limits.max_url_chars) return cx.refuse("video URL is too long");
++                try sources.append(cx.a, .{ .kind = .video, .url = url.? });
++                videos += 1;
++                const o = try json.newObject(cx.a);
++                try o.put(cx.a, "type", .{ .string = "video" });
++                try parts.append(cx.a, .{ .object = o });
++            } else if (part.typeIs("image_url")) {
++                const r = role.?.string;
++                if (!std.mem.eql(u8, r, "user") and !std.mem.eql(u8, r, "tool")) return cx.refuse("image_url parts are supported only in user and tool messages");
++                if (mediaBesides(part, "image_url")) return cx.refuse("image_url parts cannot contain other media");
++                if (images >= limits.max_images) return cx.fail(.request, "a request supports at most {d} images across the full message history, including prior turns; remove older image content, start a new conversation, or restart the server with --vision-max-images N to raise the count limit (other image limits still apply)", .{limits.max_images});
++                const v = part.get("image_url");
++                const url = if (v) |x| x.strField("url") else null;
++                if (v == null or v.? != .object or url == null or url.?.len == 0) return cx.refuse("image_url must contain a non-empty url string");
++                var detail: []const u8 = "auto";
++                if (v.?.get("detail")) |d| {
++                    const ok = d == .string and (std.mem.eql(u8, d.string, "auto") or std.mem.eql(u8, d.string, "low") or std.mem.eql(u8, d.string, "high"));
++                    if (!ok) return cx.refuse("image detail must be auto, low or high");
++                    detail = d.string;
++                }
++                if (std.mem.startsWith(u8, url.?, "data:")) {
++                    if (url.?.len > limits.image_bytes * 3 + 256) return cx.refuse("image data URL exceeds the encoded byte limit");
++                } else if (!std.mem.startsWith(u8, url.?, "https://")) {
++                    return cx.refuse("images require data URLs or public HTTPS URLs");
++                } else if (!limits.allow_urls) {
++                    return cx.refuse("image URLs are off on this server; send the image as a data URL, or start the server with --vision-urls");
++                } else if (url.?.len > limits.max_url_chars) return cx.refuse("image URL is too long");
++                try sources.append(cx.a, .{ .kind = .image, .url = url.?, .detail = detail });
++                images += 1;
++                const o = try json.newObject(cx.a);
++                try o.put(cx.a, "type", .{ .string = "image" });
++                try o.put(cx.a, "detail", .{ .string = detail });
++                try parts.append(cx.a, .{ .object = o });
++            } else return cx.refuse("content parts must be text, image_url or video_url; audio is unsupported");
++        }
++        try out.append(cx.a, .{ .object = try withField(cx, message.object, "content", .{ .array = parts.items }) });
++    }
++    return .{ .array = out.items };
++}
++
++fn isVisualPart(part: Value) bool {
++    return part.typeIs("image_url") or part.typeIs("image") or part.typeIs("video_url") or part.typeIs("video");
++}
++
+ /// ``normalize_messages`` (text only): leading system and developer text merged, later ones as ``late_system``.
+ /// A template that needs a user query gains one user turn after a trailing tool run (``needs_user_after_tool``).
+ pub fn normalize(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_after_tool: bool) errors.Refused!Value {
++    return normalizeWith(cx, messages, late_system, needs_user_after_tool, false);
++}
++
++/// ``normalize_messages``; `allow_media` (``allow_images``): a user or tool message with image or video parts
++/// keeps its parts list for the template.
++pub fn normalizeWith(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_after_tool: bool, allow_media: bool) errors.Refused!Value {
+     const list = messages orelse return cx.refuse("messages must be a non-empty list");
+     if (list != .array or list.array.len == 0) return cx.refuse("messages must be a non-empty list");
+     var out: std.ArrayList(Value) = .empty;
+@@ -35,6 +154,22 @@ pub fn normalize(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_
+         if (fields.hasMedia(message)) return cx.refuse("this server accepts text only; image, audio and video inputs are unsupported");
+         const content = message.get("content");
+         var item: *json.Object = message.object;
++        const visual = allow_media and content != null and content.? == .array and for (content.?.array) |part| {
++            if (part == .object and isVisualPart(part)) break true;
++        } else false;
++        if (visual) {
++            const r = role.?.string;
++            if (!std.mem.eql(u8, r, "user") and !std.mem.eql(u8, r, "tool")) return cx.refuse("images and videos are supported only in user and tool messages");
++            for (content.?.array) |part| {
++                if (part != .object or !(part.typeIs("text") or isVisualPart(part))) return cx.refuse("image messages may contain text and image_url (or video_url) parts only");
++                if (part.typeIs("text")) {
++                    const t = part.get("text");
++                    if (t == null or t.? != .string) return cx.refuse("a text content part must contain a text string");
++                }
++            }
++            try out.append(cx.a, message);
++            continue;
++        }
+         if (content != null and content.? == .array) {
+             var text: std.ArrayList(u8) = .empty;
+             for (content.?.array) |part| {
+@@ -223,3 +358,49 @@ test "a conversation keeps its shape when the template does not need the rule" {
+     try std.testing.expectEqualStrings("assistant", out.array[0].get("role").?.string);
+     try std.testing.expectEqualStrings("tool", out.array[1].get("role").?.string);
+ }
++
++test "split_images: image and video parts become the template's parts, the media in order" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    var cx: Cx = .{ .a = arena.allocator() };
++    const messages = (try json.parse(cx.a,
++        \\[{"role": "system", "content": "s"}, {"role": "user", "content": [{"type": "text", "text": "look"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA", "detail": "low"}}, {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,BBBB"}}]}, {"role": "assistant", "content": "", "tool_calls": [{"id": "t", "type": "function", "function": {"name": "f", "arguments": "{}"}}]}, {"role": "tool", "tool_call_id": "t", "content": [{"type": "text", "text": "shot:"}, {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,CCCC"}}]}]
++    )).ok;
++    try std.testing.expect(hasVisual(messages));
++    var sources: std.ArrayList(@import("vision.zig").Source) = .empty;
++    const template = try splitMedia(&cx, messages, .{}, &sources);
++    try std.testing.expectEqual(@as(usize, 3), sources.items.len);
++    try std.testing.expect(sources.items[0].kind == .image and std.mem.eql(u8, sources.items[0].detail, "low"));
++    try std.testing.expect(sources.items[1].kind == .video);
++    try std.testing.expect(sources.items[2].kind == .image and std.mem.eql(u8, sources.items[2].detail, "auto"));
++    const normalized = try normalizeWith(&cx, template, "system", false, true);
++    try std.testing.expectEqualStrings(
++        \\[{"role": "system", "content": "s"}, {"role": "user", "content": [{"type": "text", "text": "look"}, {"type": "image", "detail": "low"}, {"type": "video"}]}, {"role": "assistant", "content": "", "tool_calls": [{"id": "t", "type": "function", "function": {"name": "f", "arguments": "{}"}}]}, {"role": "tool", "tool_call_id": "t", "content": [{"type": "text", "text": "shot:"}, {"type": "image", "detail": "auto"}]}]
++    , try json.stringify(cx.a, normalized, .{ .ascii = false }));
++}
++
++test "split_images refuses what Python refuses" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const cases = [_][2][]const u8{
++        .{ "[{\"role\": \"assistant\", \"content\": [{\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,AA\"}}]}]", "image_url parts are supported only in user and tool messages" },
++        .{ "[{\"role\": \"tool\", \"content\": [{\"type\": \"video_url\", \"video_url\": {\"url\": \"data:video/mp4;base64,AA\"}}]}]", "video_url parts are supported only in user messages" },
++        .{ "[{\"role\": \"user\", \"content\": [{\"type\": \"image_url\", \"image_url\": {\"url\": \"http://x/y.png\"}}]}]", "images require data URLs or public HTTPS URLs" },
++        .{ "[{\"role\": \"user\", \"content\": [{\"type\": \"image_url\", \"image_url\": {\"url\": \"https://x/y.png\"}}]}]", "image URLs are off on this server; send the image as a data URL, or start the server with --vision-urls" },
++        .{ "[{\"role\": \"user\", \"content\": [{\"type\": \"image_url\", \"image_url\": {\"url\": \"data:,x\", \"detail\": \"max\"}}]}]", "image detail must be auto, low or high" },
++        .{ "[{\"role\": \"user\", \"content\": [{\"type\": \"input_audio\", \"input_audio\": {}}]}]", "content parts must be text, image_url or video_url; audio is unsupported" },
++    };
++    for (cases) |c| {
++        var cx: Cx = .{ .a = arena.allocator() };
++        var sources: std.ArrayList(@import("vision.zig").Source) = .empty;
++        const messages = (try json.parse(cx.a, c[0])).ok;
++        try std.testing.expectError(error.Refused, splitMedia(&cx, messages, .{}, &sources));
++        try std.testing.expectEqualStrings(c[1], cx.message);
++    }
++    // more than the request's images
++    var cx: Cx = .{ .a = arena.allocator() };
++    var sources: std.ArrayList(@import("vision.zig").Source) = .empty;
++    const two = (try json.parse(cx.a, "[{\"role\": \"user\", \"content\": [{\"type\": \"image_url\", \"image_url\": {\"url\": \"data:,a\"}}, {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:,b\"}}]}]")).ok;
++    try std.testing.expectError(error.Refused, splitMedia(&cx, two, .{ .max_images = 1 }, &sources));
++    try std.testing.expect(std.mem.startsWith(u8, cx.message, "a request supports at most 1 images"));
++}
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index 4a44ed291fa413b61314ba1528cf018cbaeb4f59..123b1168e28bbb4f00e7a8f15e225a5043033bb6 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -120,7 +120,11 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
+     try fields.probabilityOptions(cx, body);
+     if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
+     var input: chat.Input = .{ .fields = undefined };
+-    if (is_chat) {
++    if (is_chat and srv.vision != null and messages.hasVisual(body.get("messages"))) {
++        // image and video parts: split, rendered and prepared with the vision helper (prompt.prepareMedia)
++        input.media = body.get("messages");
++        input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
++    } else if (is_chat) {
+         input.messages = try messages.normalize(cx, body.get("messages"), "system", srv.needs_user_after_tool);
+         input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
+     } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
+diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
+index 3c743bedd7197713690d3f90a8b759108397392c..65a8a3972a3f76e2c8302f2bd22997dffdf2df3c 100644
+--- a/zig/src/server/prompt.zig
++++ b/zig/src/server/prompt.zig
+@@ -6,10 +6,13 @@ const messages_mod = @import("messages.zig");
+ const model_text = @import("model_text.zig");
+ const chat = @import("chat.zig");
+ const Server = @import("server.zig").Server;
++const api = @import("engine_api");
++const vision = @import("vision.zig");
++const log = @import("log.zig");
+ const Value = json.Value;
+ const Cx = errors.Cx;
+ 
+-pub const Rendered = struct { ids: []const u32, history_len: usize = 0 };
++pub const Rendered = struct { ids: []const u32, history_len: usize = 0, media: ?*const api.Media = null };
+ 
+ pub const isTitle = messages_mod.isTitleRequest;
+ 
+@@ -49,6 +52,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
+         } },
+         .ids => |ids| return .{ .ids = ids },
+     };
++    if (input.media) |raw| return prepareMedia(srv, cx, raw, input.tools, thinking, effort);
+     const prompt = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, true);
+     const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
+     var history_len: usize = 0;
+@@ -57,6 +61,44 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
+     return .{ .ids = prompt, .history_len = history_len };
+ }
+ 
++/// ``prepare_images``: the messages split (image_url / video_url parts as the template's image / video parts, the
++/// media in order), normalized with their parts, rendered, then the vision helper's processor and tower: Python's
++/// token ids and the media the engine takes. Such a prompt is neither kept nor resumed.
++fn prepareMedia(srv: *Server, cx: *Cx, raw: Value, tools: []const Value, thinking: bool, effort: ?[]const u8) errors.Refused!Rendered {
++    const helper = srv.vision orelse return cx.refuse("image input requires a supported vision checkpoint served with --vision");
++    if (!srv.info.media) return cx.refuse("image input requires a supported vision checkpoint served with --vision");
++    var sources: std.ArrayList(vision.Source) = .empty;
++    const template = try messages_mod.splitMedia(cx, raw, srv.media_limits, &sources);
++    if (!helper.videos) for (sources.items) |src| if (src.kind == .video) return cx.refuse("content parts must be text or image_url; audio and video are unsupported");
++    const normalized = try messages_mod.toolArguments(cx, try messages_mod.normalizeWith(cx, template, srv.late_system, srv.needs_user_after_tool, true));
++    var problem: []const u8 = "";
++    const options: model_text.RenderOptions = .{
++        .tools = if (tools.len > 0) Value{ .array = @constCast(tools) } else null,
++        .add_generation_prompt = true,
++        .enable_thinking = thinking,
++        .reasoning_effort = if (thinking) effort else null,
++    };
++    const text = srv.text.render(cx.a, normalized, options, &problem) catch |e| switch (e) {
++        error.OutOfMemory => return error.OutOfMemory,
++        error.Template => return cx.fail(.request, "the chat template rejected the request: {s}", .{problem}),
++    };
++    const window = srv.info.context_window;
++    const result = helper.prepare(cx.a, text, sources.items, if (window > 0) window else null) catch |e| switch (e) {
++        error.OutOfMemory => return error.OutOfMemory,
++        else => return cx.fail(.capacity, "image processing failed ({s}); retry shortly", .{@errorName(e)}),
++    };
++    switch (result) {
++        .refused => |r| {
++            if (r.context) return cx.fail(.context_length, "{s}", .{r.message});
++            return cx.fail(if (r.status == 503) .capacity else .request, "{s}", .{r.message});
++        },
++        .ok => |p| {
++            log.line("vision: {d} image(s), {d} video(s): {d} visual tokens of {d} prompt tokens (prepare {d:.3}s, tower {d:.3}s, helper GPU peak {d:.2} GiB, features {s})", .{ p.images, p.videos, p.visual_tokens, p.tokens.len, p.prepare_s, p.encode_s, @as(f64, @floatFromInt(p.peak)) / (1 << 30), if (p.features_sha.len >= 16) p.features_sha[0..16] else p.features_sha });
++            return .{ .ids = p.tokens, .media = p.media };
++        },
++    }
++}
++
+ /// A reusable system prefix, found with a probe in place of the first user message; zero below 512 tokens.
+ pub fn systemPrefixLen(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, prompt_ids: []const u32, thinking: bool, effort: ?[]const u8) usize {
+     if (messages != .array) return 0;
+diff --git a/zig/src/server/request_log.zig b/zig/src/server/request_log.zig
+index ea4c8b799733cb6f168a0eb2e79147753fc9ac5c..2a7c8fe1b6dd01e5d58e6d5d0b6c1351fe82d0ea 100644
+--- a/zig/src/server/request_log.zig
++++ b/zig/src/server/request_log.zig
+@@ -1,10 +1,10 @@
+-//! TENSORFOLD_REQUEST_LOG: each chat and completion body appended as one JSON line, images redacted, for replays.
++//! TENSORFOLD_REQUEST_LOG: each chat and completion body appended as one JSON line, images and videos redacted, for replays.
+ const std = @import("std");
+ const json = @import("json.zig");
+ const Value = json.Value;
+ const Allocator = std.mem.Allocator;
+ 
+-/// The body with every image part's URL replaced, the rest kept.
++/// The body with every image and video part's URL replaced, the rest kept.
+ fn redact(a: Allocator, v: Value) Allocator.Error!Value {
+     switch (v) {
+         .array => |items| {
+@@ -13,13 +13,13 @@ fn redact(a: Allocator, v: Value) Allocator.Error!Value {
+             return .{ .array = out };
+         },
+         .object => |o| {
+-            if (v.typeIs("image_url")) {
++            for ([_][]const u8{ "image_url", "video_url" }) |kind| if (v.typeIs(kind)) {
+                 const copy = try json.copyObject(a, o);
+                 const url = try json.newObject(a);
+                 try url.put(a, "url", .{ .string = "<redacted>" });
+-                try copy.put(a, "image_url", .{ .object = url });
++                try copy.put(a, kind, .{ .object = url });
+                 return .{ .object = copy };
+-            }
++            };
+             const out = try json.newObject(a);
+             for (o.keys(), o.values()) |k, item| try out.put(a, k, try redact(a, item));
+             return .{ .object = out };
+diff --git a/zig/src/server/serve.zig b/zig/src/server/serve.zig
+index 74df3d1a9519e9da8610b8762ac09ee021bea5b3..d9793a8422f1e6a588819b16761634a87caa1d95 100644
+--- a/zig/src/server/serve.zig
++++ b/zig/src/server/serve.zig
+@@ -75,6 +75,8 @@ pub const Setup = struct {
+     started: i96 = 0,
+     /// Called once the socket listens, with its port (tests read it).
+     on_listen: ?*const fn (port: u16) void = null,
++    /// --vision: the started helper (image and video prompts)
++    vision: ?*@import("vision.zig").Helper = null,
+ };
+ 
+ fn env(s: Setup, name: []const u8) ?[]const u8 {
+@@ -124,6 +126,15 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+         return 1;
+     };
+     defer srv.deinit();
++    if (s.vision) |h| {
++        if (!srv.info.media) {
++            std.debug.print("tensorfold: --vision: this engine takes no image or video rows\n", .{});
++            return 2;
++        }
++        srv.vision = h;
++        srv.media_limits = .{ .max_images = h.settings.max_images, .max_videos = h.settings.max_videos, .allow_urls = h.settings.allow_urls };
++        @import("http_body.zig").limit = 96 * 1024 * 1024;
++    }
+     if (args.loop_guard and !srv.info.loop_guard) {
+         std.debug.print("tensorfold: --loop-guard is not supported by this native engine\n", .{});
+         return 2;
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 147e118590109fd8912878adc450d91f6f6897b3..d383b628ac448c784e47cef2acd90d33fe2630f8 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -64,6 +64,9 @@ pub const Server = struct {
+     open_connections: std.atomic.Value(u32) = .init(0),
+     preparing: std.atomic.Value(i64) = .init(0),
+     arena: std.heap.ArenaAllocator,
++    /// --vision: the helper that prepares image and video prompts (null: text only)
++    vision: ?*@import("vision.zig").Helper = null,
++    media_limits: @import("messages.zig").MediaLimits = .{},
+ 
+     /// Reads what the template and tokenizer decide once: late system role, think markers, efforts, the forced close.
+     pub fn init(gpa: Allocator, io: std.Io, engine: api.Engine, text: model_text.Text, config: Config, keys: ?*auth.Store) !*Server {
+@@ -136,7 +139,15 @@ pub const Server = struct {
+                 };
+                 break :blk if (ids.len > 0) ids[0] else null;
+             } else srv.text.tokenId("<think>");
+-            request.call = .{ .opener = opener.?, .lead = form.?.lead orelse "", .tail = form.?.tail orelse "", .names = names.items, .think_open = think_open, .think_end = srv.text.tokenId(srv.markers.close) };
++            request.call = .{
++                .opener = opener.?,
++                .lead = form.?.lead orelse "",
++                .tail = form.?.tail orelse "",
++                .names = names.items,
++                .think_open = think_open,
++                .think_end = srv.text.tokenId(srv.markers.close),
++                .lex = .{ .ctx = srv, .blank = callBlank, .text = callText, .encode = callEncode },
++            };
+         }
+         if (try grammar.spec(cx, f)) |s| {
+             if (!srv.info.structures) return cx.refuse("structured output (response_format and the guided_* fields) is not supported by this engine yet");
+@@ -144,6 +155,25 @@ pub const Server = struct {
+         }
+     }
+ 
++    fn callBlank(ctx: *anyopaque, token: u32) bool {
++        const srv: *Server = @ptrCast(@alignCast(ctx));
++        for (srv.text.eosIds()) |e| if (e == token) return false;
++        var buf: [256]u8 = undefined;
++        var fba = std.heap.FixedBufferAllocator.init(&buf);
++        const text = srv.text.decode(fba.allocator(), &.{token}) catch return false;
++        return std.mem.trim(u8, text, " \t\r\n").len == 0;
++    }
++
++    fn callText(ctx: *anyopaque, a: std.mem.Allocator, token: u32) anyerror![]const u8 {
++        const srv: *Server = @ptrCast(@alignCast(ctx));
++        return srv.text.decode(a, &.{token});
++    }
++
++    fn callEncode(ctx: *anyopaque, a: std.mem.Allocator, text: []const u8) anyerror![]const u32 {
++        const srv: *Server = @ptrCast(@alignCast(ctx));
++        return srv.text.encode(a, text, false);
++    }
++
+     const Form = struct { opener: []const u8, lead: ?[]const u8, tail: ?[]const u8 };
+ 
+     /// (opener, lead, tail) of this template's tool calls, read from a rendered probe call.
+diff --git a/zig/src/server/vision.zig b/zig/src/server/vision.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..49ec1d4058767d01a30515864f709b012da8a1b5
+--- /dev/null
++++ b/zig/src/server/vision.zig
+@@ -0,0 +1,325 @@
++//! ``--vision``: image and video input through Python TensorFold's own frontend and tower, run by a helper process
++//! (``python3 -m tensorfold.vision.native_helper``, work/research/V1-vision.md). The server renders the chat template
++//! with image and video parts and sends the rendered prompt with the request's media (data URLs, or https URLs with
++//! ``--vision-urls``); the helper decodes them (Pillow, PyAV), runs the processor (resize, normalize, the expanded
++//! placeholders, the HF tokenizer, the rotary positions) and the 27-layer tower on this GPU, and answers with the
++//! prompt's token ids, the feature rows, each row's three rotary positions and the bf16 features: Python's bits. The
++//! engine moves the features into the prompt rows (``api.Media``).
++//!
++//! Frames on the helper's stdin / stdout (little endian): a request is a u32 length and its JSON; a reply is a u32
++//! header length, the header JSON, a u64 payload length and the payload (token ids u32 [n], rows u32 [k], positions
++//! i32 [n, 3], features bf16 [k, width]). One request at a time.
++const std = @import("std");
++const api = @import("engine_api");
++const json = @import("json.zig");
++const log = @import("log.zig");
++const Allocator = std.mem.Allocator;
++const Value = json.Value;
++
++/// One image or video of a request, in the order the template renders them.
++pub const Source = struct { kind: enum { image, video }, url: []const u8, detail: []const u8 = "auto" };
++
++/// What the helper made of a request: Python's token ids and the media the engine takes.
++pub const Prepared = struct {
++    tokens: []const u32,
++    media: *api.Media,
++    images: u32,
++    videos: u32,
++    visual_tokens: u32,
++    prepare_s: f64,
++    encode_s: f64,
++    features_sha: []const u8,
++    /// the helper's torch reservation peak during the request (bytes)
++    peak: u64 = 0,
++};
++
++pub const Refusal = struct { status: u16, message: []const u8, context: bool = false };
++
++pub const Result = union(enum) { ok: Prepared, refused: Refusal };
++
++pub const Settings = struct {
++    allow_urls: bool = false,
++    max_images: u32 = 50,
++    max_videos: u32 = 4,
++    image_tokens: u32 = 16384,
++};
++
++extern "c" fn read(fd: c_int, buf: [*]u8, n: usize) isize;
++extern "c" fn write(fd: c_int, buf: [*]const u8, n: usize) isize;
++extern "c" fn poll(fds: [*]std.posix.pollfd, n: c_ulong, timeout: c_int) c_int;
++extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
++extern "c" fn close(fd: c_int) c_int;
++
++/// /proc/meminfo's MemAvailable in bytes, or null.
++fn memAvailable() ?u64 {
++    const fd = open("/proc/meminfo", 0);
++    if (fd < 0) return null;
++    defer _ = close(fd);
++    var buf: [4096]u8 = undefined;
++    const got = read(fd, &buf, buf.len);
++    if (got <= 0) return null;
++    var it = std.mem.tokenizeScalar(u8, buf[0..@intCast(got)], '\n');
++    while (it.next()) |line| if (std.mem.startsWith(u8, line, "MemAvailable:")) {
++        var f = std.mem.tokenizeAny(u8, line["MemAvailable:".len..], " \t");
++        const kb = std.fmt.parseInt(u64, f.next() orelse return null, 10) catch return null;
++        return kb * 1024;
++    };
++    return null;
++}
++
++pub const Helper = struct {
++    gpa: Allocator,
++    child: std.process.Child,
++    to: c_int,
++    from: c_int,
++    io: std.Io,
++    mutex: std.Io.Mutex = .init,
++    dead: bool = false,
++    settings: Settings,
++    videos: bool = false,
++    width: u32 = 0,
++    tower_bytes: u64 = 0,
++    /// seconds a request may take (writing it, decoding, the tower, reading the answer); past it the helper is
++    /// taken as stuck: killed, and media requests refused from then on
++    timeout_s: u32 = 600,
++    /// requests waiting for the helper (each holds its body in host memory): past `max_waiting` a request is refused
++    /// at once with 503, and none waits past `wait_s` (Python's bounded image slots and 60 s wait)
++    waiting: std.atomic.Value(u32) = .init(0),
++    max_waiting: u32 = 8,
++    wait_s: u32 = 60,
++    /// the features sha of the helper's start-up self-test image (a fixed picture through the whole frontend and
++    /// tower): equal on every box running the same stack; TENSORFOLD_VISION_SELFTEST=<sha> refuses another
++    selftest: []const u8 = "",
++    /// the transaction's deadline (monotonic ns) for readAll / writeAll
++    deadline: i128 = 0,
++
++    /// Starts the helper and waits for its ready frame (the tower loaded and warm on this GPU).
++    pub fn start(gpa: Allocator, io: std.Io, dir: []const u8, settings: Settings, environ: ?*const std.process.Environ.Map, problem: *[]const u8) !*Helper {
++        const a = gpa;
++        const python = if (environ) |m| m.get("TENSORFOLD_VISION_PYTHON") orelse "python3" else "python3";
++        var argv: std.ArrayList([]const u8) = .empty;
++        defer argv.deinit(a);
++        var nums: [3][16]u8 = undefined;
++        try argv.appendSlice(a, &.{ python, "-m", "tensorfold.vision.native_helper", "--model", dir, "--max-images", try std.fmt.bufPrint(&nums[0], "{d}", .{settings.max_images}), "--image-tokens", try std.fmt.bufPrint(&nums[1], "{d}", .{settings.image_tokens}), "--max-videos", try std.fmt.bufPrint(&nums[2], "{d}", .{settings.max_videos}) });
++        if (settings.allow_urls) try argv.append(a, "--urls");
++        // TENSORFOLD_VISION_PYTHONPATH: where TensorFold's Python tree is (the image puts it beside the binary)
++        var env_copy: ?std.process.Environ.Map = null;
++        defer if (env_copy) |*m| m.deinit();
++        if (environ) |m| if (m.get("TENSORFOLD_VISION_PYTHONPATH")) |extra| {
++            env_copy = std.process.Environ.Map.init(a);
++            for (m.array_hash_map.keys(), m.array_hash_map.values()) |k, v| try env_copy.?.put(k, v);
++            const joined = if (m.get("PYTHONPATH")) |old| try std.fmt.allocPrint(a, "{s}:{s}", .{ extra, old }) else try a.dupe(u8, extra);
++            defer a.free(joined);
++            try env_copy.?.put("PYTHONPATH", joined);
++        };
++        const child = std.process.spawn(io, .{ .argv = argv.items, .stdin = .pipe, .stdout = .pipe, .stderr = .inherit, .environ_map = if (env_copy) |*m| m else environ }) catch |e| {
++            problem.* = try std.fmt.allocPrint(a, "--vision: cannot start {s} -m tensorfold.vision.native_helper ({s})", .{ python, @errorName(e) });
++            return error.VisionHelper;
++        };
++        const h = try gpa.create(Helper);
++        h.* = .{ .gpa = gpa, .io = io, .child = child, .to = child.stdin.?.handle, .from = child.stdout.?.handle, .settings = settings };
++        // loading the tower takes seconds; importing torch and transformers the first time can take a minute
++        h.timeout_s = 900;
++        h.deadline = now() + @as(i128, h.timeout_s) * std.time.ns_per_s;
++        var arena: std.heap.ArenaAllocator = .init(gpa);
++        defer arena.deinit();
++        const frame = h.readFrame(arena.allocator()) catch |e| {
++            problem.* = try std.fmt.allocPrint(a, "--vision: the helper stopped before it was ready ({s}); see its lines above", .{@errorName(e)});
++            h.stop(io);
++            return error.VisionHelper;
++        };
++        const head = frame.header;
++        if (head.get("ready") == null or head.get("ready").? != .bool or !head.get("ready").?.bool) {
++            problem.* = try std.fmt.allocPrint(a, "--vision: the helper could not load the vision tower: {s}", .{head.strField("error") orelse "unknown"});
++            h.stop(io);
++            return error.VisionHelper;
++        }
++        h.timeout_s = 600;
++        h.selftest = try gpa.dupe(u8, head.strField("selftest_sha256") orelse "");
++        if (environ) |m| if (m.get("TENSORFOLD_VISION_SELFTEST")) |want| if (want.len > 0 and !std.mem.eql(u8, want, h.selftest)) {
++            problem.* = try std.fmt.allocPrint(a, "--vision: the helper's self-test features sha {s} is not TENSORFOLD_VISION_SELFTEST {s}: another Python, torch, transformers, Pillow or PyAV stack than the reference's", .{ h.selftest, want });
++            h.stop(io);
++            return error.VisionHelper;
++        };
++        h.videos = if (head.get("videos")) |v| v == .bool and v.bool else false;
++        h.width = @intCast(if (head.get("width")) |v| v.int64() orelse 0 else 0);
++        h.tower_bytes = @intCast(if (head.get("tower_bytes")) |v| v.int64() orelse 0 else 0);
++        const versions = if (head.get("versions")) |v| json.stringify(arena.allocator(), v, .{ .compact = true }) catch "" else "";
++        log.line("vision: image{s} input on this GPU, a {d:.2} GiB tower (helper pid {d}; {s}; self-test {s})", .{ if (h.videos) " and video" else "", @as(f64, @floatFromInt(h.tower_bytes)) / (1 << 30), if (head.get("pid")) |p| p.int64() orelse 0 else 0, versions, h.selftest });
++        return h;
++    }
++
++    /// Stops the helper (killed and reaped: a stuck one cannot hold the server's exit).
++    pub fn stop(h: *Helper, io: std.Io) void {
++        h.child.kill(io);
++        if (h.selftest.len > 0) h.gpa.free(h.selftest);
++        h.gpa.destroy(h);
++    }
++
++    fn now() i128 {
++        var ts: std.posix.timespec = undefined;
++        _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
++        return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
++    }
++
++    /// Milliseconds left of the transaction (at least 1 while any is left), 0 past it.
++    fn left(h: *const Helper) c_int {
++        const ms = @divTrunc(h.deadline - now(), std.time.ns_per_ms);
++        return if (ms <= 0) 0 else @intCast(@min(ms + 1, std.math.maxInt(c_int)));
++    }
++
++    const Frame = struct { header: Value, payload: []u8 };
++
++    fn readAll(h: *Helper, buf: []u8) !void {
++        var got: usize = 0;
++        while (got < buf.len) {
++            var fds = [1]std.posix.pollfd{.{ .fd = h.from, .events = std.posix.POLL.IN, .revents = 0 }};
++            const wait = h.left();
++            if (wait == 0) return error.VisionTimeout;
++            const ready = poll(&fds, 1, wait);
++            if (ready == 0) return error.VisionTimeout;
++            if (ready < 0) {
++                if (std.posix.errno(ready) == .INTR) continue;
++                return error.VisionRead;
++            }
++            const n = read(h.from, buf[got..].ptr, buf.len - got);
++            if (n < 0) {
++                if (std.posix.errno(n) == .INTR) continue;
++                return error.VisionRead;
++            }
++            if (n == 0) return error.VisionStopped;
++            got += @intCast(n);
++        }
++    }
++
++    fn writeAll(h: *Helper, bytes: []const u8) !void {
++        var done: usize = 0;
++        while (done < bytes.len) {
++            // a helper that stops reading cannot hold the writer past the transaction's deadline
++            var fds = [1]std.posix.pollfd{.{ .fd = h.to, .events = std.posix.POLL.OUT, .revents = 0 }};
++            const wait = h.left();
++            if (wait == 0) return error.VisionTimeout;
++            const ready = poll(&fds, 1, wait);
++            if (ready == 0) return error.VisionTimeout;
++            if (ready < 0) {
++                if (std.posix.errno(ready) == .INTR) continue;
++                return error.VisionStopped;
++            }
++            if (fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP) != 0 and fds[0].revents & std.posix.POLL.OUT == 0) return error.VisionStopped;
++            const n = write(h.to, bytes[done..].ptr, @min(bytes.len - done, 1 << 16));
++            if (n < 0) {
++                if (std.posix.errno(n) == .INTR) continue;
++                return error.VisionStopped;
++            }
++            done += @intCast(n);
++        }
++    }
++
++    fn readFrame(h: *Helper, a: Allocator) !Frame {
++        var len4: [4]u8 = undefined;
++        try h.readAll(&len4);
++        const head_len = std.mem.readInt(u32, &len4, .little);
++        if (head_len > 1 << 24) return error.VisionFrame;
++        const head = try a.alloc(u8, head_len);
++        try h.readAll(head);
++        var len8: [8]u8 = undefined;
++        try h.readAll(&len8);
++        const size = std.mem.readInt(u64, &len8, .little);
++        if (size > 4 << 30) return error.VisionFrame;
++        const payload = try a.alloc(u8, @intCast(size));
++        try h.readAll(payload);
++        const parsed = try json.parse(a, head);
++        const v = switch (parsed) {
++            .ok => |x| x,
++            else => return error.VisionFrame,
++        };
++        return .{ .header = v, .payload = payload };
++    }
++
++    /// The helper's answer for one rendered prompt and its media; `a` holds the result (the request's arena).
++    pub fn prepare(h: *Helper, a: Allocator, prompt: []const u8, sources: []const Source, max_prompt_tokens: ?u32) !Result {
++        const req = try json.newObject(a);
++        try req.put(a, "prompt", .{ .string = prompt });
++        const list = try a.alloc(Value, sources.len);
++        for (sources, list) |s, *slot| {
++            const o = try json.newObject(a);
++            try o.put(a, "kind", .{ .string = if (s.kind == .image) "image" else "video" });
++            try o.put(a, "url", .{ .string = s.url });
++            try o.put(a, "detail", .{ .string = s.detail });
++            slot.* = .{ .object = o };
++        }
++        try req.put(a, "media", .{ .array = list });
++        try req.put(a, "max_prompt_tokens", if (max_prompt_tokens) |m| try json.intValue(a, m) else .null);
++        // bounded admission: a few requests wait (each holds its media in host memory), none past wait_s
++        if (h.waiting.fetchAdd(1, .acq_rel) >= h.max_waiting) {
++            _ = h.waiting.fetchSub(1, .acq_rel);
++            return .{ .refused = .{ .status = 503, .message = "image request queue is full; retry shortly" } };
++        }
++        const wait_until = now() + @as(i128, h.wait_s) * std.time.ns_per_s;
++        while (!h.mutex.tryLock()) {
++            if (now() >= wait_until) {
++                _ = h.waiting.fetchSub(1, .acq_rel);
++                return .{ .refused = .{ .status = 503, .message = "image processing capacity is busy; retry shortly" } };
++            }
++            std.Io.sleep(h.io, .fromMilliseconds(5), .awake) catch {};
++        }
++        _ = h.waiting.fetchSub(1, .acq_rel);
++        defer h.mutex.unlock(h.io);
++        if (h.dead) return .{ .refused = .{ .status = 503, .message = "the vision helper stopped; image and video requests are unavailable until the server restarts" } };
++        // the owner's floor: the request's frame and the helper's decode must leave 10 GiB MemAvailable
++        if (memAvailable()) |avail| if (avail < (10 << 30) + 4 * @as(u64, sources.len) * (1 << 20) + 2 * total_url: {
++            var t: u64 = 0;
++            for (sources) |src| t += src.url.len;
++            break :total_url t;
++        }) return .{ .refused = .{ .status = 503, .message = "not enough free memory to process the images or video now; retry shortly" } };
++        const body = try json.stringify(a, .{ .object = req }, .{ .compact = true });
++        h.deadline = now() + @as(i128, h.timeout_s) * std.time.ns_per_s;
++        var len4: [4]u8 = undefined;
++        std.mem.writeInt(u32, &len4, @intCast(body.len), .little);
++        const frame = blk: {
++            h.writeAll(&len4) catch |e| break :blk e;
++            h.writeAll(body) catch |e| break :blk e;
++            break :blk h.readFrame(a);
++        } catch |e| {
++            h.dead = true;
++            // a stuck helper is killed (it holds GPU memory and would hold the server's exit)
++            if (h.child.id) |pid| std.posix.kill(pid, std.posix.SIG.KILL) catch {};
++            log.line("vision: the helper is gone ({s}); image and video requests are refused from now on", .{@errorName(e)});
++            return .{ .refused = .{ .status = 503, .message = "the vision helper stopped; image and video requests are unavailable until the server restarts" } };
++        };
++        const head = frame.header;
++        const ok = head.get("ok");
++        if (ok == null or ok.? != .bool or !ok.?.bool) {
++            const status: u16 = @intCast(if (head.get("status")) |s| s.int64() orelse 400 else 400);
++            const code = head.strField("code");
++            return .{ .refused = .{ .status = status, .message = head.strField("error") orelse "the image or video could not be processed", .context = code != null and std.mem.eql(u8, code.?, "context_length_exceeded") } };
++        }
++        const n: usize = @intCast(head.get("tokens").?.int64() orelse return error.VisionFrame);
++        const k: usize = @intCast(head.get("rows").?.int64() orelse return error.VisionFrame);
++        const width: usize = @intCast(head.get("width").?.int64() orelse return error.VisionFrame);
++        const delta = head.get("delta").?.int64() orelse return error.VisionFrame;
++        const sizes = [_]usize{ n * 4, k * 4, n * 3 * 4, k * width * 2 };
++        var total: usize = 0;
++        for (sizes) |s| total += s;
++        if (frame.payload.len != total) return error.VisionFrame;
++        var at: usize = 0;
++        const tokens = try a.alloc(u32, n);
++        @memcpy(std.mem.sliceAsBytes(tokens), frame.payload[at..][0..sizes[0]]);
++        at += sizes[0];
++        const rows = try a.alloc(u32, k);
++        @memcpy(std.mem.sliceAsBytes(rows), frame.payload[at..][0..sizes[1]]);
++        at += sizes[1];
++        const positions = try a.alloc(i32, n * 3);
++        @memcpy(std.mem.sliceAsBytes(positions), frame.payload[at..][0..sizes[2]]);
++        at += sizes[2];
++        const media = try a.create(api.Media);
++        media.* = .{ .rows = rows, .positions = positions, .delta = delta, .features = frame.payload[at..][0..sizes[3]], .width = @intCast(width) };
++        media.check(n) catch return error.VisionFrame;
++        const count = struct {
++            fn of(v: Value, key: []const u8) u32 {
++                return @intCast(if (v.get(key)) |x| x.int64() orelse 0 else 0);
++            }
++        };
++        return .{ .ok = .{ .tokens = tokens, .media = media, .images = count.of(head, "images"), .videos = count.of(head, "videos"), .visual_tokens = count.of(head, "visual_tokens"), .prepare_s = if (head.get("prepare_s")) |x| x.float64() orelse 0 else 0, .encode_s = if (head.get("encode_s")) |x| x.float64() orelse 0 else 0, .features_sha = head.strField("features_sha256") orelse "", .peak = @intCast(@max(0, if (head.get("peak")) |x| x.int64() orelse 0 else 0)) } };
++    }
++};
