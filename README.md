@@ -520,6 +520,7 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `TF_FLASHNEXT_ADMIT_RECLAIM` | `1` | a prompt that does not fit frees kept prompt states first (a superseded one, else the least recently used; never the state the prompt resumes), and only when that makes it fit; `0` refuses it with `NoRoom` as before (patch 0029). One rank only |
 | `TF_FLASHNEXT_SUPERSEDE` | `1` | a conversation's next turn frees the kept state it resumed once it keeps a longer one, so the cache holds about one state a conversation instead of one a turn (patch 0029). `0` turns it off. One rank only |
 | `TF_FLASHNEXT_MEDIA_REUSE` | `1` | image prompts keep and resume prompt states like text ones, each image told apart by a hash of its bytes, so a conversation's next turn after a screenshot prefills only its new rows (patch 0030). Videos are not kept. `0` restores the old rule (an image prompt prefills from its start). One rank only |
+| `TENSORFOLD_DRAFT_VOCAB` | (unset) | a file of token ids for the MTP draft head instead of the built-in list (79,591 ids, English and code), as the Python engine's setting took (patch 0032). Whitespace or commas between ids, `#` to the end of a line a comment. The path is the container's: put the file under the HF cache (`$HF_CACHE`, mounted read-only at `/root/.cache/huggingface`). Drafts only change speed, never the reply. A Spanish list (the default plus 14,192 Spanish ids) took Spanish decode from 37.5 to 41.1 tok/s, English unchanged |
 | `CHECKPOINT` | `nvfp4` | `nvfp4` serves `nvidia/Qwen3.8-Flash-Next-FP4-Local`; `int4` serves azampatti's INT4-AutoRound (sets its model id and revision). `MODEL_ID` / `MODEL_REVISION` override either |
 | `MODEL_REVISION` | `b9ce18a6…` | the checkpoint commit this recipe serves (`14642741…` with `CHECKPOINT=int4`) |
 
@@ -579,13 +580,13 @@ the model was still thinking.
 
 `patches/*.patch` is the Zig Flash Next CUDA engine against TensorFold `db281878` (the `zig-flashnext` pin), applied
 with `git apply` in the checkout root. They are the engine, not speed patches on a Python package. Drafts are still
-checked: a drafted reply matches `"draft": false`. `0011` to `0015`, `0021`, `0029`, `0030` and `0031` are this recipe's own: `0011` lets the vision helper load the NVIDIA
+checked: a drafted reply matches `"draft": false`. `0011` to `0015`, `0021` and `0029` to `0032` are this recipe's own: `0011` lets the vision helper load the NVIDIA
 checkpoint's quantized tower, `0012` makes the Zig engine serve the NVIDIA FP4 checkpoint (config, CSF-compressed expert scales, MXFP8 linears, the
 NVFP4 n-gram table with read-ahead) and `0013` tunes decoding (draft depth 6, the repeat-prompt cache, burst admission). `0014` adds a shared-memory expert tile for prompt chunks (on by default, bit-identical, cold prefill +13 to 15%) and `0015` an opt-in fair prefill for mixed loads (`TF_FLASHNEXT_FILL_FAIR=1`). `0029` frees a sequence only after
 the GPU work queued on it is done (a request refused for room mid-prompt could unmap memory under queued kernels and
 kill the CUDA context with `CUDA_ERROR_ILLEGAL_ADDRESS`), and lets admission free kept prompt states before it refuses
 a prompt (`TF_FLASHNEXT_ADMIT_RECLAIM`, `TF_FLASHNEXT_SUPERSEDE`, both on).
-`0030` lets image prompts keep and resume prompt states (`TF_FLASHNEXT_MEDIA_REUSE`, on), so the next turn after a screenshot prefills only its new rows. `0021` makes `TF_FLASHNEXT_FILL=1` fill prompts that arrive together one after another instead of failing them, and `0031` adds the opt-in `TENSORFOLD_RANDOM_SEED=1` (a fresh seed for a sampled request without one).
+`0030` lets image prompts keep and resume prompt states (`TF_FLASHNEXT_MEDIA_REUSE`, on), so the next turn after a screenshot prefills only its new rows. `0021` makes `TF_FLASHNEXT_FILL=1` fill prompts that arrive together one after another instead of failing them, `0031` adds the opt-in `TENSORFOLD_RANDOM_SEED=1` (a fresh seed for a sampled request without one), and `0032` reads the draft head's list from a file (`TENSORFOLD_DRAFT_VOCAB`), for a language the built-in list covers poorly.
 
 ## Checks
 
