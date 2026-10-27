@@ -3,7 +3,7 @@
 
 Uses tokenizer.json directly: no remote code, model weights, torch or GPU needed.
 Training and holdout inputs are UTF-8 JSONL with a text field. Outputs token IDs,
-a patch baked into the language image, and a provenance/coverage report.
+and a provenance/coverage report.
 """
 from __future__ import annotations
 
@@ -111,7 +111,7 @@ def main():
         "holdout": {"documents": holdout_docs, "tokens": sum(holdout.values()),
                     "base_coverage": coverage(holdout, base), "nl_coverage": coverage(holdout, keep)},
         "split_overlap": 0,
-        "status": "Wikipedia seed vocabulary; current Zig runtime performance not measured",
+        "status": "Wikipedia seed vocabulary; runtime validation is documented separately in docs/nl-validation.md",
     }
     (args.output_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8", newline="\n")
     print(json.dumps(report, indent=2))

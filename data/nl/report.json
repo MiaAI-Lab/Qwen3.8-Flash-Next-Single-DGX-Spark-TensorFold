@@ -44,5 +44,5 @@
     "nl_coverage": 0.9947586218220206
   },
   "split_overlap": 0,
-  "status": "Wikipedia seed vocabulary; Python v0.6.1 measurements are historical, Zig runtime not benchmarked"
+  "status": "Wikipedia seed vocabulary; runtime validation is documented separately in docs/nl-validation.md"
 }

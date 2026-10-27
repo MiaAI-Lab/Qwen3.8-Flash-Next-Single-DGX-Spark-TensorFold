@@ -46,7 +46,7 @@ python tools/nl_draft_vocab.py --check
 
 - Source-only checks: 79,591 default + 5,176 added = 84,767 unique IDs, with zero overlap. Default and extension hashes equal the original [source report](../data/nl/report.json).
 - Held-out Wikipedia token coverage was 86.8968% with the default and 99.4759% with the extension. Corpus token coverage does **not** predict runtime acceptance.
-- Historical ASUS GX10 measurements on **TensorFold Python v0.6.1 with an MLX checkpoint** indicated +7.56% median long-Dutch and +8.29% median short-Dutch decode. See [historical validation](nl-validation.md). These figures do **not** establish gains in the Zig engine or current NVIDIA FP4 checkpoint.
-- PR #79's successful Spanish run is encouraging but is **not** a Dutch Zig benchmark. Dutch A/B timing, output comparisons, memory/startup cost, English/code regression and concurrent workloads need to be measured on the Zig image.
+- Historical ASUS GX10 measurements on **TensorFold Python v0.6.1 with an MLX checkpoint** indicated +7.56% median long-Dutch and +8.29% median short-Dutch decode. See [validation](nl-validation.md). These historical figures do **not** establish Zig performance.
+- A preliminary Dutch Zig A/B test on the GX10 with PR #79's patch measured paired median gains of +6.79% and +6.34% in two blocks of six prompts. Outputs matched the tested controls. See [validation and limits](nl-validation.md); long complete answers, thinking on, concurrent workloads, memory/startup costs and broader English/code controls remain unqualified.
 
 CPU checks: `python3 tools/nl_draft_vocab.py --check && python3 -m unittest discover -s tools -p 'test_nl_draft_vocab.py' -v`.
