@@ -69,6 +69,7 @@ license files from the pinned checkout.
   - `0016-decode-shared-expert-side-stream-and-lane-batched-deltanet`: MiaAI-Lab; running the shared expert on a second stream comes from the earlier
     db281878 series.
   - `0017-draft-chain-running-product-stop-rule`: MiaAI-Lab; the stop rule is the one of the earlier db281878 series, re-implemented on v1.1.4.
+  - `0018-keep-a-cold-prompt-state-inside-long-final-user-messages`: not MiaAI-Lab's. It is ashhart's TensorFold commit `3abeeff` (fixes ashhart/TensorFold#1262, shipped in TensorFold v1.1.5), backported to v1.1.4 by devopsfortunato; the one change is that the metrics block reading `info.prompt_cache_capacity` is left out, because v1.1.4 has no such field.
 - **Earlier series on TensorFold db281878** (patches 0011 to 0015, 0021 and 0029 to 0031, on `main`, retired on this branch):
   - NVIDIA FP4 support in the Zig engine (`0011` to `0015`): by MiaAI-Lab, as a port of TensorFold's Python implementation of the same formats (CSF scale
     decoding, MXFP8 linears, the NVFP4 n-gram table and its read-ahead), written by the TensorFold Contributors, to the Zig engine and its CUDA kernels.

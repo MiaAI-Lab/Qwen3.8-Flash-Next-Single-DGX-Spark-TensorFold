@@ -378,6 +378,7 @@ targeted. Drafted replies are still checked: a drafted reply matches `"draft": f
 | `0014`, `0015` | fused hyper-connection kernels, expert row tiles and MTP head pieces for prompt passes; a two-stage MX128 prompt tile |
 | `0016` | the shared expert runs on a second stream in decode rounds; a shared round takes every lane's DeltaNet rows in three launches a layer |
 | `0017` | the draft chain stops on the running product of its draft probabilities (the rule of the earlier build) |
+| `0018` | a long final user message keeps an interior prompt state, so the same document re-sent with a new question resumes instead of recomputing the whole prompt (TensorFold commit `3abeeff`, ashhart/TensorFold#1262; not by MiaAI-Lab, see [`CREDITS.md`](CREDITS.md)) |
 
 Every knob is an environment variable with its default in `scripts/config.sh`; the CHANGELOG lists them with the measured effect of each round.
 
@@ -431,6 +432,7 @@ covers this repository's scripts only.
 - **Zig CUDA serving path and CUDA family registry:** Jürgen Schmied ([jschmied](https://github.com/jschmied)), in
   [TensorFold PR #443](https://github.com/ashhart/TensorFold/pull/443)
   (commit [`59e77e8`](https://github.com/ashhart/TensorFold/commit/59e77e8f4b875ce0e863a8c896fc8e424bc539ac)).
+- **Patch 0018:** ashhart's TensorFold commit [`3abeeff`](https://github.com/ashhart/TensorFold/commit/3abeeff640e23fa94b070b7458edd24ebe136b15) ("Keep a cold prompt state inside long final user messages", fixes [TensorFold#1262](https://github.com/ashhart/TensorFold/issues/1262), shipped in TensorFold v1.1.5), backported to v1.1.4 here by devopsfortunato.
 - **The 17 patches in `patches/` (0001 to 0017):** written by MiaAI-Lab (Mia's AI Lab), MIT License. They modify
   TensorFold's own Flash Next CUDA engine (code by Ash Hart and the TensorFold contributors, under TensorFold's licenses). The list, patch by patch, with where each
   idea comes from, is in [`CREDITS.md`](CREDITS.md): the vision tower (0001, 0002), fp8 KV (0003, 0005; the format adapted from MiaAI-Lab's GLM recipe patch 0038), prompt
