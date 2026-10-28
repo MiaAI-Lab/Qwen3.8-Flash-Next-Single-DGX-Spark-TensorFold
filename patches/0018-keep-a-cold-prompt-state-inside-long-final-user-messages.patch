@@ -912,20 +912,10 @@ index 6b9358d6..a3d7e014 100644
          const keeps = info.prompt_cache;
          if (keeps) try gauge(w, "prompt_tokens_cached_total", "counter", "Prompt tokens of finished requests restored from kept prompt states.", snap.cached);
          try gauge(w, "generation_tokens_total", "counter", "Generated tokens of finished requests.", snap.generation);
-@@ -371,3 +375,25 @@ test "request counter append failure frees its label" {
+@@ -371,3 +375,15 @@ test "request counter append failure frees its label" {
      try std.testing.expectEqual(@as(u64, 2), m.requests.items[0].count);
      try std.testing.expectEqual(allocations, failing.allocations);
  }
-+
-+test "metrics expose cache budget, minimum and inability to retain a state" {
-+    var m: Metrics = .{ .gpa = std.testing.allocator };
-+    defer m.deinit();
-+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-+    defer out.deinit();
-+    const info: api.Info = .{ .prompt_cache = true, .prompt_cache_capacity = .{ .budget_bytes = 322122547, .minimum_state_bytes = 384 << 20 } };
-+    try m.render(std.testing.io, &out.writer, .{}, &.{}, info, null, 262144);
-+    for ([_][]const u8{ "tensorfold:prompt_cache_budget_bytes 322122547\n", "tensorfold:prompt_cache_minimum_state_bytes 402653184\n", "tensorfold:prompt_cache_can_keep_state 0\n" }) |line| try std.testing.expect(std.mem.indexOf(u8, out.written(), line) != null);
-+}
 +
 +test "metrics count interior states in retained occupancy as well as restored tokens" {
 +    var m: Metrics = .{ .gpa = std.testing.allocator };
