@@ -1,0 +1,1031 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b152f04..37817c1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 release notes](RELEASE-NOTES-1.0.0.md) for the native binary's supported models and migration details.
+ 
++## Unreleased
++
++- Flash Next on CUDA runs the routed NVFP4 experts of prompt chunks of 1,024 rows or more (the NVIDIA FP4 checkpoint) on shared-memory row tiles of 64 pairs, `nvfp4_experts_tile.cu`, with the decode kernel's bytes: a pair's sums run in the same order, so output does not depend on the kernel or the plan's tile. `TF_FLASHNEXT_PROMPT_EXPERT_TILE=2` (the default at one rank) takes gate/up and down, `1` gate/up only, `0` keeps the decode kernel on 16-pair items; `_CFG=pairs,gate_up,down` and `_ROWS` tune it. `tf-cuda-test nvfp4-experts-tile` compares the bytes and times a layer on a GPU. `tf-cuda-test` and `install` build again: `w4a8_tests.zig` passes the quantizer flag `Kernels.prompt` takes, and `contract_controls.cu` includes `act_round.cuh` before it uses it.
++
+ ## 1.1.4
+ 
+ - Qwen3.8-27B on CUDA has a new default prompt and decode recipe: prompts run in 4,096-row chunks with tensor-core attention and a chained delta rule, decode attention runs on tensor cores for bf16 and fp8 caches, and DFlash2 verify rounds take less time. On a GB10, cold prefill goes from 834 to 1,281 tokens/s at 2k (+54%), 612 to 1,266 at 8k (+107%), 326 to 1,165 at 32k (+258%) and 203 to 1,045 at 64k (+416%), and the decode sweep gains 1.8% to 2.2% at 1 to 8 streams. Quality equals the previous recipe's, 27 of 40 exact cases on both. The prompt arithmetic changed, so replies can differ in bits from 1.1.3; every stream still equals its run alone, a resumed prompt equals a fresh one, and a reply's tokens are always the target's picks. A query-to-KV head ratio or window the kernels do not take is refused at admission, before anything is allocated (#1079, #1080, #1168). Thanks to @BobClawblaw.
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index c28179d..fc33b40 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -56,6 +56,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "exlr8", .flags = &.{ "-O3", "--fmad=false" } }, // ours: EXLR8 lane projections, the Metal kernels' order
+     .{ .name = "exlr8_dense", .flags = &.{ "-O3", "--fmad=false" } }, // ours: EXLR8 dense matrices by row, the Metal order
+     .{ .name = "nvfp4_experts", .flags = &.{"-O3"} }, // nvfp4/experts.cu's device code, the NVFP4 expert kernels
++    .{ .name = "nvfp4_experts_tile", .flags = &.{"-O3"} }, // ours: the NVFP4 expert kernels' bits on shared-memory row tiles of 64 pairs
+     .{ .name = "rank_sum", .flags = &.{"-O3"} }, // ours: the rank-order sum of a reduce-scatter (rank_scatter.zig)
+     .{ .name = "lane_gemv", .flags = &.{"-O3"} }, // ours: qmm_group's arithmetic, a column tile's K slices in one CTA
+     .{ .name = "sample", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the Metal engine's keyed draws
+diff --git a/zig/kernels/cuda/contract_controls.cu b/zig/kernels/cuda/contract_controls.cu
+index 91b3171..86ee253 100644
+--- a/zig/kernels/cuda/contract_controls.cu
++++ b/zig/kernels/cuda/contract_controls.cu
+@@ -75,6 +75,8 @@ extern "C" __global__ void __launch_bounds__(tf_qk_round::WIDE) tf_ctl_qk_round(
+     tf_qk_round::rows(in, nw, cosv, sinv, inv, rot, pos, slot, dst, kc, vc, len, h, hk, eps, keep);
+ }
+ 
++#include "act_round.cuh"
++
+ // Gate 3: act_rows.cu's tf_softcap_rows keeping only the rounding points in `keep`; the exact check must go red.
+ extern "C" __global__ void __launch_bounds__(256) tf_ctl_softcap(const __nv_bfloat16* x, __nv_bfloat16* out, int n,
+                                                                   float cap, int keep) {
+diff --git a/zig/kernels/cuda/nvfp4_experts_tile.cu b/zig/kernels/cuda/nvfp4_experts_tile.cu
+new file mode 100644
+index 0000000..f9dd279
+--- /dev/null
++++ b/zig/kernels/cuda/nvfp4_experts_tile.cu
+@@ -0,0 +1,236 @@
++// NVFP4 prompt-chunk experts on shared-memory row tiles, the decode kernel's bits (TensorFold Contributors).
++
++#include <cuda_bf16.h>
++#include <cuda_fp8.h>
++#include <stdint.h>
++
++#include "experts.cuh"
++
++// A CTA's warps (a 32-column block each) share an item's X rows in shared memory, cp.async S - 1 K32 groups ahead.
++namespace tf_nvfp4_tile {
++
++constexpr int BLOCK4 = 36;  // uint4 a (32 columns, 32 inputs) block: 32 lanes' code words, then 4 of scales
++constexpr int XBYTES_PER_TILE = 2 * 32 * 16;  // a row tile's A fragments of one K32 group: (half, lane) 16-byte quads
++
++__device__ __forceinline__ void cp4(void* dst, const void* src) {
++  const uint32_t d = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
++  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(d), "l"(src));
++}
++
++__device__ __forceinline__ uint32_t fp4pair(uint32_t w, int s) {
++  const uint32_t v = w >> s;
++  const uint32_t t = ((v & 0x00070007u) << 6) | ((v & 0x00080008u) << 12);
++  uint32_t r;
++  asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(t), "r"(0x7E807E80u), "r"(0x80008000u));
++  return r;
++}
++
++__device__ __forceinline__ float e4m3f(uint32_t b) {
++  return __half2float(__half(__nv_cvt_fp8_to_halfraw(static_cast<__nv_fp8_storage_t>(b), __NV_E4M3)));
++}
++
++// experts.cuh's mma with a fresh +0.0 accumulator in registers of its own (the same instruction)
++__device__ __forceinline__ void mma0(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
++                                     uint32_t b1) {
++  asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
++      "{%10, %10, %10, %10};\n"
++      : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
++      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(0.0f));
++}
++
++template <int M>
++struct WStage {
++  uint4 w[M];
++  uint4 s[M];
++};
++
++// One K32 group of a warp: each weight fragment and scale serves RT row tiles; every acc gets its fmaf in (g, h) order.
++template <int M, int RT>
++__device__ __forceinline__ void scompute(float (&acc)[M][RT][NTW][4], const WStage<M>& st, const char* xs, int lane) {
++  uint4 xf[RT][2];
++#pragma unroll
++  for (int r = 0; r < RT; ++r)
++#pragma unroll
++    for (int h = 0; h < 2; ++h) xf[r][h] = *reinterpret_cast<const uint4*>(xs + (r * XBYTES_PER_TILE) + (h * 32 + lane) * 16);
++  constexpr int NF = M * 2 * NTW;
++  float pp[2][RT][4];
++  float sc[2][2];
++#pragma unroll
++  for (int f = 0; f <= NF; ++f) {
++    if (f < NF) {
++      const int m = f / (2 * NTW), h = (f / NTW) & 1, j = f % NTW;
++      const uint32_t word = comp(st.w[m], j);
++      const uint32_t b0 = fp4pair(word, 8 * h), b1 = fp4pair(word, 8 * h + 4);
++      const uint32_t sw = comp(st.s[m], 2 * h + (j >> 1));
++      const int sh = (j & 1) * 16;
++      sc[f & 1][0] = e4m3f((sw >> sh) & 0xFFu);
++      sc[f & 1][1] = e4m3f((sw >> (sh + 8)) & 0xFFu);
++#pragma unroll
++      for (int r = 0; r < RT; ++r) mma0(pp[f & 1][r], xf[r][h].x, xf[r][h].y, xf[r][h].z, xf[r][h].w, b0, b1);
++    }
++    if (f > 0) {
++      const int g = f - 1, m = g / (2 * NTW), j = g % NTW;
++#pragma unroll
++      for (int r = 0; r < RT; ++r) {
++        float(&a)[4] = acc[m][r][j];
++        a[0] = fmaf(pp[g & 1][r][0], sc[g & 1][0], a[0]);
++        a[1] = fmaf(pp[g & 1][r][1], sc[g & 1][1], a[1]);
++        a[2] = fmaf(pp[g & 1][r][2], sc[g & 1][0], a[2]);  // rows past the item's end compute garbage nobody stores
++        a[3] = fmaf(pp[g & 1][r][3], sc[g & 1][1], a[3]);
++      }
++    }
++  }
++}
++
++// Each output as the decode kernel's: p = mma(x, q) from +0.0, acc = fmaf(p, e4m3 scale, acc), then acc *= scale.
++template <int M, int EPI, int WARPS, int RT, int S>
++__device__ __forceinline__ void qchunk(char* smem, const __nv_bfloat16* __restrict__ X, int x_stride, int slots,
++                                       const uint4* blk, bool active, const float* __restrict__ scale, int e, int KG,
++                                       const int* __restrict__ members, int first, int cnt, int r0, void* out, int N,
++                                       int cb, float limit, int tid, int lane, int gq, int t, int wp) {
++  constexpr int NT = WARPS * 32, CP = (RT * 256 + NT - 1) / NT;
++  constexpr int WSLAB = M * BLOCK4 * 16, XBYTES = 4 * XBYTES_PER_TILE, STRIDE = XBYTES + WARPS * WSLAB;
++  // X words: thread -> (row, word of the K32 slice) of the RT * 16 rows, 4 bytes at a time into fragment order
++  const __nv_bfloat16* csrc[CP];
++  int cdst[CP];
++  bool cok[CP];
++#pragma unroll
++  for (int i = 0; i < CP; ++i) {
++    const int idx = tid + i * NT, rr = idx >> 4, w = idx & 15;
++    cok[i] = idx < RT * 256 && r0 + rr < cnt;
++    const int pr = cok[i] ? __ldg(members + first + r0 + rr) : 0;
++    csrc[i] = X + (size_t)(slots ? pr / slots : pr) * x_stride + 2 * w;
++    const int lane2 = (rr & 7) * 4 + ((w & 7) >> 1);
++    cdst[i] = (rr >> 4) * XBYTES_PER_TILE + ((w >> 3) * 32 + lane2) * 16 + ((w & 1) * 2 + ((rr >> 3) & 1)) * 4;
++  }
++  auto stage = [&](int g, int slot) {
++    char* base = smem + slot * STRIDE;
++#pragma unroll
++    for (int i = 0; i < CP; ++i)
++      if (cok[i]) cp4(base + cdst[i], csrc[i] + g * 32);
++    if (active) {
++      const uint4* src = blk + (size_t)g * (M * BLOCK4);
++      char* dst = base + XBYTES + wp * WSLAB;
++#pragma unroll
++      for (int m = 0; m < M; ++m) {
++        cp16(dst + (m * BLOCK4 + lane) * 16, src + m * BLOCK4 + lane);
++        if (lane < 4) cp16(dst + (m * BLOCK4 + 32 + lane) * 16, src + m * BLOCK4 + 32 + lane);
++      }
++    }
++  };
++  bool v0[RT], v1[RT];
++  int pr0[RT], pr1[RT];
++#pragma unroll
++  for (int r = 0; r < RT; ++r) {
++    const int b = r0 + 16 * r;
++    v0[r] = b + gq < cnt;
++    v1[r] = b + gq + 8 < cnt;
++    pr0[r] = v0[r] ? __ldg(members + first + b + gq) : 0;
++    pr1[r] = v1[r] ? __ldg(members + first + b + gq + 8) : 0;
++  }
++  float acc[M][RT][NTW][4];
++#pragma unroll
++  for (int m = 0; m < M; ++m)
++#pragma unroll
++    for (int r = 0; r < RT; ++r)
++#pragma unroll
++      for (int j = 0; j < NTW; ++j) acc[m][r][j][0] = acc[m][r][j][1] = acc[m][r][j][2] = acc[m][r][j][3] = 0.f;
++#pragma unroll
++  for (int s = 0; s < S - 1; ++s) {
++    if (s < KG) stage(s, s);
++    cp_commit();
++  }
++  for (int g = 0; g < KG; ++g) {
++    cp_wait<S - 2>();
++    __syncthreads();
++    if (g + S - 1 < KG) stage(g + S - 1, (g + S - 1) % S);
++    cp_commit();
++    if (active) {
++      const char* base = smem + (g % S) * STRIDE;
++      const char* wsm = base + XBYTES + wp * WSLAB;
++      WStage<M> st;
++#pragma unroll
++      for (int m = 0; m < M; ++m) {
++        st.w[m] = *reinterpret_cast<const uint4*>(wsm + (m * BLOCK4 + lane) * 16);
++        st.s[m] = *reinterpret_cast<const uint4*>(wsm + (m * BLOCK4 + 32 + t) * 16);
++      }
++      scompute<M, RT>(acc, st, base, lane);
++    }
++  }
++  cp_wait<0>();
++  __syncthreads();
++  if (!active) return;
++#pragma unroll
++  for (int m = 0; m < M; ++m) {
++    const float gs = __ldg(scale + e * M + m);
++#pragma unroll
++    for (int r = 0; r < RT; ++r)
++#pragma unroll
++      for (int j = 0; j < NTW; ++j)
++#pragma unroll
++        for (int q = 0; q < 4; ++q) acc[m][r][j][q] *= gs;
++  }
++#pragma unroll
++  for (int r = 0; r < RT; ++r) epilogue<EPI, M, RT>(acc, r, out, N, cb * COLS + 2 * t, pr0[r], pr1[r], v0[r], v1[r], limit);
++}
++
++// RTMAX: row tiles of 16 pairs a pass (an item's tail takes fewer: 3, 2, 1)
++template <int M, int EPI, int WARPS, int RTMAX, int S>
++__device__ __forceinline__ void tile_body(const __nv_bfloat16* __restrict__ X, int x_stride, int slots,
++                                          const uint4* __restrict__ W, const float* __restrict__ scale, int KG, int NB,
++                                          const int* __restrict__ items, const int* __restrict__ counts,
++                                          const int* __restrict__ members, void* __restrict__ out, int N, float limit,
++                                          int skip) {
++  extern __shared__ __align__(16) char smem[];
++  const int tid = threadIdx.x, lane = tid & 31, gq = lane >> 2, t = lane & 3, wp = tid >> 5;
++  const int groups = (NB + WARPS - 1) / WARPS;
++  const int units = __ldg(counts) * groups;
++  for (int unit = blockIdx.x; unit < units; unit += gridDim.x) {
++    const int it = unit / groups, cg = unit - it * groups;
++    const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
++    if (e == skip) continue;
++    const int cb = cg * WARPS + wp;
++    const bool active = cb < NB;
++    const uint4* blk = W + ((size_t)e * NB + (active ? cb : 0)) * (size_t)KG * (M * BLOCK4);
++    for (int r0 = 0; r0 < cnt;) {
++      const int rt = (cnt - r0 + 15) >> 4;
++      if (RTMAX >= 4 && rt >= 4) {
++        if constexpr (RTMAX >= 4)
++          qchunk<M, EPI, WARPS, 4, S>(smem, X, x_stride, slots, blk, active, scale, e, KG, members, first, cnt, r0, out, N, cb, limit, tid, lane, gq, t, wp);
++        r0 += 64;
++      } else if (RTMAX >= 3 && rt == 3) {
++        if constexpr (RTMAX >= 3)
++          qchunk<M, EPI, WARPS, 3, S>(smem, X, x_stride, slots, blk, active, scale, e, KG, members, first, cnt, r0, out, N, cb, limit, tid, lane, gq, t, wp);
++        r0 += 48;
++      } else if (RTMAX >= 2 && rt >= 2) {
++        if constexpr (RTMAX >= 2)
++          qchunk<M, EPI, WARPS, 2, S>(smem, X, x_stride, slots, blk, active, scale, e, KG, members, first, cnt, r0, out, N, cb, limit, tid, lane, gq, t, wp);
++        r0 += 32;
++      } else {
++        qchunk<M, EPI, WARPS, 1, S>(smem, X, x_stride, slots, blk, active, scale, e, KG, members, first, cnt, r0, out, N, cb, limit, tid, lane, gq, t, wp);
++        r0 += 16;
++      }
++    }
++  }
++}
++
++}  // namespace tf_nvfp4_tile
++
++// 4 warps a CTA, S * (4 * 1024 + 4 * M * 576) dynamic shared bytes; names tf_nvfp4_tile_<gu|f32>_rt<RTMAX>_s<S>.
++#define TF_NVFP4_TILE(NAME, M, EPI, RT, S)                                                                         \
++  extern "C" __global__ void __launch_bounds__(128)                                                              \
++      NAME(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,             \
++           const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,                        \
++           const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,         \
++           float limit, int skip) {                                                                              \
++    tf_nvfp4_tile::tile_body<M, EPI, 4, RT, S>(X, x_stride, slots, W, scale, KG, NB, items, counts, members,      \
++                                               out, N, limit, skip);                                             \
++  }
++TF_NVFP4_TILE(tf_nvfp4_tile_gu_rt4_s3, 2, 2, 4, 3)
++TF_NVFP4_TILE(tf_nvfp4_tile_gu_rt4_s4, 2, 2, 4, 4)
++TF_NVFP4_TILE(tf_nvfp4_tile_gu_rt2_s3, 2, 2, 2, 3)
++TF_NVFP4_TILE(tf_nvfp4_tile_gu_rt2_s4, 2, 2, 2, 4)
++TF_NVFP4_TILE(tf_nvfp4_tile_gu_rt3_s3, 2, 2, 3, 3)
++TF_NVFP4_TILE(tf_nvfp4_tile_f32_rt4_s3, 1, 0, 4, 3)
++TF_NVFP4_TILE(tf_nvfp4_tile_f32_rt4_s4, 1, 0, 4, 4)
++TF_NVFP4_TILE(tf_nvfp4_tile_f32_rt2_s3, 1, 0, 2, 3)
+diff --git a/zig/src/cuda/kernels.zig b/zig/src/cuda/kernels.zig
+index 842f84e..6839276 100644
+--- a/zig/src/cuda/kernels.zig
++++ b/zig/src/cuda/kernels.zig
+@@ -41,6 +41,7 @@ pub const fp8_experts: []const u8 = if (available) &Blob("fatbin_fp8_experts").b
+ pub const exlr8: []const u8 = if (available) &Blob("fatbin_exlr8").bytes else &.{};
+ pub const exlr8_dense: []const u8 = if (available) &Blob("fatbin_exlr8_dense").bytes else &.{};
+ pub const nvfp4_experts: []const u8 = if (available) &Blob("fatbin_nvfp4_experts").bytes else &.{};
++pub const nvfp4_experts_tile: []const u8 = if (available) &Blob("fatbin_nvfp4_experts_tile").bytes else &.{};
+ pub const rank_sum: []const u8 = if (available) &Blob("fatbin_rank_sum").bytes else &.{};
+ pub const sample: []const u8 = if (available) &Blob("fatbin_sample").bytes else &.{};
+ pub const train: []const u8 = if (available) &Blob("fatbin_train").bytes else &.{};
+diff --git a/zig/src/cuda/nvfp4_tile.zig b/zig/src/cuda/nvfp4_tile.zig
+new file mode 100644
+index 0000000..c95e498
+--- /dev/null
++++ b/zig/src/cuda/nvfp4_tile.zig
+@@ -0,0 +1,233 @@
++//! Routed NVFP4 experts of a prompt chunk on shared-memory row tiles (nvfp4_experts_tile.cu), the decode kernel's bits.
++const std = @import("std");
++const driver = @import("driver.zig");
++const module = @import("module.zig");
++const launch_ = @import("launch.zig");
++const stream_ = @import("stream.zig");
++const kernels = @import("kernels.zig");
++const grouped = @import("grouped.zig");
++const experts = @import("experts.zig");
++
++const Driver = driver.Driver;
++const Module = module.Module;
++const Function = module.Function;
++const Stream = stream_.Stream;
++const Plan = grouped.Plan;
++
++/// Threads a CTA: four warps, one 32-column block each.
++const threads: u32 = 128;
++
++/// Bytes of X fragments a stage holds (four row tiles of 16 pairs, one K32 group) and of one matrix's weight block.
++const x_stage: u32 = 4 * 1024;
++const weight_block: u32 = 4 * 576;
++
++/// One kernel instance: its name, matrices a block (2: gate and up, 1: down) and cp.async stages.
++const Variant = struct { name: [:0]const u8, parts: u32, stages: u32 };
++
++/// Gate/up: row tiles a pass (rt) and stages (s), by index.
++const gate_up = [_]Variant{
++    .{ .name = "tf_nvfp4_tile_gu_rt4_s3", .parts = 2, .stages = 3 },
++    .{ .name = "tf_nvfp4_tile_gu_rt4_s4", .parts = 2, .stages = 4 },
++    .{ .name = "tf_nvfp4_tile_gu_rt2_s3", .parts = 2, .stages = 3 },
++    .{ .name = "tf_nvfp4_tile_gu_rt2_s4", .parts = 2, .stages = 4 },
++    .{ .name = "tf_nvfp4_tile_gu_rt3_s3", .parts = 2, .stages = 3 },
++};
++
++/// Down to fp32.
++const down_f32 = [_]Variant{
++    .{ .name = "tf_nvfp4_tile_f32_rt4_s3", .parts = 1, .stages = 3 },
++    .{ .name = "tf_nvfp4_tile_f32_rt4_s4", .parts = 1, .stages = 4 },
++    .{ .name = "tf_nvfp4_tile_f32_rt2_s3", .parts = 1, .stages = 3 },
++};
++
++/// The dynamic shared bytes of an instance: S x (4 row tiles of X, then 4 warps' weight blocks).
++fn sharedBytes(v: Variant) u32 {
++    return v.stages * (x_stage + weight_block * v.parts);
++}
++
++/// Which of a prompt chunk's expert launches take the tile kernel.
++pub const Mode = enum { off, gate_up, both };
++
++pub const Config = struct {
++    mode: Mode = .both,
++    /// Pairs an item of the plan holds (the plan is routed with this tile).
++    pairs: usize = 64,
++    /// The instances of gate/up and of down.
++    gu: usize = 1,
++    down: usize = 2,
++    /// Chunks of fewer rows keep the decode kernel on 16-pair items.
++    min_rows: usize = 1024,
++    /// Set when the mode was given explicitly: it then holds at any rank count, else only at one rank.
++    any_world: bool = false,
++
++    /// The TF_FLASHNEXT_PROMPT_EXPERT_TILE settings: mode (0 off, 1 gate/up, 2 both), _CFG "pairs,gu,down", _ROWS.
++    pub fn parse(mode: ?[]const u8, cfg: ?[]const u8, rows: ?[]const u8) !Config {
++        var c: Config = .{};
++        if (mode) |m| {
++            c.any_world = true;
++            c.mode = if (std.mem.eql(u8, m, "0")) .off else if (std.mem.eql(u8, m, "1")) .gate_up else if (std.mem.eql(u8, m, "2")) .both else return error.BadExpertTile;
++        }
++        if (cfg) |text| {
++            var it = std.mem.splitScalar(u8, text, ',');
++            var v: [3]usize = undefined;
++            for (&v) |*o| o.* = std.fmt.parseInt(usize, it.next() orelse return error.BadExpertTile, 10) catch return error.BadExpertTile;
++            if (it.next() != null) return error.BadExpertTile;
++            if (v[0] < 16 or v[0] > 1024 or v[0] % 16 != 0 or v[1] >= gate_up.len or v[2] >= down_f32.len) return error.BadExpertTile;
++            c.pairs = v[0];
++            c.gu = v[1];
++            c.down = v[2];
++        }
++        if (rows) |text| {
++            c.min_rows = std.fmt.parseInt(usize, text, 10) catch return error.BadExpertTile;
++            if (c.min_rows == 0) return error.BadExpertTile;
++        }
++        return c;
++    }
++
++    pub fn fromEnv() !Config {
++        const get = struct {
++            fn f(name: [*:0]const u8) ?[]const u8 {
++                return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
++            }
++        }.f;
++        return parse(get("TF_FLASHNEXT_PROMPT_EXPERT_TILE"), get("TF_FLASHNEXT_PROMPT_EXPERT_TILE_CFG"), get("TF_FLASHNEXT_PROMPT_EXPERT_TILE_ROWS"));
++    }
++
++    /// Gate/up of a chunk of `rows` rows on a rank group of `world` takes the tile kernel.
++    pub fn applies(c: Config, rows: usize, world: usize) bool {
++        return c.mode != .off and rows >= c.min_rows and (world == 1 or c.any_world);
++    }
++
++    /// Down of such a chunk does too.
++    pub fn appliesDown(c: Config, rows: usize, world: usize) bool {
++        return c.mode == .both and c.applies(rows, world);
++    }
++};
++
++pub const Tile = struct {
++    mod: Module,
++    gu: [gate_up.len]Fn,
++    down: [down_f32.len]Fn,
++    cfg: Config,
++    sms: usize,
++
++    /// An instance and its resident CTAs an SM (at least 1) at its shared bytes.
++    const Fn = struct { f: Function, per_sm: usize, shared: u32 };
++
++    fn open(mod: Module, v: Variant) !Fn {
++        const f = try mod.function(v.name);
++        const shared = sharedBytes(v);
++        return .{ .f = f, .per_sm = @max(1, try f.occupancy(threads, shared)), .shared = shared };
++    }
++
++    pub fn load(d: *const Driver, sms: usize, cfg: Config) !Tile {
++        if (!kernels.available) return error.BuiltWithoutKernels;
++        var mod = try Module.load(d, kernels.nvfp4_experts_tile);
++        errdefer mod.unload();
++        var t: Tile = .{ .mod = mod, .gu = undefined, .down = undefined, .cfg = cfg, .sms = sms };
++        for (&t.gu, gate_up) |*f, v| f.* = try open(mod, v);
++        for (&t.down, down_f32) |*f, v| f.* = try open(mod, v);
++        return t;
++    }
++
++    pub fn unload(t: *Tile) void {
++        t.mod.unload();
++    }
++
++    /// CTAs a launch of `items` plan items on `nb` column blocks gets: a unit is an item and 4 column blocks.
++    fn gridSize(items: usize, nb: usize, f: Fn, sms: usize) usize {
++        return @min(items * ((nb + 3) / 4), f.per_sm * sms);
++    }
++
++    /// Nvfp4Experts.run on a plan routed at `cfg.pairs` pairs an item (`items`: grouped.maxItems at that tile).
++    pub fn run(t: *const Tile, s: Stream, epi: experts.Epi, in: experts.Rows, l: experts.Layer, p: Plan, out: u64, items: usize, skip: i32) !void {
++        if (l.format != .nvfp4) return error.FormatMismatch;
++        if (epi == .down_bf16) return error.EpilogueNotBuilt;
++        if (l.relu2) return error.OptionNotBuilt;
++        const up = epi == .up;
++        const kg = (if (up) l.dims else l.width) / 32;
++        const nb = (if (up) l.width else l.dims) / experts.Nvfp4Experts.cols;
++        const f = if (up) t.gu[t.cfg.gu] else t.down[t.cfg.down];
++        const grid = gridSize(items, nb, f, t.sms);
++        if (grid < 1) return;
++        var a: launch_.Args = .{};
++        a.add(in.x);
++        a.add(@as(i32, @intCast(in.stride)));
++        a.add(@as(i32, @intCast(if (up) in.slots else 0)));
++        a.add(if (up) l.up else l.down);
++        a.add(if (up) l.up_scale else l.down_scale);
++        a.add(@as(i32, @intCast(kg)));
++        a.add(@as(i32, @intCast(nb)));
++        for ([_]u64{ p.items, p.counts, p.members, out }) |v| a.add(v);
++        a.add(@as(i32, @intCast(if (up) l.width else l.dims)));
++        a.add(if (up) l.limit else @as(f32, 0.0));
++        a.add(skip);
++        try launch_.launch(f.f, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = threads, .y = 1, .z = 1 }, .shared = f.shared }, s, &a);
++    }
++};
++
++test "the mode and its tuning knobs parse strictly" {
++    const c = try Config.parse(null, null, null);
++    try std.testing.expect(c.mode == .both and !c.any_world and c.pairs == 64 and c.gu == 1 and c.down == 2 and c.min_rows == 1024);
++    try std.testing.expect((try Config.parse("0", null, null)).mode == .off);
++    try std.testing.expect((try Config.parse("1", null, null)).mode == .gate_up);
++    const two = try Config.parse("2", null, null);
++    try std.testing.expect(two.mode == .both and two.any_world);
++    for ([_][]const u8{ "", "3", "on", "02", "-1" }) |bad| try std.testing.expectError(error.BadExpertTile, Config.parse(bad, null, null));
++    const t = try Config.parse(null, "32,0,1", "2048");
++    try std.testing.expect(t.pairs == 32 and t.gu == 0 and t.down == 1 and t.min_rows == 2048);
++    for ([_][]const u8{ "", "64", "64,1", "64,1,2,3", "8,1,2", "24,1,2", "2048,1,2", "64,5,2", "64,1,3", "64,x,2", "64,1,-2" }) |bad| try std.testing.expectError(error.BadExpertTile, Config.parse(null, bad, null));
++    for ([_][]const u8{ "", "0", "1k", "-1" }) |bad| try std.testing.expectError(error.BadExpertTile, Config.parse(null, null, bad));
++}
++
++test "a chunk takes the tile from min_rows, down only in mode 2, two ranks only when the mode was given" {
++    const c: Config = .{};
++    try std.testing.expect(!c.applies(1023, 1) and c.applies(1024, 1) and c.applies(1536, 1));
++    try std.testing.expect(c.appliesDown(1536, 1) and !c.appliesDown(1023, 1));
++    try std.testing.expect(!c.applies(1536, 2) and !c.appliesDown(1536, 2));
++    const gu = try Config.parse("1", null, null);
++    try std.testing.expect(gu.applies(1536, 2) and !gu.appliesDown(1536, 2));
++    const two = try Config.parse("2", null, "2048");
++    try std.testing.expect(two.appliesDown(2048, 2) and !two.applies(2047, 2));
++    try std.testing.expect(!(try Config.parse("0", null, null)).applies(4096, 1));
++}
++
++test "every instance fits the 48 KiB a launch may use without an opt-in, and keeps the shared bytes the kernel indexes" {
++    for (gate_up ++ down_f32) |v| try std.testing.expect(sharedBytes(v) <= 48 * 1024);
++    try std.testing.expectEqual(@as(u32, 4 * (4096 + 2 * 2304)), sharedBytes(gate_up[1]));
++    try std.testing.expectEqual(@as(u32, 3 * (4096 + 2304)), sharedBytes(down_f32[2]));
++    // the names carry the instance's matrices and stages: gu = 2 matrices, f32 = 1; "_s<stages>" last
++    for (gate_up) |v| try std.testing.expect(v.parts == 2 and std.mem.indexOf(u8, v.name, "_gu_") != null and v.name[v.name.len - 1] == '0' + @as(u8, @intCast(v.stages)));
++    for (down_f32) |v| try std.testing.expect(v.parts == 1 and std.mem.indexOf(u8, v.name, "_f32_") != null and v.name[v.name.len - 1] == '0' + @as(u8, @intCast(v.stages)));
++}
++
++test "the grid covers a unit of four column blocks an item and caps at the resident CTAs" {
++    const f: Tile.Fn = .{ .f = undefined, .per_sm = 2, .shared = 0 };
++    try std.testing.expectEqual(@as(usize, 5 * 5), Tile.gridSize(5, 20, f, 48)); // gate/up: 640 / 32 = 20 blocks, 5 units an item
++    try std.testing.expectEqual(@as(usize, 96), Tile.gridSize(1000, 80, f, 48)); // down: capped at 2 x 48
++    try std.testing.expectEqual(@as(usize, 3), Tile.gridSize(1, 9, f, 48)); // a partial last group of warps
++    try std.testing.expectEqual(@as(usize, 0), Tile.gridSize(0, 20, f, 48));
++}
++
++test "a plan at 64 pairs an item fits the scratch the 16-pair plan sized" {
++    for ([_]usize{ 1, 11, 129 * 11, 1536 * 11, 16384 * 11 }) |pairs| {
++        const cap = (pairs + 15) / 16 + 513;
++        try std.testing.expect(grouped.maxItems(pairs, 513, 64) <= cap);
++        try std.testing.expect(grouped.maxItems(pairs, 513, 1024) <= cap);
++    }
++}
++
++test "rows the kernel does not build are refused before any launch" {
++    const t: Tile = undefined; // never reached: the refusal comes first
++    const s: Stream = undefined;
++    const p: Plan = .{ .members = 0, .items = 0, .counts = 0, .rank = 0, .hist = 0 };
++    const in: experts.Rows = .{ .x = 0, .stride = 64 };
++    const l: experts.Layer = .{ .format = .nvfp4, .up = 0, .down = 0, .width = 64, .dims = 64, .experts = 2 };
++    try std.testing.expectError(error.EpilogueNotBuilt, t.run(s, .down_bf16, in, l, p, 0, 1, -1));
++    var relu = l;
++    relu.relu2 = true;
++    try std.testing.expectError(error.OptionNotBuilt, t.run(s, .up, in, relu, p, 0, 1, -1));
++    var other = l;
++    other.format = .fp8g;
++    try std.testing.expectError(error.FormatMismatch, t.run(s, .up, in, other, p, 0, 1, -1));
++}
+diff --git a/zig/src/cuda/root.zig b/zig/src/cuda/root.zig
+index 6a42325..53531f0 100644
+--- a/zig/src/cuda/root.zig
++++ b/zig/src/cuda/root.zig
+@@ -48,6 +48,7 @@ pub const act_rows = @import("act_rows.zig");
+ pub const gdn_prep = @import("gdn_prep.zig");
+ pub const qk_rows = @import("qk_rows.zig");
+ pub const experts = @import("experts.zig");
++pub const nvfp4_tile = @import("nvfp4_tile.zig");
+ pub const sample = @import("sample.zig");
+ pub const rank_scatter = @import("rank_scatter.zig");
+ pub const relay_plan = @import("relay_plan.zig");
+@@ -91,6 +92,7 @@ test {
+     _ = @import("qk_rows.zig");
+     _ = @import("exl3_candidate.zig");
+     _ = @import("experts.zig");
++    _ = nvfp4_tile;
+     _ = @import("sample.zig");
+     _ = @import("roce.zig");
+     _ = @import("roce_nap.zig");
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index faf4f48..eca281c 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -448,12 +448,8 @@ pub fn Pass(comptime Tri: type) type {
+             const e = experts_n + 1;
+             const plan: cuda.grouped.Plan = .{ .members = s.members, .items = s.items, .counts = s.counts, .rank = s.rank, .hist = s.hist };
+             if (lw.native_experts) |*native| {
+-                const owned = &native.experts;
+                 try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, pairs * dims * 4, self.stream.handle), "cuMemsetD8Async");
+-                try self.k.router.route(self.stream, s.picks, pairs, e, 16, plan);
+-                const items = cuda.grouped.maxItems(pairs, e, 16);
+-                try self.k.nvfp4.run(self.stream, .up, .{ .x = s.mixed, .stride = dims, .slots = slots }, owned.view(), plan, s.moe_act, items, experts_n);
+-                try self.k.nvfp4.run(self.stream, .down_f32, .{ .x = s.moe_act, .stride = owned.width }, owned.view(), plan, s.y, items, experts_n);
++                try @import("cuda_batch_moe.zig").nativeRouted(self, native, plan);
+                 if (native.rank == 0) {
+                     const glue = self.tri.own orelse return error.NativeGlueRequired;
+                     try self.k.native_lane.matmul(self.stream, s.mixed, dims, n, native.shared[0].native.?, s.shared_gate, s.native_part);
+diff --git a/zig/src/families/flashnext/cuda_batch_moe.zig b/zig/src/families/flashnext/cuda_batch_moe.zig
+index a595380..82355b8 100644
+--- a/zig/src/families/flashnext/cuda_batch_moe.zig
++++ b/zig/src/families/flashnext/cuda_batch_moe.zig
+@@ -5,6 +5,7 @@ const batch = @import("cuda_batch.zig");
+ const LayerKeep = batch.LayerKeep;
+ const dims = wt.dims;
+ const slots = wt.slots;
++const experts_n = wt.experts_n;
+ 
+ /// After a layer's experts, when something adds to or keeps its output: the slots' fp32 sum, adds, kept branch.
+ pub fn moeAdds(self: anytype, layer: usize, keep: LayerKeep) !void {
+@@ -23,3 +24,24 @@ pub fn moeAdds(self: anytype, layer: usize, keep: LayerKeep) !void {
+     if (keep.moe_branch != 0) try self.sumSlices(s.moe_f32, keep.moe_branch, true, n * dims, 1);
+     self.pending_f32 = true;
+ }
++
++/// The native NVFP4 experts of the rows into s.y: prompt chunks on the shared-memory tile, else the decode kernel.
++pub fn nativeRouted(self: anytype, native: anytype, plan: cuda.grouped.Plan) !void {
++    const s = self.s;
++    const n = self.rows;
++    const pairs = n * slots;
++    const e = experts_n + 1;
++    const layer = native.experts.view();
++    const up_in: cuda.experts.Rows = .{ .x = s.mixed, .stride = dims, .slots = slots };
++    const down_in: cuda.experts.Rows = .{ .x = s.moe_act, .stride = layer.width };
++    const gu = if (self.k.expert_tile) |*t| (if (t.cfg.applies(n, native.world)) t else null) else null;
++    const dn = if (self.k.expert_tile) |*t| (if (t.cfg.appliesDown(n, native.world)) t else null) else null;
++    const gu_pairs: usize = if (gu) |t| t.cfg.pairs else 16;
++    try self.k.router.route(self.stream, s.picks, pairs, e, gu_pairs, plan);
++    const gu_items = cuda.grouped.maxItems(pairs, e, gu_pairs);
++    if (gu) |t| try t.run(self.stream, .up, up_in, layer, plan, s.moe_act, gu_items, experts_n) else try self.k.nvfp4.run(self.stream, .up, up_in, layer, plan, s.moe_act, gu_items, experts_n);
++    const dn_pairs: usize = if (dn) |t| t.cfg.pairs else 16;
++    if (dn_pairs != gu_pairs) try self.k.router.route(self.stream, s.picks, pairs, e, dn_pairs, plan);
++    const dn_items = cuda.grouped.maxItems(pairs, e, dn_pairs);
++    if (dn) |t| try t.run(self.stream, .down_f32, down_in, layer, plan, s.y, dn_items, experts_n) else try self.k.nvfp4.run(self.stream, .down_f32, down_in, layer, plan, s.y, dn_items, experts_n);
++}
+diff --git a/zig/src/families/flashnext/cuda_batch_state.zig b/zig/src/families/flashnext/cuda_batch_state.zig
+index 078cb46..1b17a8b 100644
+--- a/zig/src/families/flashnext/cuda_batch_state.zig
++++ b/zig/src/families/flashnext/cuda_batch_state.zig
+@@ -155,6 +155,8 @@ pub const Kernels = struct {
+     tiles: tk.TileKernels,
+     native_lane: cuda.qmmf.Lane,
+     nvfp4: cuda.experts.Nvfp4Experts,
++    /// Prompt chunks' routed NVFP4 experts on shared-memory row tiles, the decode kernel's bits; null: not taken.
++    expert_tile: ?cuda.nvfp4_tile.Tile,
+     front: cuda.Function,
+     chain: cuda.Function,
+     chain_to: cuda.Function,
+@@ -169,7 +171,7 @@ pub const Kernels = struct {
+     /// Each sparse row's top blocks (attention._select / _select_tiles), native.
+     select: cuda.Function,
+ 
+-    pub fn load(d: *const cuda.Driver) !Kernels {
++    pub fn load(d: *const cuda.Driver, tile_cfg: cuda.nvfp4_tile.Config) !Kernels {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+         var k: Kernels = undefined;
+         k.qmm = try cuda.Module.load(d, cuda.kernels.qmm);
+@@ -194,6 +196,9 @@ pub const Kernels = struct {
+         try d.check(d.api.cuDeviceGetAttribute(&sms, .multiprocessor_count, device), "cuDeviceGetAttribute");
+         k.nvfp4 = try cuda.experts.Nvfp4Experts.load(d, @intCast(sms));
+         errdefer k.nvfp4.unload();
++        k.expert_tile = if (tile_cfg.mode == .off) null else try cuda.nvfp4_tile.Tile.load(d, @intCast(sms), tile_cfg);
++        errdefer if (k.expert_tile) |*t| t.unload();
++        std.log.info("flashnext: prompt experts on shared-memory row tiles: {s}, {d} pairs an item, from {d} rows", .{ @tagName(tile_cfg.mode), tile_cfg.pairs, tile_cfg.min_rows });
+         k.sum = try k.batch.function("fn_sum_slices");
+         k.moe_sum = try k.batch.function("fn_moe_sum");
+         k.copy_cols = try k.batch.function("fn_copy_cols");
+@@ -211,6 +216,7 @@ pub const Kernels = struct {
+     }
+ 
+     pub fn deinit(k: *Kernels) void {
++        if (k.expert_tile) |*t| t.unload();
+         k.nvfp4.unload();
+         k.native_lane.unload();
+         k.batch.unload();
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index dbc2c45..a60f116 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -541,7 +541,7 @@ pub fn Namespace(comptime Tri: type) type {
+             _ = @import("cuda_score.zig").CapabilityCases(Cuda);
+         }
+ 
+-        test "a bad TF_FLASHNEXT_CHUNK is refused at load before the loader takes a stream, a module or a buffer" {
++        test "a bad TF_FLASHNEXT_CHUNK or PROMPT_EXPERT_TILE is refused at load before the loader takes anything" {
+             const env = @import("sys").env;
+             defer _ = env.unsetenv("TF_FLASHNEXT_CHUNK");
+             // every driver entry point undefined: the refusal must come before the first call
+@@ -551,6 +551,12 @@ pub fn Namespace(comptime Tri: type) type {
+                 _ = env.setenv("TF_FLASHNEXT_CHUNK", bad, 1);
+                 try std.testing.expectError(error.BadChunk, open(std.testing.allocator, std.testing.io, &ctx, "no-such-checkpoint", null, .{ .context = 4096, .drafts = true }));
+             }
++            _ = env.unsetenv("TF_FLASHNEXT_CHUNK");
++            defer _ = env.unsetenv("TF_FLASHNEXT_PROMPT_EXPERT_TILE");
++            for ([_][*:0]const u8{ "3", "on" }) |bad| {
++                _ = env.setenv("TF_FLASHNEXT_PROMPT_EXPERT_TILE", bad, 1);
++                try std.testing.expectError(error.BadExpertTile, open(std.testing.allocator, std.testing.io, &ctx, "no-such-checkpoint", null, .{ .context = 4096, .drafts = true }));
++            }
+         }
+ 
+         // -- the prompt cache's copies ------------------------------------------------------------------------
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index 0c15244..fe84fbd 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -17,6 +17,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+     if ((o.tp != 1 and o.tp != 2) or o.rank >= o.tp) return error.BadRank;
+     // refused before the stream, the glue or a captured set loads
+     const chunk = try prompt.chunkRows();
++    _ = try cuda.nvfp4_tile.Config.fromEnv();
+     const mode = try config.mode(gpa, io, dir);
+     if (o.tp != 1 and (mode != .modelopt or captured != null)) return error.UnsupportedQuantization;
+     if (o.slide and (mode != .affine or o.tp != 1)) return error.UnsupportedLearningFormat;
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index c4095b9..6b553be 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -156,8 +156,9 @@ pub const Engine = struct {
+     pub fn initRank(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, model_dir: []const u8, world: usize, rank: usize) !*Engine {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+         if ((world != 1 and world != 2) or rank >= world) return error.BadRank;
+-        // refused before anything loads: a bad TF_FLASHNEXT_CHUNK leaves no module or buffer behind
++        // refused before anything loads: a bad TF_FLASHNEXT_CHUNK or TF_FLASHNEXT_PROMPT_EXPERT_TILE leaves no module
+         const chunk = try chunkRows();
++        const expert_tile = try cuda.nvfp4_tile.Config.fromEnv();
+         const e = try gpa.create(Engine);
+         errdefer gpa.destroy(e);
+         e.gpa = gpa;
+@@ -225,7 +226,7 @@ pub const Engine = struct {
+         e.store.closeFile();
+         e.ngram = try ple.Ngram.init(gpa, io, e.model_dir);
+         errdefer e.ngram.deinit();
+-        e.batch_k = try batch.Kernels.load(driver);
++        e.batch_k = try batch.Kernels.load(driver, expert_tile);
+         e.batch_s = null;
+         e.scores = null;
+         e.chunk = chunk;
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index ccb288a..e9332f4 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -26,6 +26,7 @@ const mxfp8_tests = @import("mxfp8_tests.zig");
+ const projection_f32_tests = @import("projection_f32_tests.zig");
+ const fp8_experts_tests = @import("fp8_experts_tests.zig");
+ const nvfp4_experts_tests = @import("nvfp4_experts_tests.zig");
++const nvfp4_experts_tile_tests = @import("nvfp4_experts_tile_tests.zig");
+ const quant_ref_tests = @import("quant_ref_tests.zig");
+ const glm_ref_tests = @import("glm_ref_tests.zig");
+ const affine8_tests = @import("affine8_tests.zig");
+@@ -181,6 +182,7 @@ const usage =
+     \\  fp8-lane <dir>            block-FP8 projections against the Python lane matmul's bytes (oracle/fp8_lane.py)
+     \\  fp8-experts <dir>         grouped block-FP8 experts against recorded fixture bytes
+     \\  nvfp4-experts <dir>       grouped NVFP4 experts against recorded fixture bytes
++    \\  nvfp4-experts-tile [ROWS[,ROWS] [EXPERTS [time]]]  the prompt expert tile against the decode kernel, byte for byte, and its time (synthetic)
+     \\  projection-f32            FP32 projection outputs against FP64, rounding and row/reduction invariance
+     \\  mxfp8                     MXFP8 strided projections against FP64 and row-count invariance
+     \\  quant-ref                 FP8 and NVFP4 projections and experts against float64 references (synthetic)
+@@ -325,6 +327,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "fp8-experts")) return fp8_experts_tests.experts(gpu, try arg(rest, 0));
+     if (std.mem.eql(u8, cmd, "nvfp4")) return nvfp4_tests.run(gpu, try arg(rest, 0));
+     if (std.mem.eql(u8, cmd, "nvfp4-experts")) return nvfp4_experts_tests.experts(gpu, try arg(rest, 0));
++    if (std.mem.eql(u8, cmd, "nvfp4-experts-tile")) return nvfp4_experts_tile_tests.run(gpu, rest);
+     if (std.mem.eql(u8, cmd, "projection-f32")) return projection_f32_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "mxfp8")) return mxfp8_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "quant-ref")) return quant_ref_tests.run(gpu);
+diff --git a/zig/tests/cuda/nvfp4_experts_tile_tests.zig b/zig/tests/cuda/nvfp4_experts_tile_tests.zig
+new file mode 100644
+index 0000000..90b1a5d
+--- /dev/null
++++ b/zig/tests/cuda/nvfp4_experts_tile_tests.zig
+@@ -0,0 +1,263 @@
++//! The NVFP4 expert tile against the decode kernel it replaces on prompt chunks, byte for byte (synthetic experts).
++const std = @import("std");
++const cuda = @import("cuda");
++const check = @import("check.zig");
++const Gpu = check.Gpu;
++
++const grouped = cuda.grouped;
++const ex_ = cuda.experts;
++const fx4 = ex_.Nvfp4Experts;
++const tile_ = cuda.nvfp4_tile;
++
++const dims: usize = 2560;
++const slots: usize = 11;
++const top: usize = 10;
++
++fn bf16(v: f32) u16 {
++    const u: u32 = @bitCast(v);
++    return @truncate((u + 0x7fff + ((u >> 16) & 1)) >> 16);
++}
++
++/// Packed blocks: random code words; moderate e4m3 scale bytes, or (`special`) any byte but the NaN encodings.
++fn fillBlocks(rng: std.Random, w: []u32, special: bool) void {
++    for (w, 0..) |*v, i| {
++        if (i % fx4.words < 128) {
++            v.* = rng.int(u32);
++            continue;
++        }
++        var x: u32 = 0;
++        for (0..4) |q| {
++            var b: u8 = if (special) rng.int(u8) else rng.intRangeAtMost(u8, 0x18, 0x5F) | (if (rng.uintLessThan(u8, 8) == 0) @as(u8, 0x80) else 0);
++            if (b & 0x7f == 0x7f) b ^= 1;
++            x |= @as(u32, b) << @intCast(8 * q);
++        }
++        v.* = x;
++    }
++}
++
++/// Ten distinct experts a row and the shared slot (`experts`, skipped); `hot`: seven in ten picks from the first eight.
++fn pickRow(rng: std.Random, out: []i32, experts: usize, hot: bool) void {
++    var n: usize = 0;
++    while (n < top) {
++        const c: i32 = @intCast(if (hot and rng.uintLessThan(u8, 10) < 7) rng.uintLessThan(u32, 8) else rng.uintLessThan(u32, @intCast(experts)));
++        if (std.mem.indexOfScalar(i32, out[0..n], c) != null) continue;
++        out[n] = c;
++        n += 1;
++    }
++    out[top] = @intCast(experts);
++}
++
++const Weights = struct {
++    up: cuda.DeviceBuffer,
++    down: cuda.DeviceBuffer,
++    up_scale: cuda.DeviceBuffer,
++    down_scale: cuda.DeviceBuffer,
++    layer: ex_.Layer,
++
++    fn make(gpu: Gpu, rng: std.Random, experts: usize, ni: usize, special: bool) !Weights {
++        const a = gpu.gpa;
++        const up_words = experts * (ni / 32) * (dims / 32) * 2 * fx4.words;
++        const down_words = experts * (dims / 32) * (ni / 32) * fx4.words;
++        const buf = try a.alloc(u32, @max(up_words, down_words));
++        defer a.free(buf);
++        fillBlocks(rng, buf[0..up_words], special);
++        var up = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(buf[0..up_words]));
++        errdefer up.free();
++        fillBlocks(rng, buf[0..down_words], special);
++        var down = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(buf[0..down_words]));
++        errdefer down.free();
++        const scales = try a.alloc(f32, 3 * experts);
++        defer a.free(scales);
++        for (scales) |*v| v.* = 0.002 + rng.float(f32) * 0.02;
++        var us = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(scales[0 .. 2 * experts]));
++        errdefer us.free();
++        var ds = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(scales[2 * experts ..]));
++        errdefer ds.free();
++        return .{ .up = up, .down = down, .up_scale = us, .down_scale = ds, .layer = .{ .format = .nvfp4, .up = up.ptr, .down = down.ptr, .up_scale = us.ptr, .down_scale = ds.ptr, .width = ni, .dims = dims, .experts = experts } };
++    }
++
++    fn free(w: *Weights) void {
++        w.up.free();
++        w.down.free();
++        w.up_scale.free();
++        w.down_scale.free();
++    }
++};
++
++/// A plan's scratch for `pairs` pairs over `classes` experts at any tile.
++const PlanBufs = struct {
++    bufs: [5]cuda.DeviceBuffer,
++
++    fn make(gpu: Gpu, pairs: usize, classes: usize) !PlanBufs {
++        const nblk = (pairs + 1023) / 1024;
++        const sizes = [5]usize{ pairs * 4, grouped.maxItems(pairs, classes, 16) * 12, 8, pairs * 4, nblk * classes * 4 };
++        var p: PlanBufs = undefined;
++        var made: usize = 0;
++        errdefer for (p.bufs[0..made]) |*b| b.free();
++        for (sizes, &p.bufs) |n, *b| {
++            b.* = try cuda.DeviceBuffer.alloc(gpu.d, @max(n, 16));
++            made += 1;
++        }
++        return p;
++    }
++
++    fn free(p: *PlanBufs) void {
++        for (&p.bufs) |*b| b.free();
++    }
++
++    fn plan(p: PlanBufs) grouped.Plan {
++        return .{ .members = p.bufs[0].ptr, .items = p.bufs[1].ptr, .counts = p.bufs[2].ptr, .rank = p.bufs[3].ptr, .hist = p.bufs[4].ptr };
++    }
++};
++
++const Combo = struct { pairs: usize, gu: usize, down: usize };
++
++/// The default (64 pairs, gate/up 4 tiles 4 stages, down 2 tiles 3 stages) first, then the other instances and tiles.
++const combos = [_]Combo{
++    .{ .pairs = 64, .gu = 1, .down = 2 },
++    .{ .pairs = 64, .gu = 0, .down = 0 },
++    .{ .pairs = 64, .gu = 2, .down = 1 },
++    .{ .pairs = 64, .gu = 3, .down = 2 },
++    .{ .pairs = 64, .gu = 4, .down = 0 },
++    .{ .pairs = 32, .gu = 2, .down = 2 },
++    .{ .pairs = 48, .gu = 4, .down = 2 },
++    .{ .pairs = 128, .gu = 1, .down = 1 },
++    .{ .pairs = 16, .gu = 2, .down = 2 },
++};
++
++/// One chunk: the decode kernel on 16-pair items, then each combo's tile kernels, gate/up and down alike.
++fn oneChunk(gpu: Gpu, router: grouped.Router, ex: *const fx4, w: Weights, sms: usize, s: cuda.Stream, rng: std.Random, rows: usize, hot: bool, compare: bool, timing: bool) !void {
++    const a = gpu.gpa;
++    const pairs = rows * slots;
++    const classes = w.layer.experts + 1;
++    const ni = w.layer.width;
++    const skip: i32 = @intCast(w.layer.experts);
++    const picks = try a.alloc(i32, pairs);
++    defer a.free(picks);
++    for (0..rows) |r| pickRow(rng, picks[r * slots ..][0..slots], w.layer.experts, hot);
++    var dpicks = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(picks));
++    defer dpicks.free();
++    const x = try a.alloc(u16, rows * dims);
++    defer a.free(x);
++    for (x) |*v| v.* = bf16(rng.float(f32) * 4 - 2);
++    var dx = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(x));
++    defer dx.free();
++    var plan16 = try PlanBufs.make(gpu, pairs, classes);
++    defer plan16.free();
++    var plan_t = try PlanBufs.make(gpu, pairs, classes);
++    defer plan_t.free();
++    var act = try cuda.DeviceBuffer.alloc(gpu.d, pairs * ni * 2);
++    defer act.free();
++    var y = try cuda.DeviceBuffer.alloc(gpu.d, pairs * dims * 4);
++    defer y.free();
++    var act_t = try cuda.DeviceBuffer.alloc(gpu.d, pairs * ni * 2);
++    defer act_t.free();
++    var y_t = try cuda.DeviceBuffer.alloc(gpu.d, pairs * dims * 4);
++    defer y_t.free();
++    const up_in: ex_.Rows = .{ .x = dx.ptr, .stride = dims, .slots = slots };
++    const down_in: ex_.Rows = .{ .x = act.ptr, .stride = ni };
++
++    // the decode kernel's bytes, unwritten pairs (the shared slot) left at 0xff
++    try act.fill8(0xff, s.handle);
++    try y.fill8(0xff, s.handle);
++    try router.route(s, dpicks.ptr, pairs, classes, 16, plan16.plan());
++    const items16 = grouped.maxItems(pairs, classes, 16);
++    try ex.run(s, .up, up_in, w.layer, plan16.plan(), act.ptr, items16, skip);
++    try ex.run(s, .down_f32, down_in, w.layer, plan16.plan(), y.ptr, items16, skip);
++    try s.synchronize();
++    const want_act = if (compare) try check.download(gpu, act) else &.{};
++    defer if (compare) a.free(want_act);
++    const want_y = if (compare) try check.download(gpu, y) else &.{};
++    defer if (compare) a.free(want_y);
++
++    for (if (compare) combos[0..] else combos[0..0]) |c| {
++        var t = try tile_.Tile.load(gpu.d, sms, .{ .pairs = c.pairs, .gu = c.gu, .down = c.down });
++        defer t.unload();
++        try router.route(s, dpicks.ptr, pairs, classes, c.pairs, plan_t.plan());
++        const items = grouped.maxItems(pairs, classes, c.pairs);
++        try act_t.fill8(0xff, s.handle);
++        try y_t.fill8(0xff, s.handle);
++        try t.run(s, .up, up_in, w.layer, plan_t.plan(), act_t.ptr, items, skip);
++        // the tile's down on the decode kernel's activations, so a gate/up difference cannot hide in it
++        try t.run(s, .down_f32, down_in, w.layer, plan_t.plan(), y_t.ptr, items, skip);
++        try s.synchronize();
++        const got_act = try check.download(gpu, act_t);
++        defer a.free(got_act);
++        try check.sameBytes("tile gate-up", got_act, want_act);
++        const got_y = try check.download(gpu, y_t);
++        defer a.free(got_y);
++        try check.sameBytes("tile down", got_y, want_y);
++    }
++    if (compare) check.pass("nvfp4 expert tile: {d} rows ({s}), width {d}, {d} tile configurations equal the decode kernel's bytes", .{ rows, if (hot) "hot experts" else "uniform", ni, combos.len });
++    if (timing) try time(gpu, router, ex, w, sms, s, up_in, down_in, dpicks.ptr, pairs, act.ptr, y.ptr, plan16, plan_t);
++}
++
++/// The layer's time (plan, gate/up, down) on the decode kernel and on the env's tile configuration, median of seven.
++fn time(gpu: Gpu, router: grouped.Router, ex: *const fx4, w: Weights, sms: usize, s: cuda.Stream, up_in: ex_.Rows, down_in: ex_.Rows, picks: u64, pairs: usize, act: u64, y: u64, plan16: PlanBufs, plan_t: PlanBufs) !void {
++    const classes = w.layer.experts + 1;
++    const skip: i32 = @intCast(w.layer.experts);
++    var t = try tile_.Tile.load(gpu.d, sms, try tile_.Config.fromEnv());
++    defer t.unload();
++    var start = try cuda.Event.init(gpu.d, true);
++    defer start.deinit();
++    var end = try cuda.Event.init(gpu.d, true);
++    defer end.deinit();
++    var ms: [2][7]f64 = undefined;
++    const items16 = grouped.maxItems(pairs, classes, 16);
++    const items64 = grouped.maxItems(pairs, classes, t.cfg.pairs);
++    for (0..8) |rep| for (0..2) |which| {
++        try start.record(s);
++        if (which == 0) {
++            try router.route(s, picks, pairs, classes, 16, plan16.plan());
++            try ex.run(s, .up, up_in, w.layer, plan16.plan(), act, items16, skip);
++            try ex.run(s, .down_f32, down_in, w.layer, plan16.plan(), y, items16, skip);
++        } else {
++            try router.route(s, picks, pairs, classes, t.cfg.pairs, plan_t.plan());
++            try t.run(s, .up, up_in, w.layer, plan_t.plan(), act, items64, skip);
++            try t.run(s, .down_f32, down_in, w.layer, plan_t.plan(), y, items64, skip);
++        }
++        try end.record(s);
++        try end.synchronize();
++        if (rep > 0) ms[which][rep - 1] = try cuda.Event.elapsedMs(start, end);
++    };
++    const old = check.median(&ms[0]);
++    const new = check.median(&ms[1]);
++    std.debug.print("INFO nvfp4 expert tile {d},{d},{d}: {d} pairs, width {d}: decode kernel {d:.3} ms, tile {d:.3} ms a layer ({d:.2}x)\n", .{ t.cfg.pairs, t.cfg.gu, t.cfg.down, pairs, w.layer.width, old, new, old / new });
++}
++
++/// `nvfp4-experts-tile [ROWS[,ROWS] [EXPERTS [time]]]`: synthetic; default rows 64,129,1024,1536,2049 and 96 experts.
++pub fn run(gpu: Gpu, rest: []const [:0]const u8) !void {
++    var rows_list: std.ArrayList(usize) = .empty;
++    defer rows_list.deinit(gpu.gpa);
++    var it = std.mem.tokenizeScalar(u8, if (rest.len > 0) rest[0] else "64,129,1024,1536,2049", ',');
++    while (it.next()) |tok| try rows_list.append(gpu.gpa, try std.fmt.parseInt(usize, tok, 10));
++    const experts: usize = if (rest.len > 1) try std.fmt.parseInt(usize, rest[1], 10) else 96;
++    if (experts < 16 or rows_list.items.len == 0) return error.BadArguments;
++    const sms: usize = @intCast(try gpu.ctx.attribute(.multiprocessor_count));
++    var ex = try fx4.load(gpu.d, sms);
++    defer ex.unload();
++    var mod = try cuda.Module.load(gpu.d, cuda.kernels.experts);
++    defer mod.unload();
++    const router = try grouped.Router.resolve(mod);
++    var s = try cuda.Stream.init(gpu.d, false); // blocking: launches wait for fromHost's legacy-stream copies
++    defer s.deinit();
++    var prng = std.Random.DefaultPrng.init(0x4e56_4650);
++    const rng = prng.random();
++    // `time`: the layer's time alone, at the single rank's width
++    if (rest.len > 2 and std.mem.eql(u8, rest[2], "time")) {
++        var w = try Weights.make(gpu, rng, experts, 640, false);
++        defer w.free();
++        for (rows_list.items) |rows| try oneChunk(gpu, router, &ex, w, sms, s, rng, rows, false, false, true);
++        return;
++    }
++    // widths: the single rank's 640 and a tensor-parallel rank's 320; the second set holds every scale byte but NaN
++    for ([_]bool{ false, true }) |special| for ([_]usize{ 640, 320 }) |ni| {
++        var w = try Weights.make(gpu, rng, experts, ni, special);
++        defer w.free();
++        for (rows_list.items) |rows| for ([_]bool{ false, true }) |hot| {
++            if (special and hot) continue;
++            try oneChunk(gpu, router, &ex, w, sms, s, rng, rows, hot, true, !special and ni == 640 and !hot and rows == 1536);
++        };
++        if (special) check.pass("nvfp4 expert tile: width {d} with every scale byte but NaN, rows {any}", .{ ni, rows_list.items });
++    };
++}
+diff --git a/zig/tests/cuda/w4a8_tests.zig b/zig/tests/cuda/w4a8_tests.zig
+index ad70467..f5992ac 100644
+--- a/zig/tests/cuda/w4a8_tests.zig
++++ b/zig/tests/cuda/w4a8_tests.zig
+@@ -110,13 +110,17 @@ fn shape(r: *Rig, a4: *const qlinear.Affine4Kernels, kk: cuda.w4a8.Kernels, n: u
+     const dx = try r.dev(std.mem.sliceAsBytes(x));
+     const ws = try r.zeros(cuda.w4a8.Kernels.scratch(rows, k));
+     const out = try r.zeros(rows * n * 2);
+-    try kk.prompt(r.s, dx, q, out, rows, ws);
++    const flag = try r.zeros(4);
++    var exceptional: u32 = 0;
++    try kk.prompt(r.s, dx, q, out, rows, ws, flag, &exceptional);
++    try check.expect(exceptional == 0, "w4a8 [{d}, {d}]: the quantizer marked an ordinary chunk exceptional", .{ n, k });
+     const ref = try reference(r, x, rows, m);
+     try r.close(try std.fmt.bufPrint(&name, "w4a8 [{d}, {d}], {d} rows, against float64 of its int8 formula", .{ n, k, rows }), out, false, ref.want, ref.tol);
+     // a row's bits are its own: the first 37 rows alone equal their place in the 200
+     const few = 37;
+     const out_few = try r.zeros(few * n * 2);
+-    try kk.prompt(r.s, dx, q, out_few, few, ws);
++    try kk.prompt(r.s, dx, q, out_few, few, ws, flag, &exceptional);
++    try check.expect(exceptional == 0, "w4a8 [{d}, {d}]: the quantizer marked {d} ordinary rows exceptional", .{ n, k, few });
+     try check.sameBytes(try std.fmt.bufPrint(&name, "w4a8 [{d}, {d}]: {d} rows equal the 200-row call's", .{ n, k, few }), try r.back(out_few, few * n * 2), try r.back(out, few * n * 2));
+ }
+ 

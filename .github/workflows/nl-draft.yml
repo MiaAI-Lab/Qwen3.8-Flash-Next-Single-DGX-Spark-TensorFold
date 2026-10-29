@@ -10,6 +10,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Apply recipe patch stack to pinned TensorFold
+        run: |
+          git clone --filter=blob:none https://github.com/ashhart/TensorFold.git /tmp/tensorfold
+          git -C /tmp/tensorfold checkout eab8582819688325e371907e4706e1c602b8a273
+          for p in "$GITHUB_WORKSPACE"/patches/*.patch; do git -C /tmp/tensorfold apply --check "$p" && git -C /tmp/tensorfold apply "$p" || exit 1; done
       - name: Check base and Dutch ID invariants
         run: python3 tools/nl_draft_vocab.py --check
       - name: Run deterministic CPU tests

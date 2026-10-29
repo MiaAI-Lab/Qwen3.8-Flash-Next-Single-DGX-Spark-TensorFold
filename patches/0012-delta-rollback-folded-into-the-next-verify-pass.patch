@@ -1,0 +1,689 @@
+diff --git a/zig/kernels/cuda/flashnext_batch.cu b/zig/kernels/cuda/flashnext_batch.cu
+index f7064ed..78d7156 100644
+--- a/zig/kernels/cuda/flashnext_batch.cu
++++ b/zig/kernels/cuda/flashnext_batch.cu
+@@ -28,6 +28,27 @@ extern "C" __global__ void fn_shift_window(__nv_bfloat16* __restrict__ win, cons
+     for (int j = 0; j < taps; ++j) win[static_cast<long long>(j) * c + ch] = next[j];
+ }
+ 
++// Every layer's conv window [taps, c] (wins[layer]) past a rollback's first `n` rows in one launch: its saved history (taps rows,
++// hist_stride apart a layer) and its saved projection rows (proj_layer_stride apart, proj_row_stride a row) make the rows
++// [n, n + taps) of [history; projection rows], what fn_shift_window leaves of a window that was just copied from the history.
++extern "C" __global__ void fn_conv_roll(const unsigned long long* __restrict__ wins, const __nv_bfloat16* __restrict__ hist,
++                                        long long hist_stride, const __nv_bfloat16* __restrict__ proj,
++                                        long long proj_layer_stride, long long proj_row_stride, int n, int taps, int c) {
++    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
++    if (ch >= c) return;
++    const int layer = blockIdx.y;
++    __nv_bfloat16* win = reinterpret_cast<__nv_bfloat16*>(wins[layer]);
++    const __nv_bfloat16* h = hist + layer * hist_stride;
++    const __nv_bfloat16* rows = proj + layer * proj_layer_stride;
++    __nv_bfloat16 next[16];
++    for (int j = 0; j < taps; ++j) {
++        const int src = j + n;
++        next[j] = src < taps ? h[static_cast<long long>(src) * c + ch]
++                             : rows[static_cast<long long>(src - taps) * proj_row_stride + ch];
++    }
++    for (int j = 0; j < taps; ++j) win[static_cast<long long>(j) * c + ch] = next[j];
++}
++
+ // ---- the DeltaNet chain over a chunk: flashnext_gdn.cu's chain cut into front, rows and norm, with its bits ----
+ 
+ namespace fn_gdn {
+@@ -177,6 +198,89 @@ extern "C" __global__ void __launch_bounds__(128) fn_gdn_rows_to(
+     gdn_rows(qn, kn, v, gb, state_in, state_out, rows, ys_out);
+ }
+ 
++// fn_gdn_rows_to's chain after `np` earlier rows whose steps are taken first (TF_FLASHNEXT_KEEP_LATE): a rolled-back window's kept
++// rows wait in the lane's log as their front left them (kn, v, gb rows 0 .. np - 1, no readout), and this window's rows follow them
++// there (rows np ..); qn and ys_out hold the window's own rows from 0. Each step is fn_gdn_rows_to's, so the state it ends on has the
++// bits of the kept rows replayed on their own and the window chained after.
++static __device__ __forceinline__ void gdn_rows_late(
++        const float* __restrict__ qn, const float* __restrict__ kn, const float* __restrict__ v,
++        const float* __restrict__ gb, const float* state_in, float* state_out, int rows, float* __restrict__ ys_out, int np) {
++    using namespace fn_gdn;
++    const int hv = blockIdx.x, hk = hv / (NV / NK), warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int row0 = blockIdx.y * 16 + warp * 4;
++    const size_t sbase = (size_t)hv * DV * DK;
++    float s[4][4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j)
++#pragma unroll
++        for (int i = 0; i < 4; ++i) s[j][i] = state_in[sbase + (size_t)(row0 + j) * DK + lane * 4 + i];
++    for (int p = 0; p < np; ++p) {
++        const float4 k4 = *reinterpret_cast<const float4*>(kn + ((size_t)p * NK + hk) * DK + lane * 4);
++        const float4 v4 = *reinterpret_cast<const float4*>(v + (size_t)p * NV * DV + hv * DV + row0);
++        const float kk[4] = {k4.x, k4.y, k4.z, k4.w};
++        const float vv[4] = {v4.x, v4.y, v4.z, v4.w};
++        const float g = gb[((size_t)p * NV + hv) * 2];
++        const float beta = gb[((size_t)p * NV + hv) * 2 + 1];
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            float kv = 0.0f;
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                s[j][i] = s[j][i] * g;
++                kv = kv + s[j][i] * kk[i];
++            }
++            kv = warp_sum(kv);
++            const float delta = (vv[j] - kv) * beta;
++#pragma unroll
++            for (int i = 0; i < 4; ++i) s[j][i] = s[j][i] + kk[i] * delta;
++        }
++    }
++    for (int r = 0; r < rows; ++r) {
++        const size_t rk = (size_t)np + r;
++        const float4 k4 = *reinterpret_cast<const float4*>(kn + (rk * NK + hk) * DK + lane * 4);
++        const float4 q4 = *reinterpret_cast<const float4*>(qn + ((size_t)r * NK + hk) * DK + lane * 4);
++        const float4 v4 = *reinterpret_cast<const float4*>(v + rk * NV * DV + hv * DV + row0);
++        const float kk[4] = {k4.x, k4.y, k4.z, k4.w};
++        const float qq[4] = {q4.x, q4.y, q4.z, q4.w};
++        const float vv[4] = {v4.x, v4.y, v4.z, v4.w};
++        const float g = gb[(rk * NV + hv) * 2];
++        const float beta = gb[(rk * NV + hv) * 2 + 1];
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            float kv = 0.0f;
++#pragma unroll
++            for (int i = 0; i < 4; ++i) {
++                s[j][i] = s[j][i] * g;
++                kv = kv + s[j][i] * kk[i];
++            }
++            kv = warp_sum(kv);
++            const float delta = (vv[j] - kv) * beta;
++#pragma unroll
++            for (int i = 0; i < 4; ++i) s[j][i] = s[j][i] + kk[i] * delta;
++        }
++        float o4[4];
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            float o = 0.0f;
++#pragma unroll
++            for (int i = 0; i < 4; ++i) o = o + s[j][i] * qq[i];
++            o4[j] = bf(warp_sum(o));
++        }
++        if (lane == 0) *reinterpret_cast<float4*>(ys_out + ((size_t)r * NV + hv) * DV + row0) = make_float4(o4[0], o4[1], o4[2], o4[3]);
++    }
++#pragma unroll
++    for (int j = 0; j < 4; ++j)
++#pragma unroll
++        for (int i = 0; i < 4; ++i) state_out[sbase + (size_t)(row0 + j) * DK + lane * 4 + i] = s[j][i];
++}
++
++// rows 0: only the `np` waiting rows are taken (state_in == state_out settles a lane's log on its sequence).
++extern "C" __global__ void __launch_bounds__(128) fn_gdn_rows_late(
++        const float* __restrict__ qn, const float* __restrict__ kn, const float* __restrict__ v,
++        const float* __restrict__ gb, const float* state_in, float* state_out, int rows, float* __restrict__ ys_out, int np) {
++    gdn_rows_late(qn, kn, v, gb, state_in, state_out, rows, ys_out, np);
++}
++
+ extern "C" __global__ void __launch_bounds__(128) fn_gdn_norm(
+         const float* __restrict__ ys_in, const __nv_bfloat16* __restrict__ P, const __nv_bfloat16* __restrict__ norm_w,
+         float eps, __nv_bfloat16* __restrict__ out, float* __restrict__ xs) {
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index 5204806..5e1760c 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -287,8 +287,13 @@ pub fn Pass(comptime Tri: type) type {
+                 try self.copy(keep.hist, self.seq.conv[li].ptr, (gdn.taps - 1) * gdn.conv_dim * 2);
+             }
+             // every row's conv, norms and gates, the recurrence, then the gated norm: the one-block chain's bits
+-            const fused = self.lanes.len == 0 and n >= 64 and gdn_fused.on();
+-            if (fused) {
++            const fused = self.lanes.len == 0 and n >= 64 and gdn_fused.on() and keep.log_k == 0;
++            if (keep.log_k != 0 and self.lanes.len == 0) {
++                // the window's rows go after the rows its log holds, which the chain takes first (TF_FLASHNEXT_KEEP_LATE)
++                const np: usize = if (self.hooks.keep) |kp| kp.pend else 0;
++                try self.gdnFrontLogged(lw, keep, np, s.proj, self.seq.conv[li].ptr, n, s.gq);
++                try self.gdnChainLate(s.gq, keep, np, self.seq.state[li].ptr, keep.state_out, n, s.ys);
++            } else if (fused) {
+                 // the three in one kernel a value head: the same per-row op sequences, no fp32 rows through memory
+                 const st = self.seq.state[li].ptr;
+                 const in: gdn_fused.In = .{ .proj = s.proj, .conv = self.seq.conv[li].ptr, .cw = lw.cw.ptr, .a_log = lw.a_log.ptr, .dt = lw.dt.ptr, .state = st, .state_out = if (keep.state_out != 0) keep.state_out else st, .norm = lw.norm.ptr };
+@@ -307,8 +312,14 @@ pub fn Pass(comptime Tri: type) type {
+                     const gb = row0 * gdn.nv * 2 * 4;
+                     try self.copy(lk.proj, proj, l.rows * gdn.proj_width * 2);
+                     try self.copy(lk.hist, l.seq.conv[li].ptr, (gdn.taps - 1) * gdn.conv_dim * 2);
+-                    try self.gdnFront(lw, proj, l.seq.conv[li].ptr, l.rows, s.gq + qk, s.gk + qk, s.gv + v, s.ggb + gb);
+-                    try self.gdnChain(s.gq + qk, s.gk + qk, s.gv + v, s.ggb + gb, l.seq.state[li].ptr, lk.state_out, l.rows, s.ys + v);
++                    if (lk.log_k != 0) {
++                        const np: usize = if (l.keep) |kp| kp.pend else 0;
++                        try self.gdnFrontLogged(lw, lk, np, proj, l.seq.conv[li].ptr, l.rows, s.gq + qk);
++                        try self.gdnChainLate(s.gq + qk, lk, np, l.seq.state[li].ptr, lk.state_out, l.rows, s.ys + v);
++                    } else {
++                        try self.gdnFront(lw, proj, l.seq.conv[li].ptr, l.rows, s.gq + qk, s.gk + qk, s.gv + v, s.ggb + gb);
++                        try self.gdnChain(s.gq + qk, s.gk + qk, s.gv + v, s.ggb + gb, l.seq.state[li].ptr, lk.state_out, l.rows, s.ys + v);
++                    }
+                     // the lane's conv window moves on now: the gated norm below reads none of it
+                     try self.shiftWindow(l.seq.conv[li].ptr, proj, gdn.proj_width, l.rows, gdn.taps - 1, gdn.conv_dim);
+                     row0 += l.rows;
+@@ -334,6 +345,26 @@ pub fn Pass(comptime Tri: type) type {
+             try cuda.launch.launch(self.k.front, .{ .grid = .{ .x = @intCast(rows), .y = gdn.nk + gdn.nv }, .block = .{ .x = 256 } }, self.stream, &f);
+         }
+ 
++        /// fn_gdn_front over `rows` rows whose k, v and gates go to the layer's log after its first `np` rows, q to `qn`.
++        fn gdnFrontLogged(self: *Self, lw: *const Layer, lk: LayerKeep, np: usize, proj: u64, conv: u64, rows: usize, qn: u64) !void {
++            try self.gdnFront(lw, proj, conv, rows, qn, lk.log_k + np * gdn.log_row_k, lk.log_v + np * gdn.log_row_v, lk.log_gb + np * gdn.log_row_gb);
++        }
++
++        /// fn_gdn_rows_late over `rows` rows (q from `qn`) after the log's first `np`, from `state` to `state_out` (0: in place).
++        fn gdnChainLate(self: *Self, qn: u64, lk: LayerKeep, np: usize, state: u64, state_out: u64, rows: usize, ys: u64) !void {
++            var a: cuda.Args = .{};
++            a.add(qn);
++            a.add(lk.log_k);
++            a.add(lk.log_v);
++            a.add(lk.log_gb);
++            a.add(state);
++            a.add(if (state_out != 0) state_out else state);
++            a.add(cint(rows));
++            a.add(ys);
++            a.add(cint(np));
++            try cuda.launch.launch(self.k.chain_late, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 16 }, .block = .{ .x = 128 } }, self.stream, &a);
++        }
++
+         /// fn_gdn_rows over `rows` rows from `state`, in place or (state_out) to fn_gdn_rows_to's; readouts into ys.
+         fn gdnChain(self: *Self, gq: u64, gk: u64, gv: u64, ggb: u64, state: u64, state_out: u64, rows: usize, ys: u64) !void {
+             var a: cuda.Args = .{};
+diff --git a/zig/src/families/flashnext/cuda_batch_lanes.zig b/zig/src/families/flashnext/cuda_batch_lanes.zig
+index 7970b02..ec3a000 100644
+--- a/zig/src/families/flashnext/cuda_batch_lanes.zig
++++ b/zig/src/families/flashnext/cuda_batch_lanes.zig
+@@ -27,6 +27,9 @@ pub fn rollbackOnly(k: *const Keep) bool {
+         rest.proj = 0;
+         rest.hist = 0;
+         rest.state_out = 0;
++        rest.log_k = 0;
++        rest.log_v = 0;
++        rest.log_gb = 0;
+         if (!std.meta.eql(rest, LayerKeep{})) return false;
+     }
+     return true;
+diff --git a/zig/src/families/flashnext/cuda_batch_state.zig b/zig/src/families/flashnext/cuda_batch_state.zig
+index 1b40b7e..fe8b52f 100644
+--- a/zig/src/families/flashnext/cuda_batch_state.zig
++++ b/zig/src/families/flashnext/cuda_batch_state.zig
+@@ -89,6 +89,11 @@ pub const LayerKeep = struct {
+     hist: u64 = 0,
+     /// The chain's end state goes here, the sequence's own left as before the chunk; 0: in place.
+     state_out: u64 = 0,
++    /// DeltaNet with TF_FLASHNEXT_KEEP_LATE: the lane's log of rows [rows, ...] as the front leaves them (k [rows, 16, 128], v and
++    /// the decay and beta gates [rows, 48, 128 | 2], fp32); the window's rows go after the Keep's `pend` rows already waiting there.
++    log_k: u64 = 0,
++    log_v: u64 = 0,
++    log_gb: u64 = 0,
+     attn_hc: HcKeep = .{},
+     mlp_hc: HcKeep = .{},
+     /// The mixer's and the MoE's branches [rows, dims] bf16 as the write-backs add them (the MoE's with its pocket).
+@@ -109,6 +114,8 @@ pub const LayerKeep = struct {
+ pub const Keep = struct {
+     layers: [layers_n]LayerKeep = @splat(.{}),
+     mixer: HcKeep = .{},
++    /// Rows of earlier windows kept but not yet taken by the DeltaNet states (the logs' first rows): this pass's chain takes them first.
++    pend: u32 = 0,
+ };
+ 
+ /// A sequence of a training pass (Pass.spans): its first row and its rows.
+@@ -161,6 +168,10 @@ pub const Kernels = struct {
+     front: cuda.Function,
+     chain: cuda.Function,
+     chain_to: cuda.Function,
++    /// fn_gdn_rows_to after the rows a log holds (TF_FLASHNEXT_KEEP_LATE).
++    chain_late: cuda.Function,
++    /// Every DeltaNet layer's conv window past a rollback's kept rows (TF_FLASHNEXT_KEEP_LATE).
++    conv_roll: cuda.Function,
+     chain_tpr: cuda.Function,
+     /// front + chain + gated norm in one kernel a value head (prompt passes of 64 rows or more).
+     gdn_fused: cuda.Function,
+@@ -208,6 +219,8 @@ pub const Kernels = struct {
+         k.front = try k.batch.function("fn_gdn_front");
+         k.chain = try k.batch.function("fn_gdn_rows");
+         k.chain_to = try k.batch.function("fn_gdn_rows_to");
++        k.chain_late = try k.batch.function("fn_gdn_rows_late");
++        k.conv_roll = try k.batch.function("fn_conv_roll");
+         k.chain_tpr = try k.batch.function("fn_gdn_chain_tpr");
+         try k.chain_tpr.allowDynamicShared(chain_tpr_smem);
+         k.gdn_fused = try k.batch.function("fn_gdn_fused");
+diff --git a/zig/src/families/flashnext/cuda_gdn.zig b/zig/src/families/flashnext/cuda_gdn.zig
+index b53fb5d..ff8c97d 100644
+--- a/zig/src/families/flashnext/cuda_gdn.zig
++++ b/zig/src/families/flashnext/cuda_gdn.zig
+@@ -16,6 +16,11 @@ pub const proj_width: usize = conv_dim + nv * dv + 2 * nv;
+ pub const value_dim: usize = nv * dv;
+ pub const groups: usize = value_dim / qmm.group;
+ 
++/// A row of the DeltaNet log (TF_FLASHNEXT_KEEP_LATE) a layer: the front's k [nk, dk], v [nv, dv] and decay and beta gates [nv, 2], fp32.
++pub const log_row_k: usize = nk * dk * 4;
++pub const log_row_v: usize = value_dim * 4;
++pub const log_row_gb: usize = nv * 2 * 4;
++
+ const symbol: [:0]const u8 = "flashnext_gdn_chain";
+ 
+ fn toBf16(v: f32) u16 {
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 40f6b58..91ed448 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -582,6 +582,7 @@ pub fn Namespace(comptime Tri: type) type {
+                 if (l.draft != null) return error.TensorRankDraftSnapshotUnavailable;
+                 return try r.save(&l.seq);
+             }
++            if (l.draft) |*d| try self.ops().flushLate(&l.seq, d);
+             return try snap.save(self.gpa, self.engine.driver, self.stream, &l.seq, if (l.draft) |*d| d else null);
+         }
+ 
+diff --git a/zig/src/families/flashnext/cuda_mtp_draft.zig b/zig/src/families/flashnext/cuda_mtp_draft.zig
+index 14a2b38..26b46f0 100644
+--- a/zig/src/families/flashnext/cuda_mtp_draft.zig
++++ b/zig/src/families/flashnext/cuda_mtp_draft.zig
+@@ -29,6 +29,20 @@ const max_rows = mtp.max_rows;
+ const conv_bytes = mtp.conv_bytes;
+ const proj_bytes = mtp.proj_bytes;
+ 
++/// TF_FLASHNEXT_KEEP_LATE=1: a window kept in part does not replay its kept rows on the DeltaNet states. The rows' k, v and gates (the
++/// front's, as the verify pass computed them) wait in the lane's log, and the next window's chain takes them first, in the same
++/// pass over the states (cuda_gdn's fn_gdn_rows_late); a window kept whole settles on its end states and empties the log.
++pub fn lateOn() bool {
++    if (Draft.late_force) |on| return on;
++    const v = std.c.getenv("TF_FLASHNEXT_KEEP_LATE") orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
++
++/// Rows a lane's log holds (a window's rows go after the waiting ones) and the most that may wait after a rollback (a window's widest).
++pub const late_cap: usize = 2 * max_rows;
++pub const late_max_rows: usize = max_rows;
++const late_layer_bytes: usize = late_cap * (gdn.log_row_k + gdn.log_row_v + gdn.log_row_gb);
++
+ /// The format of the MTP head's own attention cache for a stream of `cap` positions when the engine's main caches are `main`
+ /// and a stream is charged its `window`'s bytes with the head's cache in `main` too (cuda_lanes_load.zig streamBytes). The head
+ /// is one layer and its drafts are only proposals (the main model verifies every token), but fp8 rows there cost it about a
+@@ -91,6 +105,12 @@ pub const Draft = struct {
+     /// A window ran with the states written to `spare` and is not yet kept or rolled back.
+     open: bool = false,
+     keep: batch.Keep = .{},
++    /// With TF_FLASHNEXT_KEEP_LATE: the DeltaNet layers' logs, and the rows waiting in them for the states (also in `keep.pend`).
++    log: ?cuda.DeviceBuffer = null,
++    pend: usize = 0,
++    /// The sequence's conv windows' addresses on the device (fn_conv_roll), and the first's they were made for.
++    conv_table: ?cuda.DeviceBuffer = null,
++    conv_first: u64 = 0,
+     history: [2]i64 = .{ 0, 0 },
+     unused_history: [2]i64 = .{ 0, 0 },
+     fed0: usize = 0,
+@@ -100,8 +120,11 @@ pub const Draft = struct {
+     host: []u16,
+     best_host: [max_rows * 4]f32 = undefined,
+ 
+-    const hist_at: usize = 0;
+-    const proj_at: usize = hist_at + linear_n * conv_bytes;
++    pub const late_max = late_max_rows;
++    /// A test's choice for the Drafts it makes next (null: the environment's).
++    pub var late_force: ?bool = null;
++    pub const hist_at: usize = 0;
++    pub const proj_at: usize = hist_at + linear_n * conv_bytes;
+     pub const tail_at: usize = proj_at + linear_n * max_rows * proj_bytes;
+     /// The window's n-gram rows (the pass's ple_nrow), saved for a rollback to shift the kept ones into the tail.
+     pub const nrow_at: usize = tail_at + ple_tail_n * wide * 2;
+@@ -114,7 +137,7 @@ pub const Draft = struct {
+ 
+     /// bytes with the head's cache in format `format`.
+     pub fn bytesFor(format: kv_format.Kv, cap: usize, draft_n: usize, rows: usize) usize {
+-        return cap * format.position() + prompt.pooledBytes(cap) + @max(rows, max_rows) * wide * 2 + wide * 2 + max_rows * vocab * 2 + draft_n * 2 + max_rows * 16 + saved_bytes + linear_n * state_n * 4;
++        return cap * format.position() + prompt.pooledBytes(cap) + @max(rows, max_rows) * wide * 2 + wide * 2 + max_rows * vocab * 2 + draft_n * 2 + max_rows * 16 + saved_bytes + linear_n * state_n * 4 + (if (lateOn()) linear_n * late_layer_bytes else 0);
+     }
+ 
+     /// A head cache of `cap` entries; `rows` the widest prompt chunk whose streams it keeps.
+@@ -148,6 +171,8 @@ pub const Draft = struct {
+         var made: usize = 0;
+         errdefer for (d.spare[0..made]) |*b| b.free();
+         while (made < linear_n) : (made += 1) d.spare[made] = try cuda.DeviceBuffer.alloc(driver, state_n * 4);
++        if (lateOn()) d.log = try cuda.DeviceBuffer.alloc(driver, linear_n * late_layer_bytes);
++        errdefer if (d.log) |*b| b.free();
+         d.host = try gpa.alloc(u16, @max(max_rows * vocab, draft_n));
+         errdefer gpa.free(d.host);
+         errdefer cuda.completion.drain(driver, stream, "Flash Next draft fills did not drain before rollback");
+@@ -158,6 +183,11 @@ pub const Draft = struct {
+             if (!wt.linearLayer(layer)) continue;
+             lk.hist = d.saved.ptr + hist_at + li * conv_bytes;
+             lk.proj = d.saved.ptr + proj_at + li * max_rows * proj_bytes;
++            if (d.log) |b| {
++                lk.log_k = b.ptr + li * late_layer_bytes;
++                lk.log_v = lk.log_k + late_cap * gdn.log_row_k;
++                lk.log_gb = lk.log_v + late_cap * gdn.log_row_v;
++            }
+             li += 1;
+         }
+         d.aim();
+@@ -180,12 +210,16 @@ pub const Draft = struct {
+         for (seq.state, &d.spare) |*a, *b| std.mem.swap(cuda.DeviceBuffer, a, b);
+         d.aim();
+         d.open = false;
++        // the end states took the waiting rows in
++        d.pend = 0;
+     }
+ 
+     pub fn deinit(d: *Draft) void {
+         if (d.stream) |stream| cuda.completion.drain(stream.d, stream, "Flash Next draft work did not drain before release");
+         d.gpa.free(d.host);
+         for (&d.spare) |*b| b.free();
++        if (d.log) |*b| b.free();
++        if (d.conv_table) |*b| b.free();
+         d.saved.free();
+         d.best.free();
+         d.dlogits.free();
+@@ -203,6 +237,7 @@ pub const Draft = struct {
+         d.len = 0;
+         d.drafted = 0;
+         d.rows = 0;
++        d.pend = 0;
+     }
+ };
+ 
+diff --git a/zig/src/families/flashnext/cuda_mtp_ops.zig b/zig/src/families/flashnext/cuda_mtp_ops.zig
+index 9195e52..b51ac76 100644
+--- a/zig/src/families/flashnext/cuda_mtp_ops.zig
++++ b/zig/src/families/flashnext/cuda_mtp_ops.zig
+@@ -113,6 +113,7 @@ pub fn Ops(comptime Tri: type) type {
+             if (stop > d.cap or stop <= at or stop - at > d.rows_cap) return error.PromptTooLong;
+             if (seq.fed != at or d.len != at or d.drafted != 0) return error.PositionMismatch;
+             d.media = if (seq.media) |*m| m.view() else null;
++            try o.flushLate(seq, d);
+             const last = stop == ids.len;
+             try o.forwardMain(seq, ids[at..stop], .{ .logits = if (last) .last else .none, .streams = d.streams.ptr });
+             const head_to = @min(stop, ids.len - 1);
+@@ -486,6 +487,9 @@ pub fn Ops(comptime Tri: type) type {
+             d.history = seq.history;
+             @memcpy(d.ids[0..n], ids);
+             const keeps = n > 1;
++            // a window nobody rolls back chains in place: the rows still waiting for the states are taken first
++            if (!keeps) try o.flushLate(seq, d);
++            d.keep.pend = @intCast(d.pend);
+             if (keeps) try copyAsync(o.stream(), d.saved.ptr + Draft.tail_at, seq.tail.ptr, ple_tail_n * wide * 2);
+             try o.e.forward(Tri, o.tri, seq, ids, .{ .logits = .all, .logits_out = d.logits.ptr, .keep = if (keeps) &d.keep else null, .streams = d.streams.ptr });
+             if (keeps) try copyAsync(o.stream(), d.saved.ptr + Draft.nrow_at, o.e.batch_s.?.ple_nrow, n * wide * 2);
+@@ -511,6 +515,8 @@ pub fn Ops(comptime Tri: type) type {
+                 d.history = seq.history;
+                 @memcpy(d.ids[0..n], ids);
+                 const keeps = n > 1;
++                if (!keeps) try o.flushLate(seq, d);
++                d.keep.pend = @intCast(d.pend);
+                 if (keeps) try copyAsync(o.stream(), d.saved.ptr + Draft.tail_at, seq.tail.ptr, ple_tail_n * wide * 2);
+                 w.* = .{ .seq = seq, .ids = ids, .keep = if (keeps) &d.keep else null, .streams = d.streams.ptr, .logits = d.logits.ptr };
+             }
+@@ -647,9 +653,13 @@ pub fn Ops(comptime Tri: type) type {
+             seq.history = hist;
+             try copyAsync(st, seq.tail.ptr, d.saved.ptr + Draft.tail_at, ple_tail_n * wide * 2);
+             try shift(k, st, seq.tail.ptr, d.saved.ptr + Draft.nrow_at, wide, keep, ple_tail_n, wide);
++            // TF_FLASHNEXT_KEEP_LATE: the conv windows move on, the states do not: the kept rows are already in the log, after the
++            // rows waiting there, and the next window's chain takes them (or flushLate, when too many would wait)
++            const late = d.log != null;
++            if (late) try o.convRoll(seq, d, keep);
+             var li: usize = 0;
+             for (e.layers[0..e.n_layers], 0..) |*lw, layer| {
+-                if (!lw.linear) continue;
++                if (!lw.linear or late) continue;
+                 defer li += 1;
+                 // the sequence's state is still the window's start (the pass wrote its end state to the spare)
+                 const lk = d.keep.layers[layer];
+@@ -678,6 +688,58 @@ pub fn Ops(comptime Tri: type) type {
+             }
+             d.rows = keep;
+             d.open = false;
++            if (late) {
++                d.pend += keep;
++                d.keep.pend = @intCast(d.pend);
++                if (d.pend > Draft.late_max) try o.flushLate(seq, d);
++            }
++        }
++
++        /// Every DeltaNet layer's conv window moved to the history before the window and on past its first `keep` rows, in one launch
++        /// (a copy of the saved history and fn_shift_window over the saved projection rows, layer by layer, in the replaying rollback).
++        fn convRoll(o: Self, seq: *prompt.Seq, d: *Draft, keep: usize) !void {
++            const e = o.e;
++            const first = seq.conv[0].ptr;
++            if (d.conv_table == null or d.conv_first != first) {
++                var ptrs: [linear_n]u64 = undefined;
++                for (&ptrs, seq.conv[0..linear_n]) |*p, b| p.* = b.ptr;
++                if (d.conv_table) |*t| t.free();
++                d.conv_table = try cuda.DeviceBuffer.fromHost(e.driver, std.mem.sliceAsBytes(&ptrs));
++                d.conv_first = first;
++            }
++            var a: cuda.Args = .{};
++            a.add(d.conv_table.?.ptr);
++            a.add(d.saved.ptr + Draft.hist_at);
++            a.add(@as(c_longlong, @intCast(conv_bytes / 2)));
++            a.add(d.saved.ptr + Draft.proj_at);
++            a.add(@as(c_longlong, @intCast(max_rows * gdn.proj_width)));
++            a.add(@as(c_longlong, @intCast(gdn.proj_width)));
++            a.add(cint(keep));
++            a.add(cint(gdn.taps - 1));
++            a.add(cint(gdn.conv_dim));
++            try cuda.launch.launch(e.batch_k.conv_roll, .{ .grid = .{ .x = @intCast((gdn.conv_dim + 255) / 256), .y = linear_n }, .block = .{ .x = 256 } }, o.stream(), &a);
++        }
++
++        /// The rows waiting in the draft's log taken by the sequence's DeltaNet states, in place (fn_gdn_rows_late with no rows).
++        pub fn flushLate(o: Self, seq: *prompt.Seq, d: *Draft) !void {
++            if (d.pend == 0) return;
++            if (d.log == null or o.main != null or d.open) return error.CannotRewind;
++            const e = o.e;
++            const st = o.stream();
++            var li: usize = 0;
++            for (e.layers[0..e.n_layers], 0..) |*lw, layer| {
++                if (!lw.linear) continue;
++                defer li += 1;
++                const lk = d.keep.layers[layer];
++                var a: cuda.Args = .{};
++                for ([_]u64{ 0, lk.log_k, lk.log_v, lk.log_gb, seq.state[li].ptr, seq.state[li].ptr }) |p| a.add(p);
++                a.add(cint(0));
++                a.add(@as(u64, 0));
++                a.add(cint(d.pend));
++                try cuda.launch.launch(e.batch_k.chain_late, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 16 }, .block = .{ .x = 128 } }, st, &a);
++            }
++            d.pend = 0;
++            d.keep.pend = 0;
+         }
+ 
+         fn shift(k: *const batch.Kernels, st: cuda.Stream, win: u64, rows_ptr: u64, stride: usize, n: usize, taps: usize, c: usize) !void {
+diff --git a/zig/tests/cuda/flashnext_keep_late_tests.zig b/zig/tests/cuda/flashnext_keep_late_tests.zig
+new file mode 100644
+index 0000000..13dff5c
+--- /dev/null
++++ b/zig/tests/cuda/flashnext_keep_late_tests.zig
+@@ -0,0 +1,170 @@
++//! TF_FLASHNEXT_KEEP_LATE: a window kept in part leaves its rows in the draft's log for the next window's chain instead of replaying
++//! them, and everything the engine sees afterwards (scores, hidden rows, conv windows, n-gram tails, the DeltaNet states once
++//! they are taken) is byte for byte what the replaying rollback leaves.
++const std = @import("std");
++const cuda = @import("cuda");
++const flash = @import("flashnext");
++const check = @import("check.zig");
++const prompt = flash.prompt;
++const mtp = flash.mtp;
++
++const lanes_n = 3;
++/// Rounds a script runs: lane 0's 25 pairs of consecutive keeps twice over, then 20 rounds keeping one row (the log overflows).
++const pairs_rounds = 50;
++const rounds = pairs_rounds + 20;
++
++const Side = struct {
++    seqs: [lanes_n]prompt.Seq = undefined,
++    drafts: [lanes_n]mtp.Draft = undefined,
++    made: usize = 0,
++
++    fn deinit(s: *Side, gpa: std.mem.Allocator) void {
++        for (s.seqs[0..s.made], s.drafts[0..s.made]) |*q, *d| {
++            d.deinit();
++            q.deinit(gpa);
++        }
++    }
++};
++
++pub fn run(gpu: check.Gpu, dir: []const u8, ids_path: []const u8) !void {
++    const source = try std.Io.Dir.cwd().readFileAlloc(gpu.io, ids_path, gpu.gpa, .limited(1 << 20));
++    defer gpu.gpa.free(source);
++    var base: std.ArrayList(u32) = .empty;
++    defer base.deinit(gpu.gpa);
++    var words = std.mem.tokenizeAny(u8, source, " \r\n\t");
++    while (words.next()) |word| try base.append(gpu.gpa, try std.fmt.parseInt(u32, word, 10));
++    if (base.items.len < 16) return error.BadPrompt;
++    var stream = try cuda.Stream.init(gpu.d, true);
++    defer stream.deinit();
++    var glue = try flash.Glue.load(gpu.d);
++    defer glue.deinit();
++    const tri: flash.Tri = .{ .s = stream, .own = &glue };
++    const e = try prompt.Engine.init(gpu.gpa, gpu.io, @constCast(gpu.d), &stream, dir);
++    defer e.deinit();
++    const ops: mtp.Ops(flash.Tri) = .{ .e = e, .tri = tri, .h = undefined };
++    var shared = try cuda.DeviceBuffer.alloc(gpu.d, 64 * prompt.vocabulary * 2);
++    defer shared.free();
++    for ([_]usize{ @min(base.items.len, 100), 2600 }) |length| {
++        const ids = try gpu.gpa.alloc(u32, length);
++        defer gpu.gpa.free(ids);
++        for (ids, 0..) |*t, i| t.* = base.items[i % base.items.len];
++        for ([_]bool{ true, false }) |together| try script(gpu, e, ops, &stream, shared.ptr, ids, together);
++    }
++}
++
++/// Lane `i`'s window in round `r`: its width and kept rows. Lane 0 is 5 rows with every pair of keeps in turn, lane 1 varies in
++/// width (1-row windows take the waiting rows in place), lane 2 is 16 rows wide (the log's whole capacity with 16 waiting).
++fn plan(i: usize, r: usize) struct { width: usize, keep: usize } {
++    switch (i) {
++        0 => {
++            const keep = if (r < pairs_rounds) 1 + (if (r % 2 == 0) (r / 2 / 5) % 5 else (r / 2) % 5) else 1;
++            return .{ .width = 5, .keep = keep };
++        },
++        1 => {
++            const width = 1 + (r * 5 + 3) % 8;
++            return .{ .width = width, .keep = 1 + (r * 7 + 2) % width };
++        },
++        else => return .{ .width = 16, .keep = 1 + (r * 3 + 1) % 16 },
++    }
++}
++
++fn script(gpu: check.Gpu, e: *prompt.Engine, ops: mtp.Ops(flash.Tri), stream: *cuda.Stream, shared: u64, ids: []const u32, together: bool) !void {
++    const gpa = gpu.gpa;
++    const row_bytes = prompt.vocabulary * 2;
++    const cap = ids.len + rounds * 16 + 64;
++    var replay: Side = .{};
++    defer replay.deinit(gpa);
++    var late: Side = .{};
++    defer late.deinit(gpa);
++    inline for (.{ .{ &replay, false }, .{ &late, true } }) |pair| {
++        const side = pair[0];
++        mtp.Draft.late_force = pair[1];
++        defer mtp.Draft.late_force = null;
++        for (0..lanes_n) |i| {
++            const prompt_len = ids.len - 3 * i;
++            side.seqs[i] = try e.newSeq(cap);
++            side.drafts[i] = mtp.Draft.init(gpa, e.driver, stream.*, cap, 1, e.chunk) catch |err| {
++                side.seqs[i].deinit(gpa);
++                return err;
++            };
++            side.made += 1;
++            try e.forward(flash.Tri, ops.tri, &side.seqs[i], ids[0..prompt_len], .{});
++        }
++    }
++    try check.expect(late.drafts[0].log != null and replay.drafts[0].log == null, "the late side has its log, the replaying one none", .{});
++    const hidden = replay.drafts[0].streams.len / replay.drafts[0].rows_cap;
++    const want = try gpa.alloc(u8, 16 * @max(row_bytes, hidden));
++    defer gpa.free(want);
++    const got = try gpa.alloc(u8, 16 * @max(row_bytes, hidden));
++    defer gpa.free(got);
++    var window: [lanes_n][16]u32 = undefined;
++    var compared: usize = 0;
++    var waited: usize = 0;
++    for (0..rounds) |r| {
++        var seqs: [lanes_n]*prompt.Seq = undefined;
++        var ds: [lanes_n]*mtp.Draft = undefined;
++        var idss: [lanes_n][]const u32 = undefined;
++        for (0..lanes_n) |i| {
++            const w = plan(i, r).width;
++            for (window[i][0..w], 0..) |*t, k| t.* = @intCast((37 + 101 * i + 17 * k + 29 * r) % 50_000);
++            try ops.verify(&replay.seqs[i], &replay.drafts[i], window[i][0..w]);
++            seqs[i] = &late.seqs[i];
++            ds[i] = &late.drafts[i];
++            idss[i] = window[i][0..w];
++            if (!together) try ops.verify(seqs[i], ds[i], idss[i]);
++        }
++        if (together) try ops.verifyMany(&seqs, &ds, &idss, shared);
++        try stream.synchronize();
++        for (0..lanes_n) |i| {
++            const w = plan(i, r).width;
++            inline for (.{ .{ "scores", row_bytes, "logits" }, .{ "hidden rows", hidden, "streams" } }) |f| {
++                try e.driver.check(e.driver.api.cuMemcpyDtoH_v2(want.ptr, @field(replay.drafts[i], f[2]).ptr, w * f[1]), "cuMemcpyDtoH");
++                try e.driver.check(e.driver.api.cuMemcpyDtoH_v2(got.ptr, @field(late.drafts[i], f[2]).ptr, w * f[1]), "cuMemcpyDtoH");
++                try check.sameBytes("a window after waiting rows has the replaying side's " ++ f[0], got[0 .. w * f[1]], want[0 .. w * f[1]]);
++            }
++            compared += 1;
++            const keep = plan(i, r).keep;
++            try ops.rollback(&replay.seqs[i], &replay.drafts[i], keep);
++            try ops.rollback(&late.seqs[i], &late.drafts[i], keep);
++            try stream.synchronize();
++            try check.expect(replay.seqs[i].fed == late.seqs[i].fed, "kept positions match", .{});
++            try check.expect(std.mem.eql(i64, &replay.seqs[i].history, &late.seqs[i].history), "kept n-gram histories match", .{});
++            try sameConv(gpu, replay.seqs[i], late.seqs[i]);
++            try sameBuf(gpu, "the n-gram tail after a rollback", replay.seqs[i].tail, late.seqs[i].tail);
++            waited += late.drafts[i].pend;
++            // the states: equal whenever none wait; a lane's waiting rows are taken now every seventh round and its states compared
++            if (late.drafts[i].pend > 0 and r % 7 == 6 and r < pairs_rounds) {
++                try ops.flushLate(&late.seqs[i], &late.drafts[i]);
++                try stream.synchronize();
++            }
++            if (late.drafts[i].pend == 0) try sameStates(gpu, replay.seqs[i], late.seqs[i]);
++        }
++    }
++    // every lane's waiting rows taken, then one plain row on each
++    for (0..lanes_n) |i| {
++        try ops.flushLate(&late.seqs[i], &late.drafts[i]);
++        try stream.synchronize();
++        try sameStates(gpu, replay.seqs[i], late.seqs[i]);
++        try e.forward(flash.Tri, ops.tri, &replay.seqs[i], &.{13}, .{});
++        try e.forward(flash.Tri, ops.tri, &late.seqs[i], &.{13}, .{});
++        try stream.synchronize();
++        try check.sameBytes("the row after the last rollback", late.seqs[i].logits, replay.seqs[i].logits);
++    }
++    check.pass("keep late, {s}, {d} lanes x {d} rounds at {d} prompt tokens: {d} windows' scores and hidden rows, conv windows, tails and states byte-exact ({d} waiting rows seen)", .{ if (together) "shared passes" else "lone passes", lanes_n, rounds, ids.len, compared, waited });
++}
++
++fn sameBuf(gpu: check.Gpu, what: []const u8, want: cuda.DeviceBuffer, got: cuda.DeviceBuffer) !void {
++    const xs = try check.download(gpu, want);
++    defer gpu.gpa.free(xs);
++    const ys = try check.download(gpu, got);
++    defer gpu.gpa.free(ys);
++    try check.sameBytes(what, ys, xs);
++}
++
++fn sameConv(gpu: check.Gpu, a: prompt.Seq, b: prompt.Seq) !void {
++    for (a.conv, b.conv) |x, y| try sameBuf(gpu, "a conv window after a rollback", x, y);
++}
++
++fn sameStates(gpu: check.Gpu, a: prompt.Seq, b: prompt.Seq) !void {
++    for (a.state, b.state) |x, y| try sameBuf(gpu, "a DeltaNet state after a rollback", x, y);
++}
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index 0f969ca..a5f0816 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -80,6 +80,7 @@ const flashnext_model_rank_tests = @import("flashnext_model_rank_tests.zig");
+ const flashnext_fidelity_tests = @import("flashnext_fidelity_tests.zig");
+ const flashnext_window_tests = @import("flashnext_window_tests.zig");
+ const flashnext_windows_tests = @import("flashnext_windows_tests.zig");
++const flashnext_keep_late_tests = @import("flashnext_keep_late_tests.zig");
+ const flashnext_mtp_parity_tests = @import("flashnext_mtp_parity_tests.zig");
+ const flashnext_score_tests = @import("flashnext_score_tests.zig");
+ const flashnext_rank_tests = @import("flashnext_rank_tests.zig");
+@@ -115,6 +116,7 @@ const usage =
+     \\  flashnext-fidelity-rank MODEL RANK PORT FIXTURE OUTPUT  fixed-history full score rows
+     \\  flashnext-window-rank MODEL RANK PORT IDS_FILE  two-rank serial/window and rollback parity
+     \\  flashnext-windows MODEL IDS_FILE  several streams' windows in one shared verify against each alone
++    \\  flashnext-keep-late MODEL IDS_FILE  windows kept in part with TF_FLASHNEXT_KEEP_LATE's waiting rows against the replaying rollback, byte for byte
+     \\  flashnext-mtp-parity MODEL IDS_FILE  several streams' MTP heads in one shared pass against each alone
+     \\  flashnext-score MODEL IDS_FILE  decisions' label scores against a plain pass's last row
+     \\  flashnext-model-rank MODEL RANK PORT IDS_FILE  explicit full-model replay experiment (no drafts)
+@@ -291,6 +293,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "flashnext-fidelity-single-serial")) return flashnext_fidelity_tests.runSingle(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), true);
+     if (std.mem.eql(u8, cmd, "flashnext-fidelity-rank")) return flashnext_fidelity_tests.run(gpu, try arg(rest, 0), try std.fmt.parseInt(usize, try arg(rest, 1), 10), try std.fmt.parseInt(u16, try arg(rest, 2), 10), try arg(rest, 3), try arg(rest, 4));
+     if (std.mem.eql(u8, cmd, "flashnext-windows")) return flashnext_windows_tests.run(gpu, try arg(rest, 0), try arg(rest, 1));
++    if (std.mem.eql(u8, cmd, "flashnext-keep-late")) return flashnext_keep_late_tests.run(gpu, try arg(rest, 0), try arg(rest, 1));
+     if (std.mem.eql(u8, cmd, "flashnext-mtp-parity")) return flashnext_mtp_parity_tests.run(gpu, try arg(rest, 0), try arg(rest, 1));
+     if (std.mem.eql(u8, cmd, "flashnext-score")) return flashnext_score_tests.run(gpu, try arg(rest, 0), try arg(rest, 1));
+     if (std.mem.eql(u8, cmd, "flashnext-window-rank")) return flashnext_window_tests.run(gpu, try arg(rest, 0), try std.fmt.parseInt(usize, try arg(rest, 1), 10), try std.fmt.parseInt(u16, try arg(rest, 2), 10), try arg(rest, 3));

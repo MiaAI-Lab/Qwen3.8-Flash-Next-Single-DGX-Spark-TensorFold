@@ -2,7 +2,7 @@
 # Prepare this Spark to serve Qwen3.8-Flash-Next ($QUANT_LABEL; see CHECKPOINT in scripts/config.sh) with TensorFold's Zig engine (tensorfold-native, one GPU):
 #   1. preflight: docker, the GPU, disk
 #   2. the image: tensorfold-native built from TensorFold (TF_REF) plus patches/*.patch with Zig, on NVIDIA's
-#      PyTorch container, with the TP=1 kernel set; pulled prebuilt when a matching tag is reachable (PULL=0 skips
+#      PyTorch container (kernels are embedded in the binary), with libjpeg-turbo and libwebp's decoder; pulled prebuilt when a matching tag is reachable (PULL=0 skips
 #      that), else built locally
 #   3. the checkpoint in the Hugging Face cache (~96 GiB for the NVIDIA FP4 default, ~122 GiB for CHECKPOINT=int4), at its pinned revision
 #   4. verify it: every shard its index names is there, and it is a checkpoint format this engine serves (ModelOpt NVFP4 or GPTQ int4)
@@ -110,9 +110,45 @@ if [[ $REBUILD -eq 1 || "$built_hash" != "$PATCHES_HASH" ]]; then
   docker build ${DOCKER_BUILD_ARGS:-} "${nocache[@]}" -t "$IMAGE" --build-arg BASE_IMAGE="$BASE_IMAGE" \
     --build-arg TF_REPO="$TF_REPO" --build-arg TF_REF="$TF_REF" \
     --build-arg ZIG_VERSION="$ZIG_VERSION" --build-arg ZIG_SHA256="$ZIG_SHA256" \
-    --build-arg PATCHES_HASH="$PATCHES_HASH" --build-arg KERNEL_SOURCE_MTIME="$KERNEL_SOURCE_MTIME" \
+    --build-arg LIBJPEG_TURBO_VERSION="$LIBJPEG_TURBO_VERSION" --build-arg LIBJPEG_TURBO_SHA256="$LIBJPEG_TURBO_SHA256" \
+    --build-arg LIBWEBP_VERSION="$LIBWEBP_VERSION" --build-arg LIBWEBP_SHA256="$LIBWEBP_SHA256" \
+    --build-arg TF_RELEASE_VERSION="$TF_RELEASE_VERSION" --build-arg TF_RELEASE_AARCH64_SHA256="$TF_RELEASE_AARCH64_SHA256" \
+    --build-arg PATCHES_HASH="$PATCHES_HASH" \
     -f - "$ctx" <<'DOCKERFILE'
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
+FROM ${BASE_IMAGE} AS codecs
+ARG LIBJPEG_TURBO_VERSION
+ARG LIBJPEG_TURBO_SHA256
+ARG LIBWEBP_VERSION
+ARG LIBWEBP_SHA256
+RUN mkdir -p /src /opt/codecs && cd /src && \
+    curl -fsSL -o jt.tar.gz "https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/${LIBJPEG_TURBO_VERSION}/libjpeg-turbo-${LIBJPEG_TURBO_VERSION}.tar.gz" && \
+    echo "${LIBJPEG_TURBO_SHA256}  jt.tar.gz" | sha256sum -c - && \
+    tar -xzf jt.tar.gz && cmake -S libjpeg-turbo-${LIBJPEG_TURBO_VERSION} -B jt-build -DCMAKE_BUILD_TYPE=Release \
+      -DENABLE_SHARED=ON -DENABLE_STATIC=OFF -DWITH_TURBOJPEG=ON -DCMAKE_INSTALL_PREFIX=/opt/codecs/jpeg -DCMAKE_INSTALL_LIBDIR=lib && \
+    cmake --build jt-build -j"$(nproc)" && cmake --install jt-build && \
+    test -e /opt/codecs/jpeg/lib/libturbojpeg.so.0
+RUN cd /src && \
+    curl -fsSL -o webp.tar.gz "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-${LIBWEBP_VERSION}.tar.gz" && \
+    echo "${LIBWEBP_SHA256}  webp.tar.gz" | sha256sum -c - && \
+    tar -xzf webp.tar.gz && cd libwebp-${LIBWEBP_VERSION} && \
+    ./configure --prefix=/opt/codecs/webp --enable-libwebpdecoder --disable-static --disable-gl --disable-sdl --disable-png --disable-jpeg --disable-tiff --disable-gif --disable-wic && \
+    make -j"$(nproc)" && make install && \
+    test -e /opt/codecs/webp/lib/libwebpdecoder.so.3
+
+FROM ${BASE_IMAGE} AS grammar
+ARG TF_RELEASE_VERSION
+ARG TF_RELEASE_AARCH64_SHA256
+RUN mkdir -p /opt/tfrel && cd /tmp && \
+    curl -fsSL -o tf-rel.tar.gz "https://github.com/ashhart/TensorFold/releases/download/v${TF_RELEASE_VERSION}/tensorfold-${TF_RELEASE_VERSION}-linux-aarch64.tar.gz" && \
+    echo "${TF_RELEASE_AARCH64_SHA256}  tf-rel.tar.gz" | sha256sum -c - && \
+    tar -xzf tf-rel.tar.gz -C /opt/tfrel --strip-components=1 \
+      tensorfold-${TF_RELEASE_VERSION}-linux-aarch64/lib/libtfgrammar.so \
+      tensorfold-${TF_RELEASE_VERSION}-linux-aarch64/LICENSES/xgrammar-Apache-2.0.txt \
+      tensorfold-${TF_RELEASE_VERSION}-linux-aarch64/LICENSES/xgrammar-NOTICE.txt \
+      tensorfold-${TF_RELEASE_VERSION}-linux-aarch64/LICENSES/dlpack-Apache-2.0.txt && \
+    test -s /opt/tfrel/lib/libtfgrammar.so
+
 FROM ${BASE_IMAGE} AS build
 ARG ZIG_VERSION
 ARG ZIG_SHA256
@@ -128,36 +164,26 @@ RUN git init -q /tensorfold && cd /tensorfold && git remote add origin "${TF_REP
 COPY patches /opt/tf-patches
 RUN cd /tensorfold && \
     for p in /opt/tf-patches/*.patch; do [ -e "$p" ] || continue; echo "applying $p"; git apply --check "$p" && git apply "$p" || exit 1; done
+# fatbins + native only: the default install also builds tf-cuda-test, which does not compile on 1.1.4 (contract_controls.cu, w4a8_tests.zig)
 RUN cd /tensorfold && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Doptimize=fast --prefix /opt/tensorfold \
-      -j"$(nproc)" fatbins install native && \
+      -j"$(nproc)" fatbins native && \
     test -x /opt/tensorfold/native/bin/tensorfold-native
 RUN mkdir -p /opt/tensorfold/share/doc/tensorfold && cd /tensorfold && \
     for f in LICENSE LICENSE.md LICENSES NOTICE THIRD_PARTY_NOTICES.md; do \
       if [ -e "$f" ]; then cp -a "$f" /opt/tensorfold/share/doc/tensorfold/ || exit 1; fi; done
-ARG KERNEL_SOURCE_MTIME
-RUN cd /tensorfold && python -B -c 'import json, os, sys; t = int(sys.argv[1]); \
-      [os.utime(os.path.join("src", f), (t, t)) for f in sorted({k["source"]["file"] for k in \
-       json.load(open("zig/tests/cuda/flashnext/kernels.json"))["kernels"]})]' "${KERNEL_SOURCE_MTIME}" && \
-    PYTHONPATH=/tensorfold/src python -B tools/zig/flashnext_aot.py build \
-      --spec zig/tests/cuda/flashnext/kernels.json --jit zig/tests/cuda/flashnext/jit.json --tp 1 \
-      --out /opt/tensorfold/share/tensorfold/cuda/sm121 > /tmp/aot.log || true && \
-    cat /tmp/aot.log && \
-    grep -q 'kernels ->' /tmp/aot.log && \
-    bad=$(grep PROBLEM /tmp/aot.log | grep -v 'cubin sha256' || true) && \
-    test -z "$bad" && \
-    test -f /opt/tensorfold/share/tensorfold/cuda/sm121/aot.json
 
 FROM ${BASE_IMAGE}
 COPY --from=build /opt/tensorfold /opt/tensorfold
-COPY --from=build /tensorfold/src/tensorfold /opt/tensorfold/python/tensorfold
-RUN ln -s /opt/tensorfold/native/bin/tensorfold-native /usr/local/bin/tensorfold-native && \
-    pip install --no-cache-dir "huggingface_hub>=1.0" && \
-    pip install --no-cache-dir --no-deps "transformers==5.17.0" "av==19.0.1"
+COPY --from=codecs /opt/codecs/jpeg/lib/libturbojpeg.so* /opt/tensorfold/lib/
+COPY --from=codecs /opt/codecs/webp/lib/libwebpdecoder.so* /opt/tensorfold/lib/
+# the engine looks for libtfgrammar.so in <binary dir>/../lib, i.e. next to native/bin
+COPY --from=grammar /opt/tfrel/lib/libtfgrammar.so /opt/tensorfold/native/lib/libtfgrammar.so
+COPY --from=grammar /opt/tfrel/LICENSES /opt/tensorfold/share/doc/tensorfold/LICENSES-grammar
+RUN ln -s /opt/tensorfold/native/bin/tensorfold-native /usr/local/bin/tensorfold-native
 ARG PATCHES_HASH
-LABEL tf.patches=${PATCHES_HASH} tf.kernels=present
-ENV HF_HOME=/root/.cache/huggingface TENSORFOLD_CUDA_KERNELS=/opt/tensorfold/share/tensorfold/cuda/sm121 \
-    CUDA_CACHE_PATH=/cache/nv \
-    TENSORFOLD_VISION_PYTHONPATH=/opt/tensorfold/python
+LABEL tf.patches=${PATCHES_HASH} tf.kernels=embedded
+ENV HF_HOME=/root/.cache/huggingface CUDA_CACHE_PATH=/cache/nv \
+    TENSORFOLD_LIBTURBOJPEG=/opt/tensorfold/lib/libturbojpeg.so.0 TENSORFOLD_LIBWEBP=/opt/tensorfold/lib/libwebpdecoder.so.3
 WORKDIR /workspace
 DOCKERFILE
   rm -rf -- "$ctx"; trap - EXIT

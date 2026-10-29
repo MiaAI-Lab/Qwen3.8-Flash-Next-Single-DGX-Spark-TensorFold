@@ -1,0 +1,512 @@
+diff --git a/docs/vision.md b/docs/vision.md
+index 8ff61c7..ca207cc 100644
+--- a/docs/vision.md
++++ b/docs/vision.md
+@@ -30,7 +30,7 @@ tensorfold serve TensorFold/Qwen3.8-27B-MLX-4bit --vision
+ tensorfold serve TensorFold/GLM-5.3-Flash-MLX-4bit-MTP --vision
+ ```
+ 
+-GLM-5.3-Flash image input is currently MLX-only. CUDA uses the same flag with `--backend cuda` for supported Qwen checkpoints; their vision tower must use floating-point weights.
++GLM-5.3-Flash image input is currently MLX-only. CUDA uses the same flag with `--backend cuda` for supported Qwen checkpoints; their vision tower must use floating-point weights, except that ModelOpt's MXFP8 and NVFP4 vision linears (nvidia/Qwen3.8-Flash-Next-FP4-Local) are decoded to bf16 at load, so the tower runs in bf16 as ever.
+ 
+ On a small CUDA card the resident tower and its 4 GiB workspace reserve take a large part of the startup budget. `--vision-offload` (with `--vision`, CUDA only) keeps the tower in host RAM, copies it to the GPU only while an image is encoded, and reserves 2.25 GiB instead. On one RTX 4090 with the Qwen3.8-27B EXL3 3.50bpw pack and DFlash2, the largest window with `--vision` went from 11,922 to 38,686 tokens; a 4,096-token image peaked about 1.3 GB above idle. Each image request pays the copy of the roughly 0.9 GiB tower to the GPU and back.
+ MLX also reads per-module quantized tower weights when the checkpoint declares their format.
+diff --git a/zig/src/vision/qwen_cuda_dequant.zig b/zig/src/vision/qwen_cuda_dequant.zig
+new file mode 100644
+index 0000000..40bebd8
+--- /dev/null
++++ b/zig/src/vision/qwen_cuda_dequant.zig
+@@ -0,0 +1,143 @@
++//! ModelOpt's quantized vision linears (MXFP8, NVFP4) decoded on the host to the bf16 the CUDA tower reads.
++//! The arithmetic is the Python helper's: fp32 products rounded once to bf16, nearest even.
++const std = @import("std");
++const core = @import("core");
++const convert = core.quant.convert;
++const fp8 = core.quant.fp8;
++const nvfp4_format = core.quant.nvfp4;
++
++pub const Kind = enum { mxfp8, nvfp4 };
++
++/// Inputs sharing one scale: an e8m0 power of two (MXFP8) or an e4m3 value (NVFP4).
++pub fn group(kind: Kind) usize {
++    return switch (kind) {
++        .mxfp8 => 32,
++        .nvfp4 => nvfp4_format.group,
++    };
++}
++
++/// Every e4m3fn code as fp32; 0x7f and 0xff are NaN, as torch's float8_e4m3fn reads them.
++fn e4m3Values() [256]f32 {
++    var t: [256]f32 = undefined;
++    for (&t, 0..) |*v, b| {
++        const exp: i32 = @intCast((b >> 3) & 0xF);
++        const man: f32 = @floatFromInt(b & 7);
++        const mag: f32 = if (b & 0x7f == 0x7f) std.math.nan(f32) else if (exp == 0) std.math.ldexp(man, -9) else std.math.ldexp(8 + man, exp - 10);
++        v.* = if (b & 0x80 != 0) -mag else mag;
++    }
++    return t;
++}
++
++/// Every e8m0 byte as the fp32 power of two 2^(e - 127); 255 is NaN.
++fn e8m0Values() [256]f32 {
++    var t: [256]f32 = undefined;
++    for (&t, 0..) |*v, e| v.* = if (e == 255) std.math.nan(f32) else std.math.ldexp(@as(f32, 1), @as(i32, @intCast(e)) - 127);
++    return t;
++}
++
++/// bf16 [n, k] of an NVFP4 linear: e2m1 code * e4m3 scale per 16 inputs * `global`, low nibble first, as fp32.
++pub fn nvfp4(out: []u16, codes: []const u8, scales: []const u8, global: f32, n: usize, k: usize) void {
++    const grid = [16]f32{ 0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6 };
++    const e4m3 = e4m3Values();
++    const groups = k / 16;
++    for (0..n) |r| for (0..groups) |g| {
++        const scale = e4m3[scales[r * groups + g]];
++        const bytes = codes[r * (k / 2) + g * 8 ..][0..8];
++        const dst = out[r * k + g * 16 ..][0..16];
++        for (bytes, 0..) |byte, j| {
++            dst[2 * j] = convert.bf16(grid[byte & 0xF] * scale * global);
++            dst[2 * j + 1] = convert.bf16(grid[byte >> 4] * scale * global);
++        }
++    };
++}
++
++/// bf16 [n, k] of an MXFP8 linear: e4m3 code * 2^(e8m0 - 127) per 32 inputs, as fp32.
++pub fn mxfp8(out: []u16, codes: []const u8, scales: []const u8, n: usize, k: usize) void {
++    const e4m3 = e4m3Values();
++    const powers = e8m0Values();
++    const groups = k / 32;
++    for (0..n) |r| for (0..groups) |g| {
++        const scale = powers[scales[r * groups + g]];
++        const src = codes[r * k + g * 32 ..][0..32];
++        const dst = out[r * k + g * 32 ..][0..32];
++        for (src, dst) |code, *v| v.* = convert.bf16(e4m3[code] * scale);
++    };
++}
++
++fn bf16Value(bits: u16) f32 {
++    return @bitCast(@as(u32, bits) << 16);
++}
++
++test "Qwen tower weights: every e4m3 and e8m0 byte decodes as core's references" {
++    const e4m3 = e4m3Values();
++    const powers = e8m0Values();
++    for (0..256) |b| {
++        const want = fp8.e4m3(@intCast(b));
++        if (std.math.isNan(want)) {
++            try std.testing.expect(std.math.isNan(e4m3[b]));
++        } else try std.testing.expectEqual(@as(f32, @floatCast(want)), e4m3[b]);
++        if (b == 255) {
++            try std.testing.expect(std.math.isNan(powers[b]));
++        } else try std.testing.expectEqual(std.math.pow(f64, 2, @as(f64, @floatFromInt(b)) - 127), @as(f64, powers[b]));
++    }
++    try std.testing.expectEqual(@as(u32, 0x00400000), @as(u32, @bitCast(powers[0]))); // 2^-127, an fp32 subnormal
++}
++
++test "Qwen tower weights: NVFP4 against hand-decoded values" {
++    // one row of 32: bytes 0 and 8 open the two scale groups; 0xF2 holds code 2 (1.0) low and code 15 (-6) high
++    var codes: [16]u8 = @splat(0);
++    codes[0] = 0xF2;
++    codes[1] = 0x97; // code 7 (6), code 9 (-0.5)
++    codes[8] = 0x35; // column 16: code 5 (3), column 17: code 3 (1.5)
++    codes[15] = 0x80; // column 30: code 0, column 31: code 8 (negative zero)
++    const scales = [_]u8{ 0x38, 0x40 }; // 1.0 and 2.0
++    var out: [32]u16 = undefined;
++    nvfp4(&out, &codes, &scales, 0.25, 1, 32);
++    const want = [_]struct { at: usize, value: f32 }{
++        .{ .at = 0, .value = 0.25 },
++        .{ .at = 1, .value = -1.5 },
++        .{ .at = 2, .value = 1.5 },
++        .{ .at = 3, .value = -0.125 },
++        .{ .at = 16, .value = 1.5 },
++        .{ .at = 17, .value = 0.75 },
++        .{ .at = 5, .value = 0 },
++    };
++    for (want) |w| try std.testing.expectEqual(w.value, bf16Value(out[w.at]));
++    try std.testing.expectEqual(@as(u16, 0x0000), out[30]);
++    try std.testing.expectEqual(@as(u16, 0x8000), out[31]); // -0 stays -0
++    // a global scale that is no power of two: the fp32 product rounds to bf16 once, nearest even
++    nvfp4(out[0..16], codes[0..8], scales[0..1], 0.0123, 1, 16);
++    try std.testing.expectEqual(convert.bf16(1.0 * 1.0 * 0.0123), out[0]);
++    try std.testing.expectEqual(convert.bf16(-6.0 * 1.0 * 0.0123), out[1]);
++}
++
++test "Qwen tower weights: NVFP4 NaN scales stay NaN and a zero scale zeroes its group" {
++    const codes: [16]u8 = @splat(0x22);
++    const scales = [_]u8{ 0x7f, 0x00 };
++    var out: [32]u16 = undefined;
++    nvfp4(&out, &codes, &scales, 1, 1, 32);
++    for (out[0..16]) |v| try std.testing.expect(std.math.isNan(bf16Value(v)));
++    for (out[16..]) |v| try std.testing.expectEqual(@as(f32, 0), bf16Value(v));
++}
++
++test "Qwen tower weights: MXFP8 against hand-decoded values" {
++    // two rows of 32: e4m3 0x38 is 1.0, 0xC0 is -2, 0x7E is 448, 0x01 is 2^-9
++    var codes: [64]u8 = @splat(0x38);
++    codes[1] = 0xC0;
++    codes[2] = 0x7E;
++    codes[3] = 0x01;
++    codes[32] = 0x00;
++    const scales = [_]u8{ 127 + 3, 127 - 2 }; // 8 and 0.25
++    var out: [64]u16 = undefined;
++    mxfp8(&out, &codes, &scales, 2, 32);
++    try std.testing.expectEqual(@as(f32, 8), bf16Value(out[0]));
++    try std.testing.expectEqual(@as(f32, -16), bf16Value(out[1]));
++    try std.testing.expectEqual(@as(f32, 3584), bf16Value(out[2]));
++    try std.testing.expectEqual(@as(f32, 0.015625), bf16Value(out[3]));
++    try std.testing.expectEqual(@as(f32, 0), bf16Value(out[32]));
++    try std.testing.expectEqual(@as(f32, 0.25), bf16Value(out[33]));
++    // e8m0 255 is NaN and 0 is 2^-127 (the bf16 subnormal 0x0040 for 1.0)
++    mxfp8(&out, &codes, &.{ 255, 0 }, 2, 32);
++    try std.testing.expect(std.math.isNan(bf16Value(out[0])));
++    try std.testing.expectEqual(@as(u16, 0x0040), out[33]);
++}
+diff --git a/zig/src/vision/qwen_cuda_weights.zig b/zig/src/vision/qwen_cuda_weights.zig
+index 7fdd005..2b6bd5d 100644
+--- a/zig/src/vision/qwen_cuda_weights.zig
++++ b/zig/src/vision/qwen_cuda_weights.zig
+@@ -1,6 +1,7 @@
+ //! The CUDA tower's checkpoint names, shapes and byte order, shared with its CPU regression fixtures.
+ const std = @import("std");
+ const core = @import("core");
++const dequant = @import("qwen_cuda_dequant.zig");
+ const mlx_prefix = "vision_tower.";
+ const hf_prefix = "model.visual.";
+ pub const patch = 16;
+@@ -37,6 +38,49 @@ const Reader = struct {
+         return sink.put(tn.bytes);
+     }
+ 
++    /// A linear's weight as bf16: stored so, or ModelOpt's MXFP8 or NVFP4 planes and scales decoded on the host.
++    fn linear(r: *Reader, gpa: std.mem.Allocator, sink: anytype, name: []const u8, shape: [2]usize) !u64 {
++        var buf: [96]u8 = undefined;
++        const full = try std.fmt.bufPrint(&buf, "{s}{s}", .{ r.prefix, name });
++        const stored = try r.ck.get(full);
++        const kind: dequant.Kind = switch (stored.dtype) {
++            .f8_e4m3 => .mxfp8,
++            .u8 => .nvfp4,
++            else => return r.get(sink, name, &shape),
++        };
++        const n, const k = shape;
++        const width = if (kind == .nvfp4) k / 2 else k;
++        const stem = full[0 .. full.len - ".weight".len];
++        if (!std.mem.endsWith(u8, full, ".weight") or k % dequant.group(kind) != 0 or !stored.is(stored.dtype, &.{ n, width })) return refuse(full, kind);
++        var sb: [112]u8 = undefined;
++        const scale = try r.ck.get(try std.fmt.bufPrint(&sb, "{s}.weight_scale", .{stem}));
++        const scale_ok = switch (kind) {
++            .mxfp8 => scale.is(.u8, &.{ n, k / 32 }) or scale.is(.f8_e8m0, &.{ n, k / 32 }),
++            .nvfp4 => scale.is(.f8_e4m3, &.{ n, k / 16 }),
++        };
++        if (!scale_ok) return refuse(full, kind);
++        var global: f32 = 1;
++        if (kind == .nvfp4) {
++            const g = try r.ck.get(try std.fmt.bufPrint(&sb, "{s}.weight_scale_2", .{stem}));
++            if (g.dtype != .f32 or g.numel() != 1) return refuse(full, kind);
++            global = @bitCast(std.mem.readInt(u32, g.bytes[0..4], .little));
++        }
++        const activation = try std.fmt.bufPrint(&sb, "{s}.input_scale", .{stem});
++        if (r.ck.has(activation)) _ = try r.ck.get(activation); // W4A4's static activation scale; the tower runs bf16
++        const out = try gpa.alloc(u16, n * k);
++        defer gpa.free(out);
++        switch (kind) {
++            .nvfp4 => dequant.nvfp4(out, stored.bytes, scale.bytes, global, n, k),
++            .mxfp8 => dequant.mxfp8(out, stored.bytes, scale.bytes, n, k),
++        }
++        return sink.put(std.mem.sliceAsBytes(out));
++    }
++
++    fn refuse(name: []const u8, kind: dequant.Kind) error{UnexpectedTensor} {
++        std.log.err("{s}: not a ModelOpt {t} vision linear of the tower's shape", .{ name, kind });
++        return error.UnexpectedTensor;
++    }
++
+     fn copy(r: *Reader, gpa: std.mem.Allocator, c: anytype, sink: anytype) !void {
+         const hidden = c.hidden;
+         const intermediate = c.intermediate;
+@@ -68,14 +112,15 @@ const Reader = struct {
+             inline for (shapes) |sh| {
+                 var nb: [96]u8 = undefined;
+                 const shape: [sh[2].len]usize = sh[2];
+-                @field(b, sh[0]) = try r.get(sink, try std.fmt.bufPrint(&nb, "blocks.{d}.{s}", .{ i, sh[1] }), &shape);
++                const at = try std.fmt.bufPrint(&nb, "blocks.{d}.{s}", .{ i, sh[1] });
++                @field(b, sh[0]) = if (shape.len == 2) try r.linear(gpa, sink, at, shape) else try r.get(sink, at, &shape);
+             }
+         }
+         sink.merger_norm_w = try r.get(sink, "merger.norm.weight", &.{hidden});
+         sink.merger_norm_b = try r.get(sink, "merger.norm.bias", &.{hidden});
+-        sink.fc1_w = try r.get(sink, "merger.linear_fc1.weight", &.{ merged, merged });
++        sink.fc1_w = try r.linear(gpa, sink, "merger.linear_fc1.weight", .{ merged, merged });
+         sink.fc1_b = try r.get(sink, "merger.linear_fc1.bias", &.{merged});
+-        sink.fc2_w = try r.get(sink, "merger.linear_fc2.weight", &.{ c.out_hidden, merged });
++        sink.fc2_w = try r.linear(gpa, sink, "merger.linear_fc2.weight", .{ c.out_hidden, merged });
+         sink.fc2_b = try r.get(sink, "merger.linear_fc2.bias", &.{c.out_hidden});
+         if (r.ck.unused() != 0) return error.UnusedVisionTensors;
+     }
+diff --git a/zig/src/vision/qwen_cuda_weights_logs.zig b/zig/src/vision/qwen_cuda_weights_logs.zig
+index 58a7a65..c52155e 100644
+--- a/zig/src/vision/qwen_cuda_weights_logs.zig
++++ b/zig/src/vision/qwen_cuda_weights_logs.zig
+@@ -8,7 +8,8 @@ pub fn log(comptime level: std.log.Level, comptime scope: @EnumLiteral(), compti
+         count += 1;
+         const known = scope == .default and (std.mem.eql(u8, format, "checkpoint has no tensor {s}") or
+             std.mem.eql(u8, format, "{s}: {t} {any}, expected {t} {any}") or
+-            std.mem.eql(u8, format, "unused checkpoint tensor {s}"));
++            std.mem.eql(u8, format, "unused checkpoint tensor {s}") or
++            std.mem.eql(u8, format, "{s}: not a ModelOpt {t} vision linear of the tower's shape"));
+         if (!known) unexpected += 1;
+     }
+     std.debug.print(format ++ "\n", args);
+diff --git a/zig/src/vision/qwen_cuda_weights_quant_test.zig b/zig/src/vision/qwen_cuda_weights_quant_test.zig
+new file mode 100644
+index 0000000..17fdd49
+--- /dev/null
++++ b/zig/src/vision/qwen_cuda_weights_quant_test.zig
+@@ -0,0 +1,233 @@
++//! NVIDIA's ModelOpt vision tower (MXFP8 attention, NVFP4 MLP and merger) through the real reader, no CUDA libraries.
++const std = @import("std");
++const core = @import("core");
++const weights = @import("qwen_cuda_weights.zig");
++const fixture = @import("qwen_cuda_weights_fixture.zig");
++const diagnostics = @import("qwen_weights_diagnostics");
++const convert = core.quant.convert;
++const fp8 = core.quant.fp8;
++const nvfp4 = core.quant.nvfp4;
++
++const config: fixture.Config = .{ .hidden = 32, .intermediate = 16, .depth = 1, .out_hidden = 4 };
++const Form = enum { dense, mxfp8, nvfp4 };
++const Spec = struct { suffix: []const u8, shape: []const usize, form: Form = .dense };
++const tower = [_]Spec{
++    .{ .suffix = "patch_embed.proj.weight", .shape = &.{ 32, 3, 2, 16, 16 } },
++    .{ .suffix = "patch_embed.proj.bias", .shape = &.{32} },
++    .{ .suffix = "pos_embed.weight", .shape = &.{ 2304, 32 } },
++    .{ .suffix = "blocks.0.norm1.weight", .shape = &.{32} },
++    .{ .suffix = "blocks.0.norm1.bias", .shape = &.{32} },
++    .{ .suffix = "blocks.0.attn.qkv.weight", .shape = &.{ 96, 32 }, .form = .mxfp8 },
++    .{ .suffix = "blocks.0.attn.qkv.bias", .shape = &.{96} },
++    .{ .suffix = "blocks.0.attn.proj.weight", .shape = &.{ 32, 32 }, .form = .mxfp8 },
++    .{ .suffix = "blocks.0.attn.proj.bias", .shape = &.{32} },
++    .{ .suffix = "blocks.0.norm2.weight", .shape = &.{32} },
++    .{ .suffix = "blocks.0.norm2.bias", .shape = &.{32} },
++    .{ .suffix = "blocks.0.mlp.linear_fc1.weight", .shape = &.{ 16, 32 }, .form = .nvfp4 },
++    .{ .suffix = "blocks.0.mlp.linear_fc1.bias", .shape = &.{16} },
++    .{ .suffix = "blocks.0.mlp.linear_fc2.weight", .shape = &.{ 32, 16 }, .form = .nvfp4 },
++    .{ .suffix = "blocks.0.mlp.linear_fc2.bias", .shape = &.{32} },
++    .{ .suffix = "merger.norm.weight", .shape = &.{32} },
++    .{ .suffix = "merger.norm.bias", .shape = &.{32} },
++    .{ .suffix = "merger.linear_fc1.weight", .shape = &.{ 128, 128 }, .form = .nvfp4 },
++    .{ .suffix = "merger.linear_fc1.bias", .shape = &.{128} },
++    .{ .suffix = "merger.linear_fc2.weight", .shape = &.{ 4, 128 }, .form = .nvfp4 },
++    .{ .suffix = "merger.linear_fc2.bias", .shape = &.{4} },
++};
++
++const Options = struct {
++    e8m0_dtype: bool = false, // the MXFP8 scales as F8_E8M0 instead of U8
++    input_scale: bool = false, // NVFP4 and MXFP8 linears also carry the W4A4 activation scale
++    no_global: ?usize = null, // the tower index of an NVFP4 linear written without weight_scale_2
++    swapped_scale: ?usize = null, // the tower index of a linear whose scale shape is [groups, rows]
++    scale_two_on_mxfp8: bool = false,
++    global_dtype: []const u8 = "F32",
++    global_one: bool = false, // weight_scale_2 as shape [1] instead of a scalar
++    stored_bf16: ?usize = null, // the tower index of a quantized linear stored as BF16 of the right shape instead
++};
++
++/// Seeded bytes; NaN codes and scales (0x7f, 0xff) are left out, e8m0 bytes stay within 2^-27 to 2^13.
++fn fill(bytes: []u8, seed: u64, form: Form, plane: enum { codes, scales }) void {
++    var rng = std.Random.DefaultPrng.init(seed);
++    for (bytes) |*b| {
++        b.* = rng.random().int(u8);
++        if (plane == .scales and form == .mxfp8) b.* = 100 + b.* % 40;
++        if ((plane == .scales and form == .nvfp4) or (plane == .codes and form == .mxfp8)) {
++            if (b.* & 0x7f == 0x7f) b.* = 0x38;
++        }
++    }
++}
++
++const Built = struct { header: std.ArrayList(u8) = .empty, data: std.ArrayList(u8) = .empty, expected: std.ArrayList([]u16) = .empty };
++
++fn add(a: std.mem.Allocator, built: *Built, name: []const u8, dtype: []const u8, shape: []const usize, bytes: []const u8) !void {
++    var text: std.ArrayList(u8) = .empty;
++    defer text.deinit(a);
++    for (shape, 0..) |d, i| try text.print(a, "{s}{d}", .{ if (i == 0) "" else ",", d });
++    try built.header.print(a, "{s}\"{s}\":{{\"dtype\":\"{s}\",\"shape\":[{s}],\"data_offsets\":[{d},{d}]}}", .{ if (built.header.items.len == 0) "" else ",", name, dtype, text.items, built.data.items.len, built.data.items.len + bytes.len });
++    try built.data.appendSlice(a, bytes);
++}
++
++fn deinit(a: std.mem.Allocator, built: *Built) void {
++    built.header.deinit(a);
++    built.data.deinit(a);
++    for (built.expected.items) |e| a.free(e);
++    built.expected.deinit(a);
++}
++
++fn count(shape: []const usize) usize {
++    var n: usize = 1;
++    for (shape) |d| n *= d;
++    return n;
++}
++
++/// Writes the tower; `built.expected` gets what the loader must hand the sink, tensor by tensor, from fp64 references.
++fn build(a: std.mem.Allocator, built: *Built, o: Options) !void {
++    for (tower, 0..) |t, id| {
++        var buf: [96]u8 = undefined;
++        const name = try std.fmt.bufPrint(&buf, "model.visual.{s}", .{t.suffix});
++        const n = count(t.shape);
++        const expected = try a.alloc(u16, n);
++        errdefer a.free(expected);
++        if (t.form == .dense or o.stored_bf16 == id) {
++            const raw = try a.alloc(u16, n);
++            defer a.free(raw);
++            for (raw, 0..) |*v, i| v.* = fixture.value(id, i);
++            @memcpy(expected, raw);
++            try add(a, built, name, "BF16", t.shape, std.mem.sliceAsBytes(raw));
++            try built.expected.append(a, expected);
++            continue;
++        }
++        const rows, const k = .{ t.shape[0], t.shape[1] };
++        const groups = k / (if (t.form == .nvfp4) @as(usize, 16) else 32);
++        const codes = try a.alloc(u8, if (t.form == .nvfp4) rows * k / 2 else rows * k);
++        defer a.free(codes);
++        const scales = try a.alloc(u8, rows * groups);
++        defer a.free(scales);
++        fill(codes, id * 31 + 1, t.form, .codes);
++        fill(scales, id * 31 + 2, t.form, .scales);
++        const global: f32 = 0.0123 + @as(f32, @floatFromInt(id)) / 1000;
++        const wide = try a.alloc(f64, rows * k);
++        defer a.free(wide);
++        if (t.form == .nvfp4) {
++            try nvfp4.reference(.{
++                .weight = .{ .dtype = .u8, .rank = 2, .shape = .{ rows, k / 2, 1, 1, 1 }, .bytes = codes },
++                .scale = .{ .dtype = .f8_e4m3, .rank = 2, .shape = .{ rows, groups, 1, 1, 1 }, .bytes = scales },
++                .global = &.{global},
++            }, wide);
++        } else for (wide, 0..) |*v, i| v.* = fp8.e4m3(codes[i]) * std.math.pow(f64, 2, @as(f64, @floatFromInt(scales[i / 32])) - 127);
++        for (expected, wide) |*e, v| e.* = convert.bf16(@floatCast(v));
++        try built.expected.append(a, expected);
++        const scale_shape: [2]usize = if (o.swapped_scale == id) .{ groups, rows } else .{ rows, groups };
++        const stored_k = if (t.form == .nvfp4) k / 2 else k;
++        try add(a, built, name, if (t.form == .nvfp4) "U8" else "F8_E4M3", &.{ rows, stored_k }, codes);
++        var sn: [112]u8 = undefined;
++        const scale_dtype = if (t.form == .nvfp4) "F8_E4M3" else if (o.e8m0_dtype) "F8_E8M0" else "U8";
++        try add(a, built, try std.fmt.bufPrint(&sn, "{s}_scale", .{name}), scale_dtype, &scale_shape, scales);
++        const four = std.mem.asBytes(&global);
++        const scalar: []const usize = if (o.global_one) &.{1} else &.{};
++        if (t.form == .nvfp4 and o.no_global != id) try add(a, built, try std.fmt.bufPrint(&sn, "{s}_scale_2", .{name}), o.global_dtype, scalar, if (std.mem.eql(u8, o.global_dtype, "F32")) four else four[0..2]);
++        if (t.form == .mxfp8 and o.scale_two_on_mxfp8) try add(a, built, try std.fmt.bufPrint(&sn, "{s}_scale_2", .{name}), "F32", &.{}, four);
++        if (o.input_scale) try add(a, built, try std.fmt.bufPrint(&sn, "{s}.input_scale", .{name[0 .. name.len - ".weight".len]}), "F32", &.{}, four);
++    }
++}
++
++fn write(a: std.mem.Allocator, tmp: std.testing.TmpDir, o: Options) !Built {
++    var built: Built = .{};
++    errdefer deinit(a, &built);
++    try build(a, &built, o);
++    try built.header.insert(a, 0, '{');
++    try built.header.append(a, '}');
++    var image: std.ArrayList(u8) = .empty;
++    defer image.deinit(a);
++    var size: [8]u8 = undefined;
++    std.mem.writeInt(u64, &size, built.header.items.len, .little);
++    try image.appendSlice(a, &size);
++    try image.appendSlice(a, built.header.items);
++    try image.appendSlice(a, built.data.items);
++    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = image.items });
++    return built;
++}
++
++fn run(a: std.mem.Allocator, dir: []const u8, fail_at: ?usize) !fixture.Sink {
++    var sink: fixture.Sink = .{ .a = a, .fail_at = fail_at };
++    errdefer sink.deinit();
++    try weights.load(a, std.testing.io, dir, config, &sink);
++    return sink;
++}
++
++fn loaded(o: Options) !void {
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    var built = try write(std.testing.allocator, tmp, o);
++    defer deinit(std.testing.allocator, &built);
++    var buf: [96]u8 = undefined;
++    var sink = try run(std.testing.allocator, try fixture.directory(tmp, &buf), null);
++    defer sink.deinit();
++    try std.testing.expectEqual(tower.len, sink.copies.items.len);
++    for (sink.copies.items, built.expected.items, tower) |got, want, t| {
++        try std.testing.expectEqual(want.len * 2, got.len);
++        for (want, 0..) |bits, i| std.testing.expectEqual(bits, std.mem.readInt(u16, got[i * 2 ..][0..2], .little)) catch |err| {
++            std.debug.print("{s}[{d}]\n", .{ t.suffix, i });
++            return err;
++        };
++    }
++}
++
++test "Qwen tower weights: a ModelOpt tower's MXFP8 and NVFP4 linears reach the sink as the fp64 references' bf16" {
++    try loaded(.{});
++}
++
++test "Qwen tower weights: e8m0 scale dtype and the activation scales are accepted" {
++    try loaded(.{ .e8m0_dtype = true, .input_scale = true, .global_one = true });
++}
++
++test "Qwen tower weights: a quantized linear missing or mismatching its planes fails closed" {
++    const cases = [_]struct { o: Options, err: anyerror, logs: usize }{
++        .{ .o = .{ .no_global = 11 }, .err = error.MissingTensor, .logs = 1 },
++        .{ .o = .{ .swapped_scale = 5 }, .err = error.UnexpectedTensor, .logs = 1 },
++        .{ .o = .{ .swapped_scale = 17 }, .err = error.UnexpectedTensor, .logs = 1 },
++        .{ .o = .{ .global_dtype = "F16" }, .err = error.UnexpectedTensor, .logs = 1 },
++        .{ .o = .{ .scale_two_on_mxfp8 = true }, .err = error.UnusedVisionTensors, .logs = 2 },
++    };
++    for (cases) |case| {
++        var tmp = std.testing.tmpDir(.{});
++        defer tmp.cleanup();
++        var built = try write(std.testing.allocator, tmp, case.o);
++        defer deinit(std.testing.allocator, &built);
++        var buf: [96]u8 = undefined;
++        try std.testing.expectError(case.err, run(std.testing.allocator, try fixture.directory(tmp, &buf), null));
++        try diagnostics.expect(case.logs);
++    }
++}
++
++test "Qwen tower weights: a linear stored as bf16 beside quantized ones is read as stored" {
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    var built = try write(std.testing.allocator, tmp, .{ .stored_bf16 = 5 });
++    defer deinit(std.testing.allocator, &built);
++    var buf: [96]u8 = undefined;
++    var sink = try run(std.testing.allocator, try fixture.directory(tmp, &buf), null);
++    defer sink.deinit();
++    for (built.expected.items, sink.copies.items) |want, got| try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), got);
++}
++
++test "Qwen tower weights: copy refusals and allocation failures release the decoded rows" {
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    var built = try write(std.testing.allocator, tmp, .{});
++    defer deinit(std.testing.allocator, &built);
++    var buf: [96]u8 = undefined;
++    const dir = try fixture.directory(tmp, &buf);
++    for ([_]usize{ 5, 7, 11, 17, 19 }) |i| try std.testing.expectError(error.InjectedCopyFailure, run(std.testing.allocator, dir, i));
++    var n: usize = 0;
++    while (true) : (n += 1) {
++        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = n, .resize_fail_index = 0 });
++        if (run(failing.allocator(), dir, null)) |ok| {
++            var sink = ok;
++            sink.deinit();
++        } else |err| if (err != error.OutOfMemory or !failing.has_induced_failure) return err;
++        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
++        if (!failing.has_induced_failure) break;
++    }
++}
+diff --git a/zig/src/vision/qwen_cuda_weights_test.zig b/zig/src/vision/qwen_cuda_weights_test.zig
+index 8d92c93..9952e61 100644
+--- a/zig/src/vision/qwen_cuda_weights_test.zig
++++ b/zig/src/vision/qwen_cuda_weights_test.zig
+@@ -4,6 +4,11 @@ const weights = @import("qwen_cuda_weights.zig");
+ const fixture = @import("qwen_cuda_weights_fixture.zig");
+ const diagnostics = @import("qwen_weights_diagnostics");
+ 
++comptime {
++    _ = @import("qwen_cuda_dequant.zig");
++    _ = @import("qwen_cuda_weights_quant_test.zig");
++}
++
+ fn run(a: std.mem.Allocator, dir: []const u8, fail_at: ?usize) !void {
+     var sink: fixture.Sink = .{ .a = a, .fail_at = fail_at };
+     defer sink.deinit();

@@ -1,0 +1,298 @@
+diff --git a/zig/kernels/cuda/flashnext_attn.cu b/zig/kernels/cuda/flashnext_attn.cu
+index 46c5b86..e70599b 100644
+--- a/zig/kernels/cuda/flashnext_attn.cu
++++ b/zig/kernels/cuda/flashnext_attn.cu
+@@ -309,7 +309,7 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+     // ONE: one [TK] buffer, the tile's keys and then, once the scores are taken, its values (fewer bytes, more blocks)
+     __nv_bfloat16 (*ps)[TK + 8] = reinterpret_cast<__nv_bfloat16 (*)[TK + 8]>(tiles_kv + (ONE ? TK : NB * 2 * TK));
+     __shared__ float red_m[4][QR], red_l[4][QR];
+-    __shared__ int key_ids[NB][TK];
++    __shared__ int key_ids[KV8 ? 2 : NB][TK];
+     const int r = blockIdx.x, hk = blockIdx.y, c = blockIdx.z;
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+     int n = POS0[0] + r + 1;
+@@ -343,30 +343,46 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+             qmm_frag::commit();
+         }
+     };
+-    // KV8: the keys (pass 0) or values (pass 1) of the tile whose ids are in key_ids[0], 16 codes a thread-item, widened
+-    // into the one buffer (blockDim 128: a tile is TK x HD / 16 items, four a thread); an absent key is zero codes, scale 0
+-    auto stage_kv8 = [&](int pass) {
++    // KV8: a thread's four 16-code items a tile and pass (blockDim 128: a tile is TK x HD / 16 items), their codes and the key's
++    // scale held in registers: the next tile's loads are issued before this tile's math, so their latency hides behind it. An
++    // absent key is zero codes, scale 0.
++    uint4 raw_k[4], raw_v[4];
++    float raw_sk[4], raw_sv[4];
++    auto fetch_kv8 = [&](int ids_buf, int pass) {
+         const unsigned char* kc = reinterpret_cast<const unsigned char*>(KC);
+         const unsigned char* vc = reinterpret_cast<const unsigned char*>(VC);
+ #pragma unroll
+         for (int i = 0; i < TK * (HD / 16) / 128; ++i) {
+-            const int e = threadIdx.x + i * 128, k = e / (HD / 16), c = e % (HD / 16), key = key_ids[0][k];
++            const int e = threadIdx.x + i * 128, k = e / (HD / 16), cc16 = e % (HD / 16), key = key_ids[ids_buf][k];
+             uint4 w = make_uint4(0u, 0u, 0u, 0u);
+-            float s = 0.0f;
++            float sc = 0.0f;
+             if (key >= 0) {
+                 const long long slot = static_cast<long long>(key) * HK + hk;
+                 const unsigned char* krow = kc + slot * KS;
+-                w = *reinterpret_cast<const uint4*>((pass == 0 ? krow : vc + slot * HD) + 16 * c);
+-                s = *reinterpret_cast<const float*>(krow + HD + 4 * pass);
++                w = *reinterpret_cast<const uint4*>((pass == 0 ? krow : vc + slot * HD) + 16 * cc16);
++                sc = *reinterpret_cast<const float*>(krow + HD + 4 * pass);
+             }
+-            *reinterpret_cast<uint4*>(&tiles_kv[k][16 * c]) = kv8_widen8(w.x, w.y, s);
+-            *reinterpret_cast<uint4*>(&tiles_kv[k][16 * c + 8]) = kv8_widen8(w.z, w.w, s);
++            if (pass == 0) { raw_k[i] = w; raw_sk[i] = sc; } else { raw_v[i] = w; raw_sv[i] = sc; }
+         }
+-        qmm_frag::commit();  // the group holding the queries' copies (the first call), then an empty one
++    };
++    // the registers' tile widened into the one shared buffer (keys, pass 0, or values, pass 1)
++    auto widen_kv8 = [&](int pass) {
++#pragma unroll
++        for (int i = 0; i < TK * (HD / 16) / 128; ++i) {
++            const int e = threadIdx.x + i * 128, k = e / (HD / 16), cc16 = e % (HD / 16);
++            const uint4 w = pass == 0 ? raw_k[i] : raw_v[i];
++            const float sc = pass == 0 ? raw_sk[i] : raw_sv[i];
++            *reinterpret_cast<uint4*>(&tiles_kv[k][16 * cc16]) = kv8_widen8(w.x, w.y, sc);
++            *reinterpret_cast<uint4*>(&tiles_kv[k][16 * cc16 + 8]) = kv8_widen8(w.z, w.w, sc);
++        }
++    };
++    // a tile's key ids (-1 past the context)
++    auto id_of = [&](int tile_t0, int k) {
++        const int ki = start + tile_t0 + k;
++        return ki < n ? (sparse ? IDS[static_cast<long long>(r) * IDW + ki] : ki) : -1;
+     };
+     // ONE: the keys (pass 0) or the values (pass 1) of the tile whose ids are in key_ids[0], into the one buffer
+     auto load_one = [&](int pass) {
+-        if constexpr (KV8) return stage_kv8(pass);
+         const __nv_bfloat16* src = pass == 0 ? KC : VC;
+         for (int e = threadIdx.x; e < TK * HD / 8; e += blockDim.x) {
+             const int k = e / (HD / 8), v = e % (HD / 8), key = key_ids[0][k];
+@@ -381,10 +397,23 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+     float o[8][4] = {};
+     const int tiles = min(n - start, CH);
+     if (NB == 2) load(0, 0);
++    if constexpr (KV8) {                                   // the first tile's ids, then its codes into registers
++        if (threadIdx.x < TK) key_ids[0][threadIdx.x] = id_of(0, threadIdx.x);
++        __syncthreads();
++        fetch_kv8(0, 0);
++        fetch_kv8(0, 1);
++        qmm_frag::commit();                                // the group holding the queries' copies
++    }
+     for (int t0 = 0, it = 0; t0 < tiles; t0 += TK, ++it) {
+         const int buf = NB == 2 ? it & 1 : 0;
+         const bool ahead = NB == 2 && t0 + TK < tiles;  // the next tile's loads go out before this tile's math
+-        if constexpr (ONE) {
++        const bool more = t0 + TK < tiles;
++        if constexpr (KV8) {
++            // this tile's codes are in registers (issued an iteration ago): its keys widen into the buffer, the next tile's ids beside
++            const int next_id = more && threadIdx.x < TK ? id_of(t0 + TK, threadIdx.x) : -1;
++            widen_kv8(0);
++            if (more && threadIdx.x < TK) key_ids[(it & 1) ^ 1][threadIdx.x] = next_id;
++        } else if constexpr (ONE) {
+             if (threadIdx.x < TK) {
+                 const int ki = start + t0 + threadIdx.x;
+                 key_ids[0][threadIdx.x] = ki < n ? (sparse ? IDS[static_cast<long long>(r) * IDW + ki] : ki) : -1;
+@@ -397,10 +426,13 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+         }
+         Row* kt = tiles_kv + (ONE ? 0 : buf * 2 * TK);
+         Row* vt = ONE ? kt : kt + TK;
+-        const int* keys = key_ids[buf];
++        const int* keys = key_ids[KV8 ? (it & 1) : buf];
+         if constexpr (ONE) qmm_frag::wait<0>();
+         else if (ahead) qmm_frag::wait<3>(); else qmm_frag::wait<1>();
+         __syncthreads();
++        if constexpr (KV8) {
++            if (more) fetch_kv8((it & 1) ^ 1, 0);           // the next tile's keys load during this tile's scores
++        }
+         constexpr int JT = TK / 32;  // a warp's 8-key tiles
+         float s[JT][4] = {};
+ #pragma unroll 4
+@@ -418,7 +450,12 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+         }
+         if constexpr (ONE) {                              // every warp has read the keys: the values take their place
+             __syncthreads();
+-            load_one(1);
++            if constexpr (KV8) {
++                widen_kv8(1);
++                if (more) fetch_kv8((it & 1) ^ 1, 1);
++            } else {
++                load_one(1);
++            }
+         }
+         float tile_m[2] = {-INFINITY, -INFINITY};
+ #pragma unroll
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 9a17a15..170a256 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -273,7 +273,7 @@ pub fn Namespace(comptime Tri: type) type {
+                     dropLane(self, l);
+                     self.lanes.removeByPtr(gop.key_ptr);
+                 }
+-                if (drafting) l.draft = try mtp.Draft.initFor(self.engine.kv, self.gpa, self.engine.driver, self.stream, cap, self.head.?.ids.len, self.engine.chunk);
++                if (drafting) l.draft = try mtp.Draft.initFor(mtp.headFormat(self.engine.kv, cap, @min(self.context + mtp.max_rows, prompt.max_tokens), self.head.?.ids.len, self.engine.chunk), self.gpa, self.engine.driver, self.stream, cap, self.head.?.ids.len, self.engine.chunk);
+                 if (s.images.len != 0) {
+                     const v = self.vision orelse return error.VisionNotEnabled;
+                     l.seq.media = try v.state(ids, s.images);
+@@ -563,7 +563,8 @@ pub fn Namespace(comptime Tri: type) type {
+ 
+         fn snapBytes(ptr: *anyopaque, at: u32) u64 {
+             const self = of(ptr);
+-            return snap.bytesFor(self.engine.kv, at, self.head != null);
++            // a state is sized by the larger head cache a stream may hold
++            return snap.bytesWith(self.engine.kv, if (self.head != null) .bf16 else null, at);
+         }
+ 
+         /// The owner stream's state, its prompt pass standing at `at` (a drafting stream's with the head's rows).
+diff --git a/zig/src/families/flashnext/cuda_mtp.zig b/zig/src/families/flashnext/cuda_mtp.zig
+index 4c1672a..fc6b60a 100644
+--- a/zig/src/families/flashnext/cuda_mtp.zig
++++ b/zig/src/families/flashnext/cuda_mtp.zig
+@@ -247,6 +247,7 @@ pub fn headBytes() usize {
+     return experts + attn + draft + 2 * dims * dims / 2 * 5 / 4;
+ }
+ 
++pub const headFormat = @import("cuda_mtp_draft.zig").headFormat;
+ pub const Pick = @import("cuda_mtp_draft.zig").Pick;
+ pub const Chain = @import("cuda_mtp_draft.zig").Chain;
+ pub const Draft = @import("cuda_mtp_draft.zig").Draft;
+diff --git a/zig/src/families/flashnext/cuda_mtp_draft.zig b/zig/src/families/flashnext/cuda_mtp_draft.zig
+index 580e780..14a2b38 100644
+--- a/zig/src/families/flashnext/cuda_mtp_draft.zig
++++ b/zig/src/families/flashnext/cuda_mtp_draft.zig
+@@ -29,6 +29,20 @@ const max_rows = mtp.max_rows;
+ const conv_bytes = mtp.conv_bytes;
+ const proj_bytes = mtp.proj_bytes;
+ 
++/// The format of the MTP head's own attention cache for a stream of `cap` positions when the engine's main caches are `main`
++/// and a stream is charged its `window`'s bytes with the head's cache in `main` too (cuda_lanes_load.zig streamBytes). The head
++/// is one layer and its drafts are only proposals (the main model verifies every token), but fp8 rows there cost it about a
++/// fifth of its accepted drafts (fewer, less confident drafts). A bf16 head cache takes (2,048 - 1,056) bytes more a position,
++/// so it is used whenever the stream still fits what it is charged: all but a stream within a twentieth of the full window.
++/// TF_FLASHNEXT_HEAD_KV=fp8 keeps the head's cache in the main format.
++pub fn headFormat(main: kv_format.Kv, cap: usize, window: usize, draft_n: usize, rows: usize) kv_format.Kv {
++    if (main == .bf16) return .bf16;
++    if (std.c.getenv("TF_FLASHNEXT_HEAD_KV")) |v| if (std.mem.eql(u8, std.mem.span(v), "fp8")) return main;
++    const used = prompt.seqBytesFor(main, cap) + Draft.bytesFor(.bf16, cap, draft_n, rows);
++    const charged = prompt.seqBytesFor(main, window) + Draft.bytesFor(main, window, draft_n, rows);
++    return if (used <= charged) .bf16 else main;
++}
++
+ /// One draft and its temperature-1 probability under the head.
+ pub const Pick = struct { token: u32, prob: f64 };
+ 
+diff --git a/zig/src/families/flashnext/cuda_mtp_load.zig b/zig/src/families/flashnext/cuda_mtp_load.zig
+index 37062a6..3be6a75 100644
+--- a/zig/src/families/flashnext/cuda_mtp_load.zig
++++ b/zig/src/families/flashnext/cuda_mtp_load.zig
+@@ -6,8 +6,10 @@ const core = @import("core");
+ const projection = @import("cuda_projection.zig");
+ 
+ pub const Mode = enum { bf16, affine4 };
++/// The draft head's rows: 4-bit by default (a fourth of the bytes a chained draft reads, 1.5 ms of the 2.9 a step in bf16; its drafts
++/// are only proposals, so the replies are the target's either way), TF_FLASHNEXT_DRAFT_HEAD=bf16 for the exact rows.
+ pub fn mode() !Mode {
+-    const value = if (std.c.getenv("TF_FLASHNEXT_DRAFT_HEAD")) |v| std.mem.span(v) else "bf16";
++    const value = if (std.c.getenv("TF_FLASHNEXT_DRAFT_HEAD")) |v| std.mem.span(v) else "affine4";
+     if (std.mem.eql(u8, value, "bf16")) return .bf16;
+     if (std.mem.eql(u8, value, "affine4")) return .affine4;
+     return error.BadDraftHead;
+diff --git a/zig/src/families/flashnext/cuda_snap.zig b/zig/src/families/flashnext/cuda_snap.zig
+index 659dc99..80e39a0 100644
+--- a/zig/src/families/flashnext/cuda_snap.zig
++++ b/zig/src/families/flashnext/cuda_snap.zig
+@@ -29,6 +29,12 @@ pub fn bytesFor(format: Kv, at: usize, head: bool) usize {
+     return wt.linear_n * (conv_bytes + state_bytes) + (wt.attn_n + @intFromBool(head)) * attnBytes(format, at) + tail_bytes;
+ }
+ 
++/// bytesFor with the head's cache (when `head_format` is not null) in its own format.
++pub fn bytesWith(format: Kv, head_format: ?Kv, at: usize) usize {
++    const head = if (head_format) |h| attnBytes(h, at) else 0;
++    return wt.linear_n * (conv_bytes + state_bytes) + wt.attn_n * attnBytes(format, at) + head + tail_bytes;
++}
++
+ /// One kept state; `head`: it holds the MTP head's cache over the same rows, which a drafting stream needs.
+ pub const Snap = struct {
+     rank_id: u64 = 0,
+@@ -38,6 +44,8 @@ pub const Snap = struct {
+     head: bool,
+     /// The format of the attention rows it holds (the engine's --kv-cache).
+     kv: Kv = .bf16,
++    /// The format of the head's rows when it holds them.
++    head_kv: Kv = .bf16,
+ };
+ 
+ const Way = enum { save, restore };
+@@ -74,17 +82,17 @@ fn move(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, base: u64, at: usize,
+         try dr.check(dr.api.cuMemcpyDtoDAsync_v2(dst, src, p.n, stream.handle), "cuMemcpyDtoDAsync");
+         off += p.n;
+     };
+-    std.debug.assert(off == bytesFor(seq.kv, at, d != null));
++    std.debug.assert(off == bytesWith(seq.kv, if (d) |h| h.kv else null, at));
+ }
+ 
+ /// A copy of `seq` (and of the head's cache, with `d`) as it stands after `seq.fed` tokens.
+ pub fn save(gpa: std.mem.Allocator, driver: *const cuda.Driver, stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft) !*Snap {
+     const at = seq.fed;
+     if (d) |h| if (h.len != at or h.drafted != 0) return error.NotAtMark;
+-    if (d) |h| if (h.kv != seq.kv) return error.KvFormat;
++    const head_kv: Kv = if (d) |h| h.kv else .bf16;
+     const snap = try gpa.create(Snap);
+     errdefer gpa.destroy(snap);
+-    snap.* = .{ .buf = try cuda.DeviceBuffer.alloc(driver, bytesFor(seq.kv, at, d != null)), .at = at, .history = seq.history, .head = d != null, .kv = seq.kv };
++    snap.* = .{ .buf = try cuda.DeviceBuffer.alloc(driver, bytesWith(seq.kv, if (d != null) head_kv else null, at)), .at = at, .history = seq.history, .head = d != null, .kv = seq.kv, .head_kv = head_kv };
+     errdefer snap.buf.free();
+     try move(stream, seq, d, snap.buf.ptr, at, .save);
+     try stream.synchronize();
+@@ -96,6 +104,7 @@ pub fn restore(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, snap: *const S
+     if (snap.at > seq.cap) return error.SequenceTooShort;
+     if (snap.kv != seq.kv) return error.KvFormat;
+     if (d) |h| if (!snap.head or snap.at > h.cap) return error.NoHeadState;
++    if (d) |h| if (h.kv != snap.head_kv) return error.NoHeadState;
+     // a state with the head's rows serves a stream without drafts too: those rows stay in the buffer
+     try move(stream, seq, d, snap.buf.ptr, snap.at, .restore);
+     try stream.synchronize();
+@@ -146,3 +155,12 @@ test "a piece list moves exactly a state's bytes in either format" {
+         }
+     }
+ }
++
++test "a state with the head's cache in bf16 under fp8 caches takes 2,048 + 256 bytes a token for the head and 1,056 + 256 for each layer" {
++    for ([_]usize{ 0, 1, 4, 513, 262144 }) |at| {
++        try std.testing.expectEqual(bytesFor(.fp8, at, true), bytesWith(.fp8, .fp8, at));
++        try std.testing.expectEqual(bytesFor(.fp8, at, false), bytesWith(.fp8, null, at));
++        try std.testing.expectEqual(bytesFor(.bf16, at, true), bytesWith(.bf16, .bf16, at));
++        try std.testing.expectEqual(at * (2048 - 1056), bytesWith(.fp8, .bf16, at) - bytesWith(.fp8, .fp8, at));
++    }
++}
+diff --git a/zig/src/native/cuda_flashnext_kv8_test.zig b/zig/src/native/cuda_flashnext_kv8_test.zig
+index a5913c3..b0384c0 100644
+--- a/zig/src/native/cuda_flashnext_kv8_test.zig
++++ b/zig/src/native/cuda_flashnext_kv8_test.zig
+@@ -70,3 +70,24 @@ test "the prompt cache keeps about 1.6 times the states in fp8" {
+     const kept_f8 = 16 * GiB / f8;
+     try std.testing.expect(kept_f8 * 10 >= kept_bf * 15);
+ }
++
++test "the MTP head's cache stays bf16 under fp8 main caches while the stream fits what it is charged" {
++    const mtp = flashnext.mtp;
++    const prompt = flashnext.prompt;
++    const full = window + 16;
++    const f8 = flashnext.lanes_load.streamBytes(.fp8, full, draft_ids, chunk, false);
++    // a bf16 engine's head is bf16; an fp8 engine's is bf16 for a stream whose own caches and head fit one full window's charge
++    try std.testing.expectEqual(flashnext.kv_format.Kv.bf16, mtp.headFormat(.bf16, full, full, draft_ids, chunk));
++    for ([_]usize{ 1, 4096, 65536, 200_000 }) |cap| {
++        try std.testing.expectEqual(flashnext.kv_format.Kv.bf16, mtp.headFormat(.fp8, cap, full, draft_ids, chunk));
++        const used = prompt.seqBytesFor(.fp8, cap) + mtp.Draft.bytesFor(.bf16, cap, draft_ids, chunk);
++        try std.testing.expect(used <= f8);
++    }
++    // the full window keeps the fp8 head: five of them still fit the room that holds five fp8 streams
++    try std.testing.expectEqual(flashnext.kv_format.Kv.fp8, mtp.headFormat(.fp8, full, full, draft_ids, chunk));
++    try std.testing.expectEqual(@as(u32, 5), try memory.admit(room(24.36), f8, 0, 5, true));
++    // the largest stream with a bf16 head is within a twentieth of the window
++    var cap: usize = full;
++    while (mtp.headFormat(.fp8, cap, full, draft_ids, chunk) == .fp8) cap -= 1024;
++    try std.testing.expect(cap * 20 > full * 18);
++}

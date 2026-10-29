@@ -5,6 +5,76 @@ Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:
 
 ## Unreleased
 
+**Measured gains of the v1.1.4 build (patches 0001 to 0017) over the db281878 build (patches 0001 to 0015), sparkDash on the same Spark, 2026-10-27.**
+The "before" numbers are the sparkDash tables the README carried (db281878 + patches, patch 0014 era); the "after" numbers are a new sparkDash run on the
+v1.1.4 build. Prose was run at temperature 0.7 with thinking on, code at temperature 0 with thinking off; the README did not record the earlier run's
+sampling settings, so the prose and code comparisons are indicative rather than a controlled A/B. Three concurrent requests were not run, so that row has no
+comparison. Gain is (after / before - 1); for TTFT a negative number is better. One run each: single readings vary by about 3%, and single-stream prose by up to 15%.
+
+Decode, prose (aggregate tok/s / per request tok/s / TTFT ms):
+
+| Concurrent requests | Before | After | Aggregate | Per request | TTFT |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 46-55 (50.5 midpoint) / 195 ms | 55.6 / 136 ms | **+10.1%** (+1.1% to +20.9% over the 46-55 spread) | +10.1% | -30.3% |
+| 2 | 73.5 / 38.1 / 204 | 95.4 / 49.4 / 234 | **+29.8%** | +29.7% | +14.7% |
+| 4 | 106.4 / 27.9 / 243 | 145.1 / 38.1 / 300 | **+36.4%** | +36.6% | +23.5% |
+| 5 | 132.7 / 27.7 / 266 | 156.1 / 35.0 / 370 | **+17.6%** | +26.4% | +39.1% |
+
+Decode, code:
+
+| Concurrent requests | Before | After | Aggregate | Per request | TTFT |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 67.9 / 67.9 / 181 | 110.5 / 110.5 / 164 | **+62.7%** | +62.7% | -9.4% |
+| 2 | 100.1 / 51.3 / 330 | 147.2 / 78.7 / 212 | **+47.1%** | +53.4% | -35.8% |
+| 4 | 131.2 / 34.8 / 323 | 192.9 / 52.7 / 374 | **+47.0%** | +51.4% | +15.8% |
+| 5 | 149.7 / 31.9 / 324 | 217.6 / 48.0 / 403 | **+45.4%** | +50.5% | +24.4% |
+
+Prefill, cold prompts (tok/s / TTFT s; the prompt lengths differ by a few tokens between the runs):
+
+| Prompt | Before | After | Prefill | TTFT |
+| ---: | ---: | ---: | ---: | ---: |
+| 4k | 2,665 / 1.73 | 3,050 / 1.52 | **+14.5%** | -12.1% |
+| 8k | 2,583 / 3.36 | 2,956 / 2.95 | **+14.4%** | -12.2% |
+| 16k | 2,501 / 6.74 | 2,839 / 5.95 | **+13.5%** | -11.7% |
+| 32k | 2,430 / 13.67 | 2,735 / 12.16 | **+12.6%** | -11.0% |
+| 64k | 2,331 / 28.30 | 2,230 / 29.57 | **-4.3%** | +4.5% |
+| 128k | 2,197 / 59.86 | 2,269 / 57.94 | **+3.3%** | -3.2% |
+
+Mean of the rows: prose aggregate +23.5% (1, 2, 4, 5 requests), code aggregate +50.5%, prefill +9.0% (+13.8% from 4k to 32k).
+Not a gain: time to first token under load. At four and five concurrent requests it is 16% to 39% higher than before (prose and code), and the 64k prefill point is
+4.3% lower than the earlier run. The 64k reading is also below this run's own 32k and 128k points, so it looks like noise, but it has not been repeated.
+Against the earlier Python-engine build (prose 54.4, 81.3, 101.6, 123.1 tok/s at 1, 2, 4, 5 requests; code 84.9, 128.3, 159.5, 181.9; prefill 2,315 tok/s at 4k, 1,889 at 128k) the new
+numbers are prose +2%, +17%, +43%, +27%; code +30%, +15%, +21%, +20%; prefill +32% at 4k and +20% at 128k.
+
+**TensorFold v1.1.4 (the latest release) with our changes re-implemented on its own Flash Next CUDA engine.**
+
+v1.1.4 replaces the engine the earlier patches were written against, so patches 0001 to 0031 of the db281878 series are retired and the
+recipe now carries seventeen patches on v1.1.4 (`patches/0001` to `0017`):
+- `0001`, `0002`: v1.1.4 loads NVIDIA's quantized vision tower (MXFP8 attention, NVFP4 MLP and merger decoded to bf16 at load); the image-token budget goes to 16384.
+- `0003`: `--kv-cache fp8` for Flash Next (5 full 262,144-token windows fit; stock v1.1.4 fits 3). `0005`: the fp8 attention reader keeps the next tile in registers, the MTP head's cache stays bf16 and its rows are 4-bit.
+- `0004`, `0006`: the prompt expert tile and prefill work (no drain between prompt chunks, no zero fill of the fp32 `y` buffer, vectorised hyper-connection kernels, a 128x128 MXFP8 prompt tile for prompt passes only, 3072-row chunks).
+- `0007` to `0011`: sampled requests (temperature above 0) join the batched draft pass, GPU top-k candidates with a 3x faster kernel, a round-cost model (off), the n-gram rows of all lanes gathered in one pass, and host draws on worker threads. Settings in `scripts/config.sh`, all bit-identical in output: `TF_FLASHNEXT_SAMPLED_HEADS`, `SAMPLE_CAND`, `GATHER_EARLY`, `HOST_DRAW_THREADS`.
+- `0012`, `0013` (round 2, from profiling the previous build's rounds side by side with this one): a partly rejected draft window no longer replays the DeltaNet state (the kept rows wait in a log and the next verify pass applies them, `TF_FLASHNEXT_KEEP_LATE`, about 3 ms a 5-stream round); the n-gram table is read with `pread` by a thread pool with read-ahead (the draft tokens' rows during the head step, the next prompt chunk's rows during the current one) instead of an mmap that page-faults (`TF_FLASHNEXT_GATHER_READ=pread`, `DRAFT_AHEAD`, `WARM_AHEAD`; the join wait at 5 streams fell from 4-8 ms to about 1 ms, major faults from 44,600 to 2,900 over a 5-stream run), and the last two prompt chunks are evened out when the last would be under 512 rows (`TF_FLASHNEXT_PREFILL_TAIL`). Same bits (exact, sampled-exact compare, toolcheck, visioncheck, prompt_reuse, 200k needle).
+  5 streams, 300 tokens, 3 reps, same prompts, tok/s, previous build / this build / the db281878 build: greedy prose 100.6 / 106.4 / 110.7, greedy code 126.0 / 137.6 / 149.3, sampled prose 91.7 / 101.3 / 100.8, sampled code 108.6 / 121.7 / 122.0, 1 stream sampled 38.6 / 41.4 / 37.3; prefill 3k / 13k / 26k tokens 1,713 / 1,964 / - vs 1,844 / 2,021 / 2,042 vs 2,223 / 2,312 / 2,341.
+- `0014`, `0015` (round 3, prefill): the hyper-connection normalize, down GEMM, up GEMM and mix run as fused kernels in prompt passes (`TF_FLASHNEXT_PROMPT_HC2`), the shared expert's rows go straight into the y slot (`PROMPT_SHARED_DIRECT`), the routed experts use the shared-memory row tiles from 256 rows and the MTP head takes prompt pieces of 1536 rows (`PROMPT_EXPERT_TILE_ROWS`, `HEAD_PIECE`); the MX128 MXFP8 prompt tile runs with two pipeline stages and two blocks an SM (`PROMPT_GEMM2`, 15-25% faster per call). All bit-identical to the unfused path (tf-cuda-test hc-fuse, exact.py, pDS-sampled-exact). The memory reserve default is now 9 GiB: the fused path's scratch takes ~0.55 GiB of the pool and five full 262,144-token windows need 23.9 GiB; keep nothing large running on the Spark while the server starts.
+  Live build, same harness, tok/s, db281878 build / v1.1.4 round 2 / now: cold prefill 3k 2,223 / 1,844 / 2,033, 13k 2,312 / 2,021 / 2,369, 26k 2,341 / 2,042 / 2,411, 52k 2,310 / 2,024 / 2,381; 200k needle prefill 107.6 s / 115.9 s / ~100 s; 5 streams greedy prose 110.7 / 106.4 / 104.6, greedy code 149.3 / 137.6 / 130.2, sampled prose 100.8 / 101.3 / 99.1, sampled code 122.0 / 121.7 / 118.8; 1 stream sampled prose 37.3 / 41.4 / 43.0. Single runs, +-4% noise. Remaining gap: greedy code decode (-13%: the old engine's copy-window drafts), greedy prose -6%, 3k prefill -9%.
+- `0016` (round 4, decode): the shared expert runs on a second stream beside the routed experts in decode rounds, windows and head passes (`TF_FLASHNEXT_SHARED_SIDE`), and a shared round takes every lane's DeltaNet rows in three launches a layer instead of five a lane (`TF_FLASHNEXT_GDN_LANES`, needs `KEEP_LATE`; 432 fewer kernels and 360 fewer copies a 5-stream round). Both on by default, bit-identical (exact.py, pDS-sampled-exact, `tf-cuda-test flashnext-keep-late` byte-exact).
+  Same harness, 5 streams, 300 tokens, 3 reps, tok/s, round 3 / now / the db281878 build: greedy prose 104.6 / 108.8 / 110.7, greedy code 130.2 / 139.1 / 149.3, sampled prose 99.1 / 103.7 / 100.8, sampled code 118.8 / 128.4 / 122.0; 1 stream sampled 43.0 / 40.8 / 37.3 (within noise of round 3); prefill unchanged (3k 2,042, 13k 2,381, 26k 2,410, 52k 2,378); 200k needle prefill 100.7 s. Checks: exact.py --pad 3000, pDS-sampled-exact, toolcheck 3/3, visioncheck, prompt_reuse 30000 (worst 99.3%), needle 200k.
+- `0017` (round 4, decode): the draft chain's stop rule of the db281878 build comes back (v1.1.4 parses a negative `TF_FLASHNEXT_CONFIDENCE` but treats it as "never stop"): keep draft j while the running product p1*...*pj of the draft probabilities is at least 0.4, up to `TF_FLASHNEXT_PRODUCT_STREAMS`=5 streams drafting together (the per-draft floor 0.5 above). It only changes how many draft rows a window asks for, so replies are unchanged. Measured on the previous build, same harness: greedy code +4.3% at 5 streams, +10.2% at 3, +13.6% at 1; prose and sampled within noise. Copy-window proposals were measured and are not the difference (2% of windows). `TF_FLASHNEXT_CONFIDENCE=0.6` restores the stock rule; `TF_FLASHNEXT_COPY_LOG=1` prints copy-window statistics.
+- `libtfgrammar.so`: structured output (`response_format`, `guided_*`) and `tool_choice: "required"` or a named function (also Anthropic's `{"type":"any"}`) returned HTTP 400 on the first v1.1.4 build, because
+  the grammar library is not part of the source build. The image now copies it out of TensorFold's own v1.1.4 release archive (aarch64, SHA-256 pinned in `config.sh`, with xgrammar's and dlpack's Apache-2.0
+  notices in `/opt/tensorfold/share/doc/tensorfold/LICENSES-grammar` and in `NOTICE`). Checked live: a forced call returns `get_weather {"city":"Paris"}`, a JSON schema returns a valid object, and the gates
+  (exact, toolcheck 3/3, visioncheck, prompt_reuse 99.3%) and speeds are unchanged (5 streams: greedy prose 112.9, greedy code 137.8, sampled prose 102.1, sampled code 127.2; prefill 2,035 / 2,384 / 2,417 / 2,383 tok/s at 3k / 13k / 26k / 52k).
+  This answers the structured-output ask of #66 and #69 without their patches.
+- Known limits of the v1.1.4 build (2026-10-27): `CHECKPOINT=int4` is not supported on this branch. `PARALLEL` above 5 does not fit at 262,144 tokens with the default 9 GiB reserve
+  (`PARALLEL=8` needs 38.27 GiB, the budget leaves about 27 to 29 GiB; `PARALLEL=6` starts with a 7 GiB reserve but leaves 0.2 GiB of prompt cache and `prompt_reuse.py` fails).
+  `tools/context_boundary.py` now accepts the streamed over-limit refusal as an error inside the stream (v1.1.4 no longer answers HTTP 400 before the stream opens).
+  The README was rewritten for v1.1.4: current sparkDash tables, the new settings, the 17 patches, KV and memory numbers of this build; the old `bench_streams.py` tables, the INT4 tables
+  and the 1.0.0 system-memory-cache notes were removed.
+- Image: libjpeg-turbo 3.1.4.1 and libwebp 1.6.0's decoder are built from checksummed sources (JPEG and WebP input); `fatbins native` only, since v1.1.4's `install` step does not compile (`contract_controls.cu`, `w4a8_tests.zig`; fixed inside patch 0004).
+- Already in v1.1.4 and dropped from our series: image-prompt reuse (#5), random seeds without a `seed` (`--prompt-seed` restores prompt-keyed seeds), supersede-style cache eviction, the free-after-drain fix for #67. Checkpoint `CHECKPOINT=int4` is not supported by this engine.
+- Measured on one Spark against the previous build (db281878 + the old patches), 5 streams, 300 tokens, same prompts: greedy prose 100.6 vs 110.7 tok/s (distinct prompts), sampled prose 91.7 vs 100.8, 1 stream sampled 38.6 vs 37.3 (faster); prefill 1,713 / 1,964 tok/s at 3k / 13k tokens vs 2,223 / 2,312. v1.1.4 is 10 to 15% behind the previous build at 5 streams and 10 to 15% behind on prefill, and ahead at 1 stream. `tools/exact.py`, `toolcheck.py`, `visioncheck.py`, `prompt_reuse.py` and a 200k needle all pass. The earlier "193 tok/s at 5 streams" came from 5 identical prompts.
+
 **Triage of the open pull requests and issues (2026-10-25): two ports, one new setting and README notes.**
 
 - `patches/0021-flash-next-sliced-fill-one-at-a-time.patch`, from [BadAd84](https://github.com/BadAd84)'s PR #53 and hand-rebased onto the FP4 engine tree: with

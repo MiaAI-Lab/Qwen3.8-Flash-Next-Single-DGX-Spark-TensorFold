@@ -6,14 +6,15 @@ This project's own code, scripts and documentation are licensed under the MIT Li
 This project builds on third-party work that keeps its own license:
 
 TensorFold
-  https://github.com/ashhart/TensorFold (branch zig-flashnext)
+  https://github.com/ashhart/TensorFold (release v1.1.4, commit eab85828)
   Copyright 2026 TensorFold contributors. Apache License, Version 2.0 from 0.6.0; code written before 0.6.0 keeps its
   MIT notice (below). TensorFold's NOTICE reads: "TensorFold / Copyright 2026 TensorFold contributors /
   https://github.com/ashhart/TensorFold".
   scripts/prepare.sh builds TensorFold's Zig engine (tensorfold-native) from TensorFold's source at the commit pinned
   in scripts/config.sh; the image carries that build in /opt/tensorfold and TensorFold's LICENSE, LICENSES/, NOTICE and
   THIRD_PARTY_NOTICES.md in /opt/tensorfold/share/doc/tensorfold. The files in patches/ modify TensorFold's source and
-  are applied to it with git apply before the build. The changes in patches/ are this project's work under the MIT
+  are applied to it with git apply before the build. The changes in patches/ (0001 to 0017) are this project's work, written by MiaAI-Lab (Mia's AI Lab) and listed
+  one by one in CREDITS.md, under the MIT
   License; the TensorFold code they modify, and quote as diff context, stays under TensorFold's licenses: Apache-2.0,
   and for code written before 0.6.0 also its MIT notice (TensorFold's LICENSES/MIT.txt), so keep TensorFold's NOTICE
   and this copyright and permission notice with any copy of a patched tree:
@@ -50,12 +51,19 @@ Zig
   The image build downloads Zig 0.17.0 (zig-aarch64-linux-0.17.0.tar.xz, checked against its sha256) to compile
   TensorFold's Zig engine; the compiler is used in the build stage only and is not part of the published image.
 
+xgrammar and dlpack (inside libtfgrammar.so)
+  https://github.com/mlc-ai/xgrammar (MLC-AI team), https://github.com/dmlc/dlpack (DLPack contributors). Apache License, Version 2.0.
+  scripts/prepare.sh copies the prebuilt lib/libtfgrammar.so out of TensorFold's v1.1.4 release archive (aarch64, checked against its
+  SHA-256 in scripts/config.sh) into /opt/tensorfold/native/lib, with the archive's xgrammar and dlpack license and notice files in
+  /opt/tensorfold/share/doc/tensorfold/LICENSES-grammar. The library serves structured output and required tool calls; nothing of it is
+  modified or compiled here.
+
 Model files (downloaded from Hugging Face by scripts/prepare.sh; not included in this repository or its image)
   The checkpoint this recipe serves by default, nvidia/Qwen3.8-Flash-Next-FP4-Local, is NVIDIA's quantization-aware-distilled
   FP4 export (NVIDIA Model Optimizer) of Qwen/Qwen3.8-Flash-Next by the Qwen team (Alibaba). Its use is governed by the NVIDIA Open
   Model Agreement (https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-agreement/); the base model is under the
   Qwen Community License 1.0 (https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE).
-  The optional checkpoint (CHECKPOINT=int4), azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound, is by azampatti (the
+  The optional checkpoint (CHECKPOINT=int4, served by the db281878 recipe on main, not by this branch), azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound, is by azampatti (the
   top-5 expert cut and the shared-expert healing), built on Intel's AutoRound int4 quantization
   (Intel/Qwen3.8-Flash-Next-W4A16-AutoRound) and on Saren-Arterius's hybrid checkpoint and FP8 n-gram table
   (Saren/Qwen3.8-Flash-Next-ple-table-fp8), of Qwen/Qwen3.8-Flash-Next. Per its model card, it is under the Qwen license

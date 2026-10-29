@@ -1,0 +1,545 @@
+diff --git a/zig/kernels/cuda/flashnext_batch.cu b/zig/kernels/cuda/flashnext_batch.cu
+index 78d7156..6b3797b 100644
+--- a/zig/kernels/cuda/flashnext_batch.cu
++++ b/zig/kernels/cuda/flashnext_batch.cu
+@@ -82,7 +82,7 @@ static __device__ __forceinline__ float conv_act(const __nv_bfloat16* __restrict
+ }  // namespace fn_gdn
+ 
+ // Program (row, unit), 256 threads: key head u's normed q and k (u < NK), else a value head's v, decay g and beta.
+-extern "C" __global__ void __launch_bounds__(256) fn_gdn_front(
++static __device__ __forceinline__ void gdn_front(
+         const __nv_bfloat16* __restrict__ P, const __nv_bfloat16* __restrict__ cs, const __nv_bfloat16* __restrict__ cw,
+         const float* __restrict__ a_log, const float* __restrict__ dt_bias, float* __restrict__ qn,
+         float* __restrict__ kn, float* __restrict__ v, float* __restrict__ gb) {
+@@ -119,6 +119,13 @@ extern "C" __global__ void __launch_bounds__(256) fn_gdn_front(
+     }
+ }
+ 
++extern "C" __global__ void __launch_bounds__(256) fn_gdn_front(
++        const __nv_bfloat16* __restrict__ P, const __nv_bfloat16* __restrict__ cs, const __nv_bfloat16* __restrict__ cw,
++        const float* __restrict__ a_log, const float* __restrict__ dt_bias, float* __restrict__ qn,
++        float* __restrict__ kn, float* __restrict__ v, float* __restrict__ gb) {
++    gdn_front(P, cs, cw, a_log, dt_bias, qn, kn, v, gb);
++}
++
+ // The chain through the chunk from state_in to state_out (in place, or apart for a rollback): a warp 4 state rows.
+ static __device__ __forceinline__ void gdn_rows(
+         const float* __restrict__ qn, const float* __restrict__ kn, const float* __restrict__ v,
+@@ -281,6 +288,77 @@ extern "C" __global__ void __launch_bounds__(128) fn_gdn_rows_late(
+     gdn_rows_late(qn, kn, v, gb, state_in, state_out, rows, ys_out, np);
+ }
+ 
++// ---- the lanes of a shared round in one launch a step (TF_FLASHNEXT_GDN_LANES) ----------------------------------------------
++// One layer of a shared verify round with every lane's rows logged (TF_FLASHNEXT_KEEP_LATE): what the per-lane loop launches as
++// copy proj, copy history, fn_gdn_front, fn_gdn_rows_late and fn_shift_window a lane, as three launches for all lanes. Each lane's
++// program is the per-lane kernel's on that lane's pointers, so every output byte is the same; the lanes touch disjoint memory.
++constexpr int FN_LANES_MAX = 8;
++struct FnGdnLane {
++    const __nv_bfloat16* proj;   // the lane's projection rows [rows, PW]
++    __nv_bfloat16* conv;         // the lane's conv window [TAPS - 1, C], shifted past the rows at the end
++    __nv_bfloat16* proj_save;    // copy of proj (rows x PW), or null
++    __nv_bfloat16* hist_save;    // copy of the window before the shift ([TAPS - 1, C]), or null
++    float* qn;                   // this window's q rows [rows, NK, DK]
++    float* log_k;                // the lane's log of k, v, decay and beta rows (the first np rows wait there)
++    float* log_v;
++    float* log_gb;
++    const float* state_in;
++    float* state_out;
++    float* ys;                   // readouts [rows, NV, DV]
++    int rows;
++    int np;
++};
++struct FnGdnLanes {
++    FnGdnLane lane[FN_LANES_MAX];
++    int count;
++    int max_rows;
++};
++
++// Program (lane, row, unit), 256 threads: the lane's fn_gdn_front of row r (k, v and gates to the log after its np waiting rows),
++// and, on the side, a slice of the copy of the lane's projection rows.
++extern "C" __global__ void __launch_bounds__(256) fn_gdn_front_lanes(
++        const __grid_constant__ FnGdnLanes L, const __nv_bfloat16* __restrict__ cw, const float* __restrict__ a_log,
++        const float* __restrict__ dt_bias) {
++    using namespace fn_gdn;
++    const FnGdnLane& l = L.lane[blockIdx.z];
++    if (blockIdx.x >= l.rows) return;
++    if (l.proj_save != nullptr) {
++        const unsigned total = (unsigned)l.rows * (PW / 2);
++        const unsigned per = (total + (unsigned)l.rows * gridDim.y - 1) / ((unsigned)l.rows * gridDim.y);   // the lane's blocks: rows x units
++        const unsigned b = blockIdx.x * gridDim.y + blockIdx.y;
++        const unsigned lo = b * per;
++        const unsigned hi = lo + per < total ? lo + per : total;
++        const unsigned* src = reinterpret_cast<const unsigned*>(l.proj);
++        unsigned* dst = reinterpret_cast<unsigned*>(l.proj_save);
++        for (unsigned i = lo + threadIdx.x; i < hi; i += blockDim.x) dst[i] = src[i];
++    }
++    gdn_front(l.proj, l.conv, cw, a_log, dt_bias, l.qn, l.log_k + (size_t)l.np * NK * DK, l.log_v + (size_t)l.np * NV * DV,
++              l.log_gb + (size_t)l.np * NV * 2);
++}
++
++// Program (lane, block of 128 threads): fn_gdn_rows_late on the lane's pointers.
++extern "C" __global__ void __launch_bounds__(128) fn_gdn_rows_late_lanes(const __grid_constant__ FnGdnLanes L) {
++    const FnGdnLane& l = L.lane[blockIdx.z];
++    gdn_rows_late(l.qn, l.log_k, l.log_v, l.log_gb, l.state_in, l.state_out, l.rows, l.ys, l.np);
++}
++
++// Program (lane, 256 channels): the lane's history copy and fn_shift_window (taps rows, c channels, the lane's rows PW apart).
++extern "C" __global__ void __launch_bounds__(256) fn_shift_window_lanes(const __grid_constant__ FnGdnLanes L, int taps, int c) {
++    using namespace fn_gdn;
++    const FnGdnLane& l = L.lane[blockIdx.y];
++    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
++    if (ch >= c) return;
++    __nv_bfloat16* win = l.conv;
++    __nv_bfloat16 next[16];
++    for (int j = 0; j < taps; ++j) {
++        const int src = j + l.rows;
++        next[j] = src < taps ? win[(long long)src * c + ch] : l.proj[(long long)(src - taps) * PW + ch];
++    }
++    if (l.hist_save != nullptr)
++        for (int j = 0; j < taps; ++j) l.hist_save[(long long)j * c + ch] = win[(long long)j * c + ch];
++    for (int j = 0; j < taps; ++j) win[(long long)j * c + ch] = next[j];
++}
++
+ extern "C" __global__ void __launch_bounds__(128) fn_gdn_norm(
+         const float* __restrict__ ys_in, const __nv_bfloat16* __restrict__ P, const __nv_bfloat16* __restrict__ norm_w,
+         float eps, __nv_bfloat16* __restrict__ out, float* __restrict__ xs) {
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index d964bf5..c4717bc 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -12,6 +12,7 @@ const batch_lanes = @import("cuda_batch_lanes.zig");
+ const tiles = @import("cuda_tiles.zig");
+ const tk = @import("cuda_tile_kernels.zig");
+ const knobs = @import("cuda_knobs.zig");
++const side_ = @import("cuda_batch_side.zig");
+ 
+ const layers_n = wt.layers_n;
+ const linear_n = wt.linear_n;
+@@ -309,6 +310,8 @@ pub fn Pass(comptime Tri: type) type {
+             } else if (self.lanes.len == 0) {
+                 try self.gdnFront(lw, s.proj, self.seq.conv[li].ptr, n, s.gq, s.gk, s.gv, s.ggb);
+                 try self.gdnChain(s.gq, s.gk, s.gv, s.ggb, self.seq.state[li].ptr, keep.state_out, n, s.ys);
++            } else if (try self.gdnLanesBatched(lw, layer, li)) {
++                // every lane's rows in three launches (TF_FLASHNEXT_GDN_LANES)
+             } else {
+                 // shared rounds: each lane's rows kept, fronted and chained on its own conv window and state
+                 var row0: usize = 0;
+@@ -338,6 +341,62 @@ pub fn Pass(comptime Tri: type) type {
+             self.out_slices = try self.lane(s.gout, s.gxs, lw.out, s.dummy, s.part, n, out_sk);
+         }
+ 
++        /// A shared round's DeltaNet layer for all lanes at once when every lane logs its rows (TF_FLASHNEXT_GDN_LANES): the copies
++        /// of the projection rows and the conv history, the front, the late chain and the window shift as three launches. False
++        /// (nothing queued) when a lane does not log or there are more lanes than a launch takes.
++        fn gdnLanesBatched(self: *Self, lw: *const Layer, layer: usize, li: usize) !bool {
++            if (!knobs.gdnLanes() or self.lanes.len > gdn.lanes_max) return false;
++            const s = self.s;
++            for (self.lanes) |l| {
++                const kp = l.keep orelse return false;
++                const lk = kp.layers[layer];
++                if (lk.log_k == 0 or lk.log_v == 0 or lk.log_gb == 0 or lk.proj % 4 != 0) return false;
++            }
++            var tab: gdn.Lanes = std.mem.zeroes(gdn.Lanes);
++            var row0: usize = 0;
++            var max_rows: usize = 0;
++            for (self.lanes, 0..) |l, i| {
++                const kp = l.keep.?;
++                const lk = kp.layers[layer];
++                const st = l.seq.state[li].ptr;
++                tab.lane[i] = .{
++                    .proj = s.proj + row0 * gdn.proj_width * 2,
++                    .conv = l.seq.conv[li].ptr,
++                    .proj_save = lk.proj,
++                    .hist_save = lk.hist,
++                    .qn = s.gq + row0 * gdn.nk * gdn.dk * 4,
++                    .log_k = lk.log_k,
++                    .log_v = lk.log_v,
++                    .log_gb = lk.log_gb,
++                    .state_in = st,
++                    .state_out = if (lk.state_out != 0) lk.state_out else st,
++                    .ys = s.ys + row0 * gdn.value_dim * 4,
++                    .rows = cint(l.rows),
++                    .np = cint(kp.pend),
++                };
++                max_rows = @max(max_rows, l.rows);
++                row0 += l.rows;
++            }
++            tab.count = cint(self.lanes.len);
++            tab.max_rows = cint(max_rows);
++            const z: u32 = @intCast(self.lanes.len);
++            var f: cuda.Args = .{};
++            f.add(tab);
++            f.add(lw.cw.ptr);
++            f.add(lw.a_log.ptr);
++            f.add(lw.dt.ptr);
++            try cuda.launch.launch(self.k.front_lanes, .{ .grid = .{ .x = @intCast(max_rows), .y = gdn.nk + gdn.nv, .z = z }, .block = .{ .x = 256 } }, self.stream, &f);
++            var a: cuda.Args = .{};
++            a.add(tab);
++            try cuda.launch.launch(self.k.chain_lanes, .{ .grid = .{ .x = gdn.nv, .y = gdn.dv / 16, .z = z }, .block = .{ .x = 128 } }, self.stream, &a);
++            var h: cuda.Args = .{};
++            h.add(tab);
++            h.add(cint(gdn.taps - 1));
++            h.add(cint(gdn.conv_dim));
++            try cuda.launch.launch(self.k.shift_lanes, .{ .grid = .{ .x = @intCast(cdiv(gdn.conv_dim, 256)), .y = z }, .block = .{ .x = 256 } }, self.stream, &h);
++            return true;
++        }
++
+         /// fn_gdn_front over `rows` projection rows after the conv window `conv`.
+         fn gdnFront(self: *Self, lw: *const Layer, proj: u64, conv: u64, rows: usize, gq: u64, gk: u64, gv: u64, ggb: u64) !void {
+             var f: cuda.Args = .{};
+@@ -498,11 +557,54 @@ pub fn Pass(comptime Tri: type) type {
+             return self.moeBlockKeep(lw, .{});
+         }
+ 
++        /// The native shared expert's three projections and SwiGLU, then its scatter into y's last slot (unless `direct`: the
++        /// next write-back reads the fp32 output where it lies), queued on `stream`.
++        fn sharedExpert(self: *Self, native: anytype, stream: cuda.Stream, direct: bool) !void {
++            const s = self.s;
++            const n = self.rows;
++            const glue = self.tri.own orelse return error.NativeGlueRequired;
++            try self.k.native_lane.matmul(stream, s.mixed, dims, n, native.shared[0].native.?, s.shared_gate, s.native_part);
++            try self.k.native_lane.matmul(stream, s.mixed, dims, n, native.shared[1].native.?, s.shared_up, s.native_part);
++            try glue.sharedSwiGLU(stream, s.shared_gate, s.shared_up, s.shared_act, n, moe_w);
++            try self.k.native_lane.matmulF32(stream, s.shared_act, moe_w, n, native.shared[2].native.?, s.shared_out, s.native_part);
++            if (!direct) try glue.sharedScatter(stream, s.shared_out, s.y, n, dims, slots);
++        }
++
++        /// The side stream's NaN fill of what the shared expert writes (TF_FLASHNEXT_SHARED_SIDE_POISON=1).
++        fn poisonShared(self: *Self, stream: cuda.Stream) !void {
++            const s = self.s;
++            const n = self.rows;
++            const d = stream.d;
++            inline for (.{ .{ s.shared_gate, n * moe_w * 2 }, .{ s.shared_up, n * moe_w * 2 }, .{ s.shared_act, n * moe_w * 2 }, .{ s.shared_out, n * dims * 4 }, .{ s.native_part, 8 * n * dims * 4 } }) |b| {
++                try d.check(d.api.cuMemsetD8Async(b[0], 0xff, b[1], stream.handle), "cuMemsetD8Async");
++            }
++        }
++
+         /// moeBlock, keeping its input, experts and weights.
+         pub fn moeBlockKeep(self: *Self, lw: *const Layer, keep: LayerKeep) !void {
+             const s = self.s;
+             const n = self.rows;
+             const pairs = n * slots;
++            // The shared expert reads the normalized rows (s.mixed) and nothing the router and routed experts write; its
++            // scratch is its own for the window and its y slot is outside theirs. On the side stream it starts at once.
++            // A prompt chunk that reads the shared output in place (shared_direct) stays on the compute stream.
++            var side: ?*const side_.Side = null;
++            errdefer if (side) |sd| sd.end(self.stream) catch {};
++            var direct = false;
++            if (lw.native_experts) |*native| {
++                // one rank: the routed kernels and the shared scatter write every slot of every row; ranks sum partial rows
++                if (native.world != 1 or native.rank != 0) try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, pairs * dims * 4, self.stream.handle), "cuMemsetD8Async");
++                // the next write-back reads the shared output where it lies (no copy into y's last slot) when nothing else reads y
++                direct = native.rank == 0 and self.prompt and knobs.sharedDirect() and (self.hooks.logits == .none or self.hooks.streams != 0) and self.hooks.moe_add == null and self.m.pocket == null and keep.moe_branch == 0 and native.world == 1;
++                if (native.rank == 0 and !direct) {
++                    if (try side_.get(&s.side, self.stream.d)) |sd| if (sd.applies(self.prompt)) {
++                        try sd.begin(self.stream);
++                        side = sd;
++                        if (side_.poison()) try self.poisonShared(sd.stream);
++                        try self.sharedExpert(native, sd.stream, false);
++                    };
++                }
++            }
+             try self.copy(keep.moe_x, s.mixed, n * dims * 2);
+             try self.tri.routerMany(s.mixed, lw.router.ptr, s.router_l, dims, n);
+             try self.tri.topkMany(s.router_l, s.picks, s.wts, n);
+@@ -511,19 +613,14 @@ pub fn Pass(comptime Tri: type) type {
+             const e = experts_n + 1;
+             const plan: cuda.grouped.Plan = .{ .members = s.members, .items = s.items, .counts = s.counts, .rank = s.rank, .hist = s.hist };
+             if (lw.native_experts) |*native| {
+-                // one rank: the routed kernels and the shared scatter write every slot of every row; ranks sum partial rows
+-                if (native.world != 1 or native.rank != 0) try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, pairs * dims * 4, self.stream.handle), "cuMemsetD8Async");
+                 try @import("cuda_batch_moe.zig").nativeRouted(self, native, plan);
+-                if (native.rank == 0) {
+-                    const glue = self.tri.own orelse return error.NativeGlueRequired;
+-                    try self.k.native_lane.matmul(self.stream, s.mixed, dims, n, native.shared[0].native.?, s.shared_gate, s.native_part);
+-                    try self.k.native_lane.matmul(self.stream, s.mixed, dims, n, native.shared[1].native.?, s.shared_up, s.native_part);
+-                    try glue.sharedSwiGLU(self.stream, s.shared_gate, s.shared_up, s.shared_act, n, moe_w);
+-                    try self.k.native_lane.matmulF32(self.stream, s.shared_act, moe_w, n, native.shared[2].native.?, s.shared_out, s.native_part);
+-                    // the next write-back reads the shared output where it lies (no copy into y's last slot) when nothing else reads y
+-                    if (self.prompt and knobs.sharedDirect() and (self.hooks.logits == .none or self.hooks.streams != 0) and self.hooks.moe_add == null and self.m.pocket == null and keep.moe_branch == 0 and native.world == 1) {
+-                        self.shared_direct = true;
+-                    } else try glue.sharedScatter(self.stream, s.shared_out, s.y, n, dims, slots);
++                if (side) |sd| {
++                    // behind the join nothing of the shared expert is in flight: s.y is whole and its scratch is free
++                    side = null;
++                    try sd.end(self.stream);
++                } else if (native.rank == 0) {
++                    try self.sharedExpert(native, self.stream, direct);
++                    if (direct) self.shared_direct = true;
+                 }
+                 if (native.world != 1) {
+                     const collective = self.m.collective orelse return error.TensorParallelUnavailable;
+diff --git a/zig/src/families/flashnext/cuda_batch_side.zig b/zig/src/families/flashnext/cuda_batch_side.zig
+new file mode 100644
+index 0000000..56526c2
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_batch_side.zig
+@@ -0,0 +1,173 @@
++//! The MoE shared expert's second stream: forked from the compute stream where its input rows are ready, joined where the
++//! experts' output is first read. One per scratch (so one per engine and rank), made on first use.
++//!
++//! Only the schedule moves: the side stream runs the same kernels on the same arguments as the compute stream did, so the
++//! output bits are the same. The shared expert owns shared_gate/up/act/out and the split-K partials (native_part), which
++//! nothing else touches between the fork and the join; its slot of y is a column range the routed kernels do not write.
++//! Every use of those buffers outside the window is ordered behind the join by the compute stream, and a free waits on the
++//! compute stream, which has the join in front of everything queued after it.
++const std = @import("std");
++const cuda = @import("cuda");
++
++/// Where a layer's shared expert runs.
++pub const Mode = enum {
++    /// On the compute stream, after the routed experts (the v1.1.4 order).
++    off,
++    /// On the side stream in decode rounds, drafted windows and other passes that are not prompt chunks.
++    decode,
++    /// Also in prompt chunks.
++    all,
++};
++
++/// TF_FLASHNEXT_SHARED_SIDE: 0 off, 1 decode and windows, 2 every pass (read once per process).
++pub fn mode() Mode {
++    const v = std.c.getenv("TF_FLASHNEXT_SHARED_SIDE") orelse return .off;
++    const t = std.mem.span(v);
++    if (std.mem.eql(u8, t, "1")) return .decode;
++    if (std.mem.eql(u8, t, "2")) return .all;
++    return .off;
++}
++
++/// TF_FLASHNEXT_SHARED_SIDE_PRIO=high: the side stream gets the context's greatest priority, so its few CTAs are placed
++/// ahead of the routed experts' grid instead of behind it.
++fn highPriority() bool {
++    const v = std.c.getenv("TF_FLASHNEXT_SHARED_SIDE_PRIO") orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "high");
++}
++
++/// TF_FLASHNEXT_SHARED_SIDE_POISON=1: debugging. The side stream fills the shared expert's scratch with NaN bytes before
++/// each use; any byte it reads that it did not write itself then shows up in the replies.
++pub fn poison() bool {
++    const v = std.c.getenv("TF_FLASHNEXT_SHARED_SIDE_POISON") orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
++
++pub const Side = struct {
++    stream: cuda.Stream,
++    /// Recorded on the compute stream (fork), recorded on the side stream (join); ordering only.
++    fork: cuda.Event,
++    join: cuda.Event,
++    mode: Mode,
++
++    pub fn init(d: *const cuda.Driver, m: Mode) !Side {
++        var stream = if (highPriority()) try cuda.Stream.initPriority(d, .highest) else try cuda.Stream.init(d, true);
++        errdefer stream.deinit();
++        var fork = try cuda.Event.init(d, false);
++        errdefer fork.deinit();
++        const join = try cuda.Event.init(d, false);
++        return .{ .stream = stream, .fork = fork, .join = join, .mode = m };
++    }
++
++    /// Waits for the side stream, then releases it; the caller frees nothing the stream could still be using.
++    pub fn deinit(sd: *Side) void {
++        sd.stream.deinit();
++        sd.fork.deinit();
++        sd.join.deinit();
++    }
++
++    /// Whether a pass (`prompt`: a prompt chunk) puts its shared experts here.
++    pub fn applies(sd: *const Side, prompt: bool) bool {
++        return switch (sd.mode) {
++            .off => false,
++            .decode => !prompt,
++            .all => true,
++        };
++    }
++
++    /// The side stream starts behind everything `main` has queued so far (the rows the shared expert reads).
++    pub fn begin(sd: *const Side, main: cuda.Stream) !void {
++        try sd.fork.record(main);
++        try sd.stream.wait(sd.fork);
++    }
++
++    /// `main` continues behind everything the side stream has queued: call before anything reads its outputs.
++    pub fn end(sd: *const Side, main: cuda.Stream) !void {
++        try sd.join.record(sd.stream);
++        try main.wait(sd.join);
++    }
++};
++
++/// The scratch's side stream, made on the first call; null when the knob is off.
++pub fn get(slot: *?Side, d: *const cuda.Driver) !?*Side {
++    if (slot.*) |*sd| return sd;
++    const m = mode();
++    if (m == .off) return null;
++    slot.* = try Side.init(d, m);
++    return &slot.*.?;
++}
++
++const tt = std.testing;
++
++const Fake = struct {
++    var log: [32]u32 = undefined;
++    var n: usize = 0;
++    var made: usize = 0;
++    var destroyed: usize = 0;
++    fn put(code: u32) void {
++        log[n] = code;
++        n += 1;
++    }
++    fn stream(out: *cuda.abi.Stream, _: c_uint) callconv(.c) cuda.abi.Result {
++        made += 1;
++        out.* = @ptrFromInt(0x1000);
++        return 0;
++    }
++    fn streamDestroy(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
++        destroyed += 1;
++        return 0;
++    }
++    fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
++        return 0;
++    }
++    fn event(out: *cuda.abi.Event, _: c_uint) callconv(.c) cuda.abi.Result {
++        made += 1;
++        out.* = @ptrFromInt(0x2000 + made);
++        return 0;
++    }
++    fn eventDestroy(_: cuda.abi.Event) callconv(.c) cuda.abi.Result {
++        destroyed += 1;
++        return 0;
++    }
++    // codes: 1 record(main), 2 wait(side), 3 record(side), 4 wait(main)
++    fn record(_: cuda.abi.Event, s: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
++        put(if (@intFromPtr(s) == 0x1000) 3 else 1);
++        return 0;
++    }
++    fn wait(s: cuda.abi.Stream, _: cuda.abi.Event, _: c_uint) callconv(.c) cuda.abi.Result {
++        put(if (@intFromPtr(s) == 0x1000) 2 else 4);
++        return 0;
++    }
++};
++
++test "the side stream forks behind the compute stream's queue and the compute stream joins behind the side stream's" {
++    var d: cuda.Driver = undefined;
++    d.api.cuStreamCreate = Fake.stream;
++    d.api.cuStreamDestroy_v2 = Fake.streamDestroy;
++    d.api.cuStreamSynchronize = Fake.sync;
++    d.api.cuEventCreate = Fake.event;
++    d.api.cuEventDestroy_v2 = Fake.eventDestroy;
++    d.api.cuEventRecord = Fake.record;
++    d.api.cuStreamWaitEvent = Fake.wait;
++    Fake.n = 0;
++    Fake.made = 0;
++    Fake.destroyed = 0;
++    const main: cuda.Stream = .{ .d = &d, .handle = @ptrFromInt(0x99) };
++    var sd = try Side.init(&d, .decode);
++    try sd.begin(main);
++    try sd.end(main);
++    try sd.begin(main); // the next layer reuses both events
++    try sd.end(main);
++    try tt.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 1, 2, 3, 4 }, Fake.log[0..Fake.n]);
++    sd.deinit();
++    try tt.expectEqual(Fake.made, Fake.destroyed);
++}
++
++test "the modes pick the passes that fork" {
++    var sd: Side = undefined;
++    sd.mode = .off;
++    try tt.expect(!sd.applies(false) and !sd.applies(true));
++    sd.mode = .decode;
++    try tt.expect(sd.applies(false) and !sd.applies(true));
++    sd.mode = .all;
++    try tt.expect(sd.applies(false) and sd.applies(true));
++}
+diff --git a/zig/src/families/flashnext/cuda_batch_state.zig b/zig/src/families/flashnext/cuda_batch_state.zig
+index fe8b52f..0a6c9a4 100644
+--- a/zig/src/families/flashnext/cuda_batch_state.zig
++++ b/zig/src/families/flashnext/cuda_batch_state.zig
+@@ -172,6 +172,11 @@ pub const Kernels = struct {
+     chain_late: cuda.Function,
+     /// Every DeltaNet layer's conv window past a rollback's kept rows (TF_FLASHNEXT_KEEP_LATE).
+     conv_roll: cuda.Function,
++    /// The three launches a lane-batched shared round takes a DeltaNet layer (TF_FLASHNEXT_GDN_LANES): front with the projection
++    /// copy, the late chain, the history copy with the window shift, each for every lane.
++    front_lanes: cuda.Function,
++    chain_lanes: cuda.Function,
++    shift_lanes: cuda.Function,
+     chain_tpr: cuda.Function,
+     /// front + chain + gated norm in one kernel a value head (prompt passes of 64 rows or more).
+     gdn_fused: cuda.Function,
+@@ -221,6 +226,9 @@ pub const Kernels = struct {
+         k.chain_to = try k.batch.function("fn_gdn_rows_to");
+         k.chain_late = try k.batch.function("fn_gdn_rows_late");
+         k.conv_roll = try k.batch.function("fn_conv_roll");
++        k.front_lanes = try k.batch.function("fn_gdn_front_lanes");
++        k.chain_lanes = try k.batch.function("fn_gdn_rows_late_lanes");
++        k.shift_lanes = try k.batch.function("fn_shift_window_lanes");
+         k.chain_tpr = try k.batch.function("fn_gdn_chain_tpr");
+         try k.chain_tpr.allowDynamicShared(chain_tpr_smem);
+         k.gdn_fused = try k.batch.function("fn_gdn_fused");
+@@ -363,6 +371,8 @@ pub const Scratch = struct {
+     host: ?cuda.HostBuffer = null,
+     /// The uploads from `host` and the event recorded after a pass's last one: the next pass waits before writing it.
+     staging: ?Staging(Uploads) = null,
++    /// The shared expert's second stream and its fork and join events, made on first use (cuda_batch_side.zig).
++    side: ?@import("cuda_batch_side.zig").Side = null,
+ 
+     fn add(s: *Scratch, gpa: std.mem.Allocator, d: *const cuda.Driver, len: usize) !u64 {
+         var b = try cuda.DeviceBuffer.alloc(d, @max(len, 256));
+@@ -517,6 +527,8 @@ pub const Scratch = struct {
+     }
+ 
+     pub fn free(s: *Scratch, gpa: std.mem.Allocator) void {
++        // the stream drains first: its kernels read and write buffers freed below
++        if (s.side) |*sd| sd.deinit();
+         if (s.staging) |*g| {
+             // no queued upload may still read `host`; a wait that fails has lost the context, and its copies with it
+             g.ready() catch {};
+diff --git a/zig/src/families/flashnext/cuda_gdn.zig b/zig/src/families/flashnext/cuda_gdn.zig
+index ff8c97d..b15f52a 100644
+--- a/zig/src/families/flashnext/cuda_gdn.zig
++++ b/zig/src/families/flashnext/cuda_gdn.zig
+@@ -21,6 +21,31 @@ pub const log_row_k: usize = nk * dk * 4;
+ pub const log_row_v: usize = value_dim * 4;
+ pub const log_row_gb: usize = nv * 2 * 4;
+ 
++/// One lane of a shared round's DeltaNet layer for the lane-batched kernels (fn_gdn_front_lanes ...; flashnext_batch.cu's FnGdnLane).
++pub const Lane = extern struct {
++    proj: u64,
++    conv: u64,
++    proj_save: u64,
++    hist_save: u64,
++    qn: u64,
++    log_k: u64,
++    log_v: u64,
++    log_gb: u64,
++    state_in: u64,
++    state_out: u64,
++    ys: u64,
++    rows: c_int,
++    np: c_int,
++};
++
++/// The lanes of a shared round passed by value (FnGdnLanes).
++pub const lanes_max = 8;
++pub const Lanes = extern struct {
++    lane: [lanes_max]Lane,
++    count: c_int,
++    max_rows: c_int,
++};
++
+ const symbol: [:0]const u8 = "flashnext_gdn_chain";
+ 
+ fn toBf16(v: f32) u16 {
+diff --git a/zig/src/families/flashnext/cuda_knobs.zig b/zig/src/families/flashnext/cuda_knobs.zig
+index 51241b9..baf8a3a 100644
+--- a/zig/src/families/flashnext/cuda_knobs.zig
++++ b/zig/src/families/flashnext/cuda_knobs.zig
+@@ -74,3 +74,10 @@ pub fn promptGemm2() bool {
+     const v = std.c.getenv("TF_FLASHNEXT_PROMPT_GEMM2") orelse return false;
+     return std.mem.eql(u8, std.mem.span(v), "1");
+ }
++
++/// TF_FLASHNEXT_GDN_LANES=1: a shared round's DeltaNet layers take every lane's rows in three launches (front, late chain, window
++/// shift) instead of five a lane. Each lane's kernel program is the per-lane one's on its own pointers: the same bytes out.
++pub fn gdnLanes() bool {
++    const v = std.c.getenv("TF_FLASHNEXT_GDN_LANES") orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}

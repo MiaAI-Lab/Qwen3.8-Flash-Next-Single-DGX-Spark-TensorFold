@@ -1,0 +1,689 @@
+diff --git a/zig/kernels/cuda/flashnext_mtp.cu b/zig/kernels/cuda/flashnext_mtp.cu
+index 1ac2e6f..2f5dc92 100644
+--- a/zig/kernels/cuda/flashnext_mtp.cu
++++ b/zig/kernels/cuda/flashnext_mtp.cu
+@@ -1,4 +1,5 @@
+-// Flash Next's MTP drafts (cuda_mtp.zig): a score row's best value, its first id and the row's log-sum-exp.
++// Flash Next's MTP drafts (cuda_mtp.zig): a score row's best value, its first id and the row's log-sum-exp, and a row's
++// first `count` candidates for a keyed sampled draw (fn_row_cand).
+ 
+ #include <cuda_bf16.h>
+ #include <math_constants.h>
+@@ -13,6 +14,13 @@ static __device__ __forceinline__ void better(float& v, int& i, float ov, int oi
+     }
+ }
+ 
++// A bf16 score's 16-bit sort key: larger scores get larger keys, and +0 and -0 get one (cuda_mtp.zig candidateKey).
++static __device__ __forceinline__ unsigned cand_key(unsigned short b) {
++    unsigned u = b;
++    if ((u & 0x7fffu) == 0u) u = 0u;
++    return (u & 0x8000u) ? (~u & 0xffffu) : (u | 0x8000u);
++}
++
+ }  // namespace fn_mtp
+ 
+ // Program (row), 1024 threads: out [rows, 4] fp32 holds the best of a row's first V values, its log-sum-exp, its id, 0.
+@@ -68,3 +76,123 @@ extern "C" __global__ void __launch_bounds__(1024) fn_row_best(const __nv_bfloat
+         }
+     }
+ }
++
++// A sampled draw's candidates (cuda_mtp.zig topCandidates is its host form, and the spec). The idea, an exact selection of a
++// row's k best on the device so that the host draws among k scores instead of a whole row, is Track B of the DeepSeek-V4.1
++// recipe (MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold, patch 0021, Mia's AI Lab); this kernel is written for
++// bf16 rows (16-bit keys) and the draw's tie rule here. Program (row), 1024 threads. Of the row's first V bf16 scores (`ld` apart between rows) the first `count` in the draw's order (the larger
++// score first, of equal scores the lower column; +0 and -0 equal) go to vals[row * stride + j] (the score as fp32, exact) and
++// cols[row * stride + j] (its column), in no particular order, and flags[row] = 0. A row with a NaN has no total order: it
++// writes flags[row] = 1 and nothing else, and the host reads that row whole. The count-th largest key is found by two 8-bit
++// histogram passes over the 16-bit keys; the keys above it are taken whole, and of the keys equal to it the lowest columns, by
++// walking the row in tiles of 1,024 columns with a block-wide count of the ties in each.
++extern "C" __global__ void __launch_bounds__(1024) fn_row_cand(const __nv_bfloat16* __restrict__ L, int V, long long ld, int count,
++                                                               int stride, float* __restrict__ vals, int* __restrict__ cols,
++                                                               int* __restrict__ flags) {
++    using namespace fn_mtp;
++    const int r = blockIdx.x, t = threadIdx.x, lane = t & 31, warp = t >> 5;
++    const unsigned short* row = reinterpret_cast<const unsigned short*>(L + static_cast<long long>(r) * ld);
++    const int k = count < V ? count : V;
++    __shared__ unsigned whist[32][256];
++    __shared__ unsigned hist[256];
++    __shared__ unsigned wtie[32];
++    __shared__ unsigned s_left, s_hi, s_cut, s_above, s_taken;
++    if (t == 0) s_left = static_cast<unsigned>(k);
++    // pass 1: the keys' high bytes, a histogram a warp (lanes of one warp seldom share a bin); a NaN ends the row
++    for (int b = t; b < 32 * 256; b += blockDim.x) (&whist[0][0])[b] = 0u;
++    __syncthreads();
++    bool nan = false;
++    for (int i = t; i < V; i += blockDim.x) {
++        const unsigned short b = row[i];
++        nan |= (b & 0x7fffu) > 0x7f80u;
++        atomicAdd(&whist[warp][cand_key(b) >> 8], 1u);
++    }
++    if (__syncthreads_or(nan)) {
++        if (t == 0) flags[r] = 1;
++        return;
++    }
++    if (t < 256) {
++        unsigned sum = 0u;
++        for (int w = 0; w < 32; ++w) sum += whist[w][t];
++        hist[t] = sum;
++    }
++    __syncthreads();
++    if (t == 0) {
++        const unsigned left = s_left;
++        unsigned above = 0u;
++        int b = 255;
++        for (; b > 0; --b) {
++            if (above + hist[b] >= left) break;
++            above += hist[b];
++        }
++        s_left = left - above;
++        s_hi = static_cast<unsigned>(b);
++    }
++    __syncthreads();
++    // pass 2: the low bytes of the keys whose high byte is the cut's
++    for (int b = t; b < 32 * 256; b += blockDim.x) (&whist[0][0])[b] = 0u;
++    __syncthreads();
++    const unsigned hi = s_hi;
++    for (int i = t; i < V; i += blockDim.x) {
++        const unsigned key = cand_key(row[i]);
++        if ((key >> 8) == hi) atomicAdd(&whist[warp][key & 255u], 1u);
++    }
++    __syncthreads();
++    if (t < 256) {
++        unsigned sum = 0u;
++        for (int w = 0; w < 32; ++w) sum += whist[w][t];
++        hist[t] = sum;
++    }
++    __syncthreads();
++    if (t == 0) {
++        const unsigned left = s_left;
++        unsigned above = 0u;
++        int b = 255;
++        for (; b > 0; --b) {
++            if (above + hist[b] >= left) break;
++            above += hist[b];
++        }
++        s_left = left - above;  // the keys equal to the cut that are taken
++        s_cut = (hi << 8) | static_cast<unsigned>(b);
++        s_above = 0u;
++        s_taken = 0u;
++    }
++    __syncthreads();
++    const unsigned cut = s_cut;
++    const unsigned ties = s_left;
++    const unsigned taken_above = static_cast<unsigned>(k) - ties;
++    float* out_v = vals + static_cast<long long>(r) * stride;
++    int* out_c = cols + static_cast<long long>(r) * stride;
++    for (int base = 0; base < V; base += blockDim.x) {
++        const int i = base + t;
++        bool tie = false;
++        if (i < V) {
++            const unsigned short b = row[i];
++            const unsigned key = cand_key(b);
++            if (key > cut) {
++                const unsigned at = atomicAdd(&s_above, 1u);
++                out_v[at] = __bfloat162float(__ushort_as_bfloat16(b));
++                out_c[at] = i;
++            }
++            tie = key == cut;
++        }
++        const unsigned m = __ballot_sync(0xffffffffu, tie);
++        if (lane == 0) wtie[warp] = static_cast<unsigned>(__popc(m));
++        __syncthreads();
++        unsigned before = 0u, total = 0u;
++        for (int w = 0; w < 32; ++w) {
++            if (w < warp) before += wtie[w];
++            total += wtie[w];
++        }
++        if (tie) {
++            const unsigned rank = s_taken + before + static_cast<unsigned>(__popc(m & ((1u << lane) - 1u)));
++            if (rank < ties) {
++                out_v[taken_above + rank] = __bfloat162float(__ushort_as_bfloat16(row[i]));
++                out_c[taken_above + rank] = i;
++            }
++        }
++        __syncthreads();
++        if (t == 0) s_taken += total;
++    }
++    if (t == 0) flags[r] = 0;
++}
+diff --git a/zig/src/families/flashnext/cuda_mtp.zig b/zig/src/families/flashnext/cuda_mtp.zig
+index 37ad6c8..4bf817b 100644
+--- a/zig/src/families/flashnext/cuda_mtp.zig
++++ b/zig/src/families/flashnext/cuda_mtp.zig
+@@ -149,6 +149,115 @@ pub fn isSampled(sm: ?Sampling) bool {
+     return if (sm) |s| s.temperature > 0 else false;
+ }
+ 
++// ---- a row's first candidates from the GPU -------------------------------------------------------------------------------
++
++/// Candidates a row's draw reads at most (a request's top_k; a larger one takes the whole row).
++pub const cand_max: usize = 64;
++
++/// TF_FLASHNEXT_SAMPLE_CAND=1: a sampled draw (a verify window's rows, the draft head's row) reads its row's top_k best
++/// scores and columns, selected on the device (fn_row_cand), instead of the whole row copied to the host and scanned. The
++/// candidates are the set `drawRow` keeps, so the draws are the same bits. Unset or any other value: the whole row.
++pub fn candidatesOn() bool {
++    const v = std.c.getenv("TF_FLASHNEXT_SAMPLE_CAND") orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
++
++/// How many candidates a draw of `sm` over a row of `n` scores needs, null when it must read the row whole (greedy; no top_k;
++/// a top_k as wide as the row or past cand_max).
++pub fn candidateCount(sm: ?Sampling, n: usize) ?usize {
++    const s = sm orelse return null;
++    if (s.temperature <= 0 or s.top_k == 0 or s.top_k >= n or s.top_k > cand_max) return null;
++    return s.top_k;
++}
++
++/// Rows one launch of fn_row_cand serves at most (a window's rows, or the lanes of a batched head step).
++pub const cand_slots: usize = 16;
++/// Device scratch for fn_row_cand's outputs: vals [cand_slots, cand_max] f32, cols [cand_slots, cand_max] i32, flags [cand_slots] i32.
++pub const cand_bytes: usize = 2 * cand_slots * cand_max * 4 + cand_slots * 4;
++
++/// What `Ops.candidates` copies back: slot s holds vals / cols [s * cand_max ..] and flags[s] (non-zero: read that row whole).
++pub const Cands = struct {
++    vals: [cand_slots * cand_max]f32 = undefined,
++    cols: [cand_slots * cand_max]i32 = undefined,
++    flags: [cand_slots]i32 = undefined,
++};
++
++/// A bf16 score's 16-bit sort key (fn_row_cand's): larger scores larger keys, +0 and -0 one key (NaN has none).
++pub fn candidateKey(bits: u16) u16 {
++    const u: u32 = if (bits & 0x7fff == 0) 0 else bits;
++    return @intCast(if (u & 0x8000 != 0) ~u & 0xffff else u | 0x8000);
++}
++
++/// Whether a bf16 score is a NaN (a row with one has no total order: the host reads it whole).
++pub fn candidateNan(bits: u16) bool {
++    return bits & 0x7fff > 0x7f80;
++}
++
++/// The row's first `count` scores and their columns in the draw's order (the larger score first, of equal scores the lower
++/// column; +0 and -0 equal), as fn_row_cand selects them: the key of the count-th largest by two 8-bit histogram passes, the
++/// keys above it, then the lowest columns among those equal to it. `vals` and `cols` take them in any order (the kernel's
++/// atomics fix none; callers sort). False for a row with a NaN (nothing written), else the row's candidates are in place.
++pub fn topCandidates(row: []const u16, count: usize, vals: []f32, cols: []i32) bool {
++    const k = @min(count, row.len);
++    var hist: [256]u32 = @splat(0);
++    for (row) |b| {
++        if (candidateNan(b)) return false;
++        hist[candidateKey(b) >> 8] += 1;
++    }
++    var left: u32 = @intCast(k);
++    var hi: usize = 255;
++    var above: u32 = 0;
++    while (hi > 0 and above + hist[hi] < left) : (hi -= 1) above += hist[hi];
++    left -= above;
++    hist = @splat(0);
++    for (row) |b| if (candidateKey(b) >> 8 == hi) {
++        hist[candidateKey(b) & 255] += 1;
++    };
++    var lo: usize = 255;
++    above = 0;
++    while (lo > 0 and above + hist[lo] < left) : (lo -= 1) above += hist[lo];
++    left -= above; // the keys equal to the cut that are taken: the lowest columns
++    const cut: u16 = @intCast(hi << 8 | lo);
++    const taken_above = k - left;
++    var n_above: usize = 0;
++    var n_tie: usize = 0;
++    for (row, 0..) |b, col| {
++        const key = candidateKey(b);
++        if (key > cut) {
++            vals[n_above] = promote(b);
++            cols[n_above] = @intCast(col);
++            n_above += 1;
++        } else if (key == cut and n_tie < left) {
++            vals[taken_above + n_tie] = promote(b);
++            cols[taken_above + n_tie] = @intCast(col);
++            n_tie += 1;
++        }
++    }
++    return true;
++}
++
++/// drawRow over a row's candidates (`vals` and `cols` from topCandidates / fn_row_cand, `count` = the request's top_k of them,
++/// any order): the keyed draw among the top_k best columns, token ids[col] (or col). The set and the key of each are drawRow's,
++/// and choose orders them by score and id, so the draw is drawRow's over the whole row.
++pub fn drawCandidates(gpa: std.mem.Allocator, vals: []const f32, cols: []const i32, ids: ?[]const u32, position: u64, sm: ?Sampling) !u32 {
++    const s = sm orelse return error.NotSampled;
++    if (vals.len != cols.len or vals.len == 0 or vals.len > cand_max) return error.BadCandidates;
++    var v: [cand_max]f64 = undefined;
++    var key: [cand_max]u64 = undefined;
++    for (vals, cols, 0..) |x, c, i| {
++        v[i] = x;
++        key[i] = if (ids) |m| m[@intCast(c)] else @intCast(c);
++    }
++    return @intCast(try lanes.sampling.choose(gpa, v[0..vals.len], key[0..vals.len], position, s));
++}
++
++/// drawPick over a row's candidates: the drawn token's probability from its own candidate score.
++pub fn drawPickCandidates(gpa: std.mem.Allocator, vals: []const f32, cols: []const i32, ids: []const u32, lse: f32, position: u64, sm: ?Sampling) !Pick {
++    const tok = try drawCandidates(gpa, vals, cols, ids, position, sm);
++    for (vals, cols) |x, c| if (ids[@intCast(c)] == tok) return .{ .token = tok, .prob = @exp(@as(f64, x) - @as(f64, lse)) };
++    return .{ .token = tok, .prob = 0 };
++}
++
+ // ---- the head's weights --------------------------------------------------------------------------------------------
+ 
+ pub const Head = struct {
+@@ -166,6 +275,9 @@ pub const Head = struct {
+     service: lanes.proposal_head.Service,
+     module: cuda.Module,
+     best_fn: cuda.Function,
++    /// fn_row_cand and the device scratch of its outputs, with TF_FLASHNEXT_SAMPLE_CAND=1 (else null).
++    cand_fn: ?cuda.Function,
++    cand_buf: ?cuda.DeviceBuffer,
+ 
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, dir: []const u8) !*Head {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+@@ -212,6 +324,12 @@ pub const Head = struct {
+         h.module = try cuda.Module.load(driver, cuda.kernels.flashnext_mtp);
+         errdefer h.module.unload();
+         h.best_fn = try h.module.function("fn_row_best");
++        h.cand_fn = null;
++        h.cand_buf = null;
++        if (candidatesOn()) {
++            h.cand_fn = try h.module.function("fn_row_cand");
++            h.cand_buf = try cuda.DeviceBuffer.alloc(driver, cand_bytes);
++        }
+         return h;
+     }
+ 
+@@ -221,6 +339,7 @@ pub const Head = struct {
+     }
+ 
+     pub fn deinit(h: *Head) void {
++        if (h.cand_buf) |*b| b.free();
+         h.module.unload();
+         h.draft.free();
+         h.artifact.deinit();
+@@ -247,6 +366,24 @@ pub const Head = struct {
+         _ = try pass.lane(input, sums, h.draft, out, pass.s.dummy, rows, 1);
+     }
+ 
++    /// fn_row_cand over `rows` rows of `v` scores `ld` apart: each row's first `count` candidates into scratch slots
++    /// [slot, slot + rows) (cand_max entries each), which `candidates` reads back.
++    pub fn cand(h: *const Head, stream: cuda.Stream, scores: u64, v: usize, ld: usize, rows: usize, count: usize, slot: usize) !void {
++        const f = h.cand_fn orelse return error.NoCandidates;
++        const buf = h.cand_buf orelse return error.NoCandidates;
++        if (rows == 0 or slot + rows > cand_slots or count == 0 or count > cand_max) return error.BadCandidates;
++        var a: cuda.Args = .{};
++        a.add(scores);
++        a.add(cint(v));
++        a.add(@as(c_longlong, @intCast(ld)));
++        a.add(cint(count));
++        a.add(cint(cand_max));
++        a.add(buf.ptr + slot * cand_max * 4);
++        a.add(buf.ptr + (cand_slots + slot) * cand_max * 4);
++        a.add(buf.ptr + 2 * cand_slots * cand_max * 4 + slot * 4);
++        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, stream, &a);
++    }
++
+     /// fn_row_best over `rows` rows of `v` scores `ld` apart: [rows, 4] fp32 at `out` (best, log-sum-exp, id bits).
+     pub fn best(h: *const Head, stream: cuda.Stream, scores: u64, v: usize, ld: usize, rows: usize, out: u64) !void {
+         var a: cuda.Args = .{};
+@@ -337,6 +474,90 @@ test "a draft pick is the keyed draw over the head's row and that token's probab
+     try std.testing.expect(isSampled(s) and !isSampled(null) and !isSampled(.{ .seed = 1, .temperature = 0 }));
+ }
+ 
++/// A bf16 row of `n` scores drawn from a few values so that ties at any cut are common, with both zeros and both infinities.
++fn tiedRow(prng: *std.Random.DefaultPrng, row: []u16, levels: u8) void {
++    const specials = [_]u16{ 0x0000, 0x8000, 0x7f80, 0xff80, 0x3f80, 0xbf80 };
++    for (row) |*v| {
++        const r = prng.random().int(u16);
++        v.* = if (r % 17 == 0) specials[r / 17 % specials.len] else @as(u16, 0x3f00) + prng.random().uintLessThan(u8, levels);
++    }
++}
++
++test "a row's candidates are its top_k best columns, ties to the lower column, whatever the order they come in" {
++    var prng = std.Random.DefaultPrng.init(21);
++    var row: [1500]u16 = undefined;
++    var vals: [cand_max]f32 = undefined;
++    var cols: [cand_max]i32 = undefined;
++    for ([_]u8{ 1, 2, 5, 40, 200 }) |levels| for ([_]usize{ 1, 2, 3, 20, 31, 64 }) |count| {
++        for ([_]usize{ 70, 300, 1500 }) |n| {
++            tiedRow(&prng, row[0..n], levels);
++            try std.testing.expect(topCandidates(row[0..n], count, &vals, &cols));
++            // the brute force: every column ranked by score (equal scores by column), the first `count`
++            var rank: [1500]u16 = undefined;
++            for (rank[0..n], 0..) |*r, i| r.* = @intCast(i);
++            std.mem.sort(u16, rank[0..n], row[0..n], struct {
++                fn before(r: []const u16, a: u16, b: u16) bool {
++                    const x = promote(r[a]);
++                    const y = promote(r[b]);
++                    return x > y or (x == y and a < b);
++                }
++            }.before);
++            const k = @min(count, n);
++            var want: [cand_max]i32 = undefined;
++            for (want[0..k], rank[0..k]) |*w, r| w.* = r;
++            std.mem.sort(i32, want[0..k], {}, std.sort.asc(i32));
++            std.mem.sort(i32, cols[0..k], {}, std.sort.asc(i32));
++            try std.testing.expectEqualSlices(i32, want[0..k], cols[0..k]);
++            // and each candidate's score is its column's
++            _ = topCandidates(row[0..n], count, &vals, &cols);
++            for (vals[0..k], cols[0..k]) |x, c| try std.testing.expectEqual(promote(row[@intCast(c)]), x);
++        }
++    };
++    // a NaN anywhere sends the row to the host whole
++    row[5] = 0x7fc0;
++    try std.testing.expect(!topCandidates(row[0..300], 20, &vals, &cols));
++    // keys order the bf16 values: -inf < negatives < -0 = +0 < positives < +inf
++    try std.testing.expectEqual(candidateKey(0x0000), candidateKey(0x8000));
++    try std.testing.expect(candidateKey(0xff80) < candidateKey(0xbf80) and candidateKey(0xbf80) < candidateKey(0x8000));
++    try std.testing.expect(candidateKey(0x8000) < candidateKey(0x0001) and candidateKey(0x3f80) < candidateKey(0x7f80));
++    try std.testing.expect(candidateKey(0x8001) < candidateKey(0x0000));
++}
++
++test "a keyed draw over the candidates is the draw over the whole row, and a pick's probability the same" {
++    const gpa = std.testing.allocator;
++    var prng = std.Random.DefaultPrng.init(77);
++    var row: [900]u16 = undefined;
++    var ids: [900]u32 = undefined;
++    for (&ids, 0..) |*id, col| id.* = @intCast(5 + 2 * col);
++    var vals: [cand_max]f32 = undefined;
++    var cols: [cand_max]i32 = undefined;
++    for ([_]u8{ 3, 30, 200 }) |levels| {
++        tiedRow(&prng, &row, levels);
++        const lse: f32 = 7.0; // any finite log-sum-exp: the probabilities are exp(score - lse), infinite scores included
++        for ([_]u32{ 1, 2, 20, 40, 64 }) |top_k| for ([_]f64{ 1.0, 0.95, 0.5 }) |top_p| for ([_]f64{ 1.0, 0.7 }) |temperature| {
++            const s: Sampling = .{ .seed = 41 + top_k, .temperature = temperature, .top_k = top_k, .top_p = top_p, .min_p = if (top_p == 0.5) 0.05 else 0 };
++            const count = candidateCount(s, row.len).?;
++            try std.testing.expectEqual(@as(usize, top_k), count);
++            try std.testing.expect(topCandidates(&row, count, &vals, &cols));
++            for (0..24) |position| {
++                try std.testing.expectEqual(try drawRow(gpa, &row, null, position, s), try drawCandidates(gpa, vals[0..count], cols[0..count], null, position, s));
++                try std.testing.expectEqual(try drawRow(gpa, &row, &ids, position, s), try drawCandidates(gpa, vals[0..count], cols[0..count], &ids, position, s));
++                const whole = try drawPick(gpa, &row, &ids, lse, position, s);
++                const cand = try drawPickCandidates(gpa, vals[0..count], cols[0..count], &ids, lse, position, s);
++                try std.testing.expectEqual(whole.token, cand.token);
++                try std.testing.expectEqual(whole.prob, cand.prob);
++            }
++        };
++    }
++    // the draws that read a row whole: greedy, no top_k, a top_k as wide as the row or past the candidates' room
++    try std.testing.expectEqual(@as(?usize, null), candidateCount(null, 900));
++    try std.testing.expectEqual(@as(?usize, null), candidateCount(.{ .seed = 1, .temperature = 0 }, 900));
++    try std.testing.expectEqual(@as(?usize, null), candidateCount(.{ .seed = 1, .top_k = 0 }, 900));
++    try std.testing.expectEqual(@as(?usize, null), candidateCount(.{ .seed = 1, .top_k = 65 }, 900));
++    try std.testing.expectEqual(@as(?usize, null), candidateCount(.{ .seed = 1, .top_k = 20 }, 20));
++    try std.testing.expectEqual(@as(?usize, 20), candidateCount(.{ .seed = 1, .top_k = 20 }, 21));
++}
++
+ test "a masked row draws only allowed tokens, greedy the best of them" {
+     const gpa = std.testing.allocator;
+     var prng = std.Random.DefaultPrng.init(5);
+diff --git a/zig/src/families/flashnext/cuda_mtp_ops.zig b/zig/src/families/flashnext/cuda_mtp_ops.zig
+index 5e1799e..c2b8cb2 100644
+--- a/zig/src/families/flashnext/cuda_mtp_ops.zig
++++ b/zig/src/families/flashnext/cuda_mtp_ops.zig
+@@ -93,6 +93,14 @@ pub fn Ops(comptime Tri: type) type {
+             return o.e.stream.*;
+         }
+ 
++        /// Slots [0, n) of the head's candidate scratch (filled by Head.cand) on the host.
++        fn candidates(o: Self, n: usize, c: *mtp.Cands) !void {
++            const base = (o.h.cand_buf orelse return error.NoCandidates).ptr;
++            try download(o.stream(), std.mem.sliceAsBytes(c.vals[0 .. n * mtp.cand_max]), base);
++            try download(o.stream(), std.mem.sliceAsBytes(c.cols[0 .. n * mtp.cand_max]), base + mtp.cand_slots * mtp.cand_max * 4);
++            try download(o.stream(), std.mem.sliceAsBytes(c.flags[0..n]), base + 2 * mtp.cand_slots * mtp.cand_max * 4);
++        }
++
+         /// Prompt rows [at, stop): the pass with its streams kept, then the head over each row with a known next token.
+         pub fn prefillChunk(o: Self, seq: *prompt.Seq, d: *Draft, ids: []const u32, at: usize, stop: usize) !void {
+             if (stop > d.cap or stop <= at or stop - at > d.rows_cap) return error.PromptTooLong;
+@@ -208,6 +216,13 @@ pub fn Ops(comptime Tri: type) type {
+                 const col: usize = @intCast(@as(i32, @bitCast(d.best_host[2])));
+                 return .{ .token = try view_.global(@intCast(col)), .prob = @exp(@as(f64, top) - @as(f64, lse)) };
+             }
++            if (mtp.candidatesOn()) if (mtp.candidateCount(sm, n)) |count| {
++                // the row's top_k best on the device: nothing of the row but those is copied (a NaN row is read whole)
++                var c: mtp.Cands = undefined;
++                try h.cand(o.stream(), d.dlogits.ptr, n, n, 1, count, 0);
++                try o.candidates(1, &c);
++                if (c.flags[0] == 0) return mtp.drawPickCandidates(o.e.gpa, c.vals[0..count], c.cols[0..count], h.ids, lse, position, sm);
++            };
+             const row = d.host[0..n];
+             try download(o.stream(), std.mem.sliceAsBytes(row), d.dlogits.ptr);
+             return mtp.drawPick(o.e.gpa, row, h.ids, lse, position, sm);
+@@ -370,10 +385,20 @@ pub fn Ops(comptime Tri: type) type {
+             var step_next: [max_lanes][1]u32 = undefined;
+             var step_nexts: [max_lanes][]const u32 = undefined;
+             var step_rows: [max_lanes]u64 = undefined;
++            var cands: mtp.Cands = undefined;
+             while (n_act > 0 and j < max_chain) : (j += 1) {
+                 // every active lane's best draft (fn_row_best on its own scores), then one download of all of them
+                 for (act[0..n_act], 0..) |i, r| try h.best(o.stream(), ds[i].dlogits.ptr, h.ids.len, h.ids.len, 1, ds[0].best.ptr + r * 16);
++                // a sampled lane's top_k best on the device too (TF_FLASHNEXT_SAMPLE_CAND=1), read back with the bests
++                var cand_k: [max_lanes]usize = @splat(0);
++                var any_cand = false;
++                if (mtp.candidatesOn()) for (act[0..n_act], 0..) |i, r| if (mtp.candidateCount(sms[i], h.ids.len)) |count| {
++                    cand_k[r] = count;
++                    any_cand = true;
++                    try h.cand(o.stream(), ds[i].dlogits.ptr, h.ids.len, h.ids.len, 1, count, r);
++                };
+                 try download(o.stream(), std.mem.sliceAsBytes(best_host[0 .. n_act * 4]), ds[0].best.ptr);
++                if (any_cand) try o.candidates(n_act, &cands);
+                 var next_act: usize = 0;
+                 var n_step: usize = 0;
+                 for (act[0..n_act], 0..) |i, r| {
+@@ -382,10 +407,15 @@ pub fn Ops(comptime Tri: type) type {
+                     const col: usize = @intCast(@as(i32, @bitCast(best_host[r * 4 + 2])));
+                     var got: Pick = .{ .token = h.ids[col], .prob = @exp(@as(f64, top) - @as(f64, lse)) };
+                     if (mtp.isSampled(sms[i])) {
+-                        // the lane's whole row (the stream is idle after the download above): the keyed draw as pick makes it
+-                        const row = ds[i].host[0..h.ids.len];
+-                        try download(o.stream(), std.mem.sliceAsBytes(row), ds[i].dlogits.ptr);
+-                        got = try mtp.drawPick(o.e.gpa, row, h.ids, lse, positions[i] + j, sms[i]);
++                        if (cand_k[r] > 0 and cands.flags[r] == 0) {
++                            const at = r * mtp.cand_max;
++                            got = try mtp.drawPickCandidates(o.e.gpa, cands.vals[at..][0..cand_k[r]], cands.cols[at..][0..cand_k[r]], h.ids, lse, positions[i] + j, sms[i]);
++                        } else {
++                            // the lane's whole row (the stream is idle after the download above): the keyed draw as pick makes it
++                            const row = ds[i].host[0..h.ids.len];
++                            try download(o.stream(), std.mem.sliceAsBytes(row), ds[i].dlogits.ptr);
++                            got = try mtp.drawPick(o.e.gpa, row, h.ids, lse, positions[i] + j, sms[i]);
++                        }
+                     }
+                     const out = outs[i];
+                     const low = confidence > 0 and got.prob < confidence;
+@@ -474,6 +504,17 @@ pub fn Ops(comptime Tri: type) type {
+                 for (out[0..n], 0..) |*t, r| t.* = @intCast(@as(i32, @bitCast(d.best_host[4 * r + 2])));
+                 return;
+             }
++            if (masks.len == 0 and mtp.candidatesOn() and n <= mtp.cand_slots) if (mtp.candidateCount(sm, vocab)) |count| {
++                // each row's top_k best on the device, nothing else of the window's scores copied (a window with a NaN row
++                // is read whole below); the draw is drawRow's over the same candidates
++                var c: mtp.Cands = undefined;
++                try o.h.cand(o.stream(), d.logits.ptr, vocab, vocab, n, count, 0);
++                try o.candidates(n, &c);
++                if (std.mem.allEqual(i32, c.flags[0..n], 0)) {
++                    for (out[0..n], 0..) |*t, r| t.* = try mtp.drawCandidates(o.e.gpa, c.vals[r * mtp.cand_max ..][0..count], c.cols[r * mtp.cand_max ..][0..count], null, d.fed0 + 1 + r, sm);
++                    return;
++                }
++            };
+             const rows = d.host[0 .. n * vocab];
+             try download(o.stream(), std.mem.sliceAsBytes(rows), d.logits.ptr);
+             const words = masks.len / n;
+diff --git a/zig/tests/cuda/flashnext_cand_tests.zig b/zig/tests/cuda/flashnext_cand_tests.zig
+new file mode 100644
+index 0000000..57d0e8b
+--- /dev/null
++++ b/zig/tests/cuda/flashnext_cand_tests.zig
+@@ -0,0 +1,87 @@
++//! fn_row_cand (the sampled draw's candidates, TF_FLASHNEXT_SAMPLE_CAND=1) against cuda_mtp.zig's topCandidates, which a unit
++//! test holds to a sort of every column: the same set of columns for rows full of ties, both zeros, both infinities, the
++//! draft head's width and the vocabulary's, and a NaN row flagged and left unwritten.
++const std = @import("std");
++const cuda = @import("cuda");
++const flash = @import("flashnext");
++const check = @import("check.zig");
++const rig = @import("flashnext_rig.zig");
++
++const mtp = flash.mtp;
++const Rig = rig.Rig;
++
++fn tied(r: *Rig, row: []u16, levels: u8) void {
++    const specials = [_]u16{ 0x0000, 0x8000, 0x7f80, 0xff80, 0x3f80, 0xbf80 };
++    for (row) |*v| {
++        const x = r.rng.int(u16);
++        v.* = if (x % 17 == 0) specials[x / 17 % specials.len] else @as(u16, 0x3f00) + r.rng.uintLessThan(u8, levels);
++    }
++}
++
++/// Rows of `n` scores with `count` candidates each (row `bad`, when below `rows`, a NaN row), against the host reference.
++fn rows(r: *Rig, mod: cuda.Module, n: usize, count: usize, levels: u8, bad: usize) !void {
++    const f = try mod.function("fn_row_cand");
++    const rows_n = 5;
++    const stride = mtp.cand_max;
++    const host = try r.a.alloc(u16, rows_n * n);
++    for (0..rows_n) |i| tied(r, host[i * n ..][0..n], levels);
++    if (bad < rows_n) host[bad * n + n / 3] = 0x7fc0;
++    const scores = try r.dev(std.mem.sliceAsBytes(host));
++    const vals = try r.out(rows_n * stride * 4);
++    const cols = try r.out(rows_n * stride * 4);
++    const flags = try r.out(rows_n * 4);
++    var a: cuda.Args = .{};
++    a.add(scores);
++    a.add(@as(c_int, @intCast(n)));
++    a.add(@as(c_longlong, @intCast(n)));
++    a.add(@as(c_int, @intCast(count)));
++    a.add(@as(c_int, @intCast(stride)));
++    a.add(vals);
++    a.add(cols);
++    a.add(flags);
++    try cuda.launch.launch(f, .{ .grid = .{ .x = rows_n }, .block = .{ .x = 1024 } }, r.s, &a);
++    const got_v = try r.back(f32, vals, rows_n * stride);
++    const got_c = try r.back(i32, cols, rows_n * stride);
++    const got_f = try r.back(i32, flags, rows_n);
++    for (0..rows_n) |i| {
++        const row = host[i * n ..][0..n];
++        var want_v: [mtp.cand_max]f32 = undefined;
++        var want_c: [mtp.cand_max]i32 = undefined;
++        const ok = mtp.topCandidates(row, count, &want_v, &want_c);
++        try check.expect(ok == (i != bad) and got_f[i] == @intFromBool(i == bad), "fn_row_cand n={d} count={d} row {d}: NaN flag {d}", .{ n, count, i, got_f[i] });
++        if (!ok) continue;
++        const k = @min(count, n);
++        // the sets (score, column) pairs, sorted by column: the kernel's order is the atomics'
++        const Pair = struct { c: i32, v: f32 };
++        var g: [mtp.cand_max]Pair = undefined;
++        var w: [mtp.cand_max]Pair = undefined;
++        for (0..k) |j| {
++            g[j] = .{ .c = got_c[i * stride + j], .v = got_v[i * stride + j] };
++            w[j] = .{ .c = want_c[j], .v = want_v[j] };
++        }
++        const less = struct {
++            fn before(_: void, x: Pair, y: Pair) bool {
++                return x.c < y.c;
++            }
++        }.before;
++        std.mem.sort(Pair, g[0..k], {}, less);
++        std.mem.sort(Pair, w[0..k], {}, less);
++        for (g[0..k], w[0..k]) |x, y| try check.expect(x.c == y.c and @as(u32, @bitCast(x.v)) == @as(u32, @bitCast(y.v)), "fn_row_cand n={d} count={d} levels={d} row {d}: column {d} (score {e}) for column {d} (score {e})", .{ n, count, levels, i, x.c, x.v, y.c, y.v });
++    }
++}
++
++pub fn run(gpu: check.Gpu) !void {
++    var arena: std.heap.ArenaAllocator = .init(gpu.gpa);
++    defer arena.deinit();
++    var prng = std.Random.DefaultPrng.init(83);
++    var r = try Rig.init(gpu, arena.allocator(), prng.random());
++    defer r.deinit();
++    var mod = try cuda.Module.load(gpu.d, cuda.kernels.flashnext_mtp);
++    defer mod.unload();
++    // the draft head's width (79,591), the vocabulary's (248,320), and short rows; many ties through almost none
++    for ([_]usize{ 70, 1500, 79_591, 248_320 }) |n| for ([_]usize{ 1, 2, 20, 33, 64 }) |count| for ([_]u8{ 1, 3, 40, 200 }) |levels| try rows(&r, mod, n, count, levels, 99);
++    // a NaN row among clean ones: flagged, the others unaffected
++    try rows(&r, mod, 79_591, 20, 40, 2);
++    try rows(&r, mod, 248_320, 20, 40, 4);
++    check.pass("flashnext-cand: fn_row_cand's candidates are topCandidates' set for rows of 70 to 248,320 scores, 1 to 64 candidates and ties from every score equal to almost none; a NaN row is flagged", .{});
++}
+diff --git a/zig/tests/cuda/flashnext_mtp_parity_tests.zig b/zig/tests/cuda/flashnext_mtp_parity_tests.zig
+index 01951fa..741a6bc 100644
+--- a/zig/tests/cuda/flashnext_mtp_parity_tests.zig
++++ b/zig/tests/cuda/flashnext_mtp_parity_tests.zig
+@@ -47,6 +47,10 @@ pub fn run(gpu: check.Gpu, dir: []const u8, ids_path: []const u8) !void {
+     const tri: flash.Tri = .{ .s = stream, .own = &glue };
+     const e = try prompt.Engine.init(gpu.gpa, gpu.io, @constCast(gpu.d), &stream, dir);
+     defer e.deinit();
++    // the head allocates its candidate scratch only with TF_FLASHNEXT_SAMPLE_CAND=1 at load; shape() then switches it per run
++    const env = @import("sys").env;
++    _ = env.setenv("TF_FLASHNEXT_SAMPLE_CAND", "1", 1);
++    defer _ = env.unsetenv("TF_FLASHNEXT_SAMPLE_CAND");
+     const h = try mtp.Head.init(gpu.gpa, gpu.io, @constCast(gpu.d), &stream, dir);
+     defer h.deinit();
+     const ops: mtp.Ops(flash.Tri) = .{ .e = e, .tri = tri, .h = h };
+@@ -55,21 +59,30 @@ pub fn run(gpu: check.Gpu, dir: []const u8, ids_path: []const u8) !void {
+     for (ids, 0..) |*t, i| t.* = base.items[i % base.items.len];
+     // no confidence stop (the whole chain), then a stop above every probability (each chain keeps one token)
+     for ([_]f64{ 0, 2 }) |confidence| {
+-        for (shapes) |widths| _ = try shape(gpu, e, ops, &stream, ids, widths, confidence, null);
++        for (shapes) |widths| _ = try shape(gpu, e, ops, &stream, ids, widths, confidence, null, false);
+     }
+     // sampled streams (the model card's temperature 1, top_k 20, top_p 0.95; TF_FLASHNEXT_SAMPLED_HEADS): the shared pass draws
+-    // each lane's drafts as its lone pass does
++    // each lane's drafts as its lone pass does, and the device's candidates draw what the whole row does
+     const sampled: mtp.Sampling = .{ .seed = 19, .temperature = 1.0, .top_k = 20, .top_p = 0.95 };
+     for ([_]f64{ 0, 0.5 }) |confidence| for (shapes) |widths| {
+-        _ = try shape(gpu, e, ops, &stream, ids, widths, confidence, sampled);
++        const whole = try shape(gpu, e, ops, &stream, ids, widths, confidence, sampled, false);
++        const cand = try shape(gpu, e, ops, &stream, ids, widths, confidence, sampled, true);
++        for (whole[0..widths.len], cand[0..widths.len]) |a, b| {
++            try check.expect(a.n == b.n and std.mem.eql(u32, a.tokens[0..a.n], b.tokens[0..b.n]), "sampled drafts from the device's candidates equal the whole row's", .{});
++            try check.expect(std.mem.eql(f64, a.probs[0..a.n], b.probs[0..b.n]), "their probabilities equal the whole row's", .{});
++        }
+     };
+-    check.pass("sampled heads: a shared pass's drafts equal each lone pass's", .{});
++    check.pass("sampled heads: a shared pass's drafts equal each lone pass's, and the candidates' equal the whole row's", .{});
+ }
+ 
+ /// One shape's streams drafted alone and in one shared pass: the logits, the proposals, the probabilities and the stop.
+-/// With `sm` the streams draw keyed samples (all at position 5 of their keys). Returns the lone chains.
+-fn shape(gpu: check.Gpu, e: *prompt.Engine, ops: mtp.Ops(flash.Tri), stream: *cuda.Stream, ids: []const u32, widths: []const usize, confidence: f64, sm: ?mtp.Sampling) ![6]mtp.Chain {
++/// With `sm` the streams draw keyed samples (all at position 5 of their keys); `cand` reads their rows through the device's
++/// candidates. Returns the lone chains.
++fn shape(gpu: check.Gpu, e: *prompt.Engine, ops: mtp.Ops(flash.Tri), stream: *cuda.Stream, ids: []const u32, widths: []const usize, confidence: f64, sm: ?mtp.Sampling, cand: bool) ![6]mtp.Chain {
+     const gpa = gpu.gpa;
++    const env = @import("sys").env;
++    if (cand) _ = env.setenv("TF_FLASHNEXT_SAMPLE_CAND", "1", 1) else _ = env.unsetenv("TF_FLASHNEXT_SAMPLE_CAND");
++    defer _ = env.setenv("TF_FLASHNEXT_SAMPLE_CAND", "1", 1);
+     const position: u64 = if (sm == null) 0 else 5;
+     const cap = ids.len + 64;
+     const count = 2;
+@@ -135,6 +148,6 @@ fn shape(gpu: check.Gpu, e: *prompt.Engine, ops: mtp.Ops(flash.Tri), stream: *cu
+         try stream.synchronize();
+         try check.expect(!(try sameLogits(gpu, &alone.drafts[1], &together.drafts[1])), "the planted broken gather is caught", .{});
+     }
+-    check.pass("a shared MTP head over {d} streams ({any} rows, {s}) equals each stream's own pass: logits, proposals, probabilities and the confidence stop", .{ n, widths, if (sm == null) "greedy" else "sampled" });
++    check.pass("a shared MTP head over {d} streams ({any} rows, {s}{s}) equals each stream's own pass: logits, proposals, probabilities and the confidence stop", .{ n, widths, if (sm == null) "greedy" else "sampled", if (cand) ", candidates" else "" });
+     return alone_chains;
+ }
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index bd8e1ae..0f969ca 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -90,6 +90,7 @@ const flashnext_dense_hc_tests = @import("flashnext_dense_hc_tests.zig");
+ const flashnext_hc_tests = @import("flashnext_hc_tests.zig");
+ const flashnext_attn_tests = @import("flashnext_attn_tests.zig");
+ const flashnext_kv8_tests = @import("flashnext_kv8_tests.zig");
++const flashnext_cand_tests = @import("flashnext_cand_tests.zig");
+ const ggml_tests = @import("ggml_tests.zig");
+ const paged_tests = @import("paged_tests.zig");
+ 
+@@ -125,6 +126,7 @@ const usage =
+     \\  flashnext-hc              Flash Next's own hyper-connection and n-gram glue against float64 (synthetic rows)
+     \\  flashnext-attn            Flash Next's own attention glue, pooling and block scores against float64 (synthetic)
+     \\  flashnext-kv8             Flash Next's --kv-cache fp8 write against its format model and its reads against the bf16 kernels (synthetic)
++    \\  flashnext-cand            Flash Next's sampled-draw candidates (fn_row_cand) against the host reference (synthetic rows, ties, NaN)
+     \\  info                      driver, device and library versions
+     \\  smoke                     copies, fills, launches, argument packing, module globals
+     \\  shared-context            Context.shared and Stream.borrowed as a library inside a host's process sees them
+@@ -301,6 +303,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "flashnext-hc")) return flashnext_hc_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "flashnext-attn")) return flashnext_attn_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "flashnext-kv8")) return flashnext_kv8_tests.run(gpu);
++    if (std.mem.eql(u8, cmd, "flashnext-cand")) return flashnext_cand_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "info")) return info(gpu);
+     if (std.mem.eql(u8, cmd, "smoke")) return runtime_tests.smoke(gpu);
+     if (std.mem.eql(u8, cmd, "shared-context")) return runtime_tests.sharedContext(gpu);

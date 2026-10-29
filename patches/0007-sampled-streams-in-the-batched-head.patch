@@ -1,0 +1,272 @@
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 170a256..10dfef9 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -480,7 +480,8 @@ pub fn Namespace(comptime Tri: type) type {
+             const self = of(ptr);
+             if (self.head == null) return error.NoDraftHead;
+             defer lanes_draft.depthLog(self, requests);
+-            // greedy chains of a shared round: their heads in one pass a step (the drafts each would get alone)
++            // greedy chains of a shared round (sampled ones too with TF_FLASHNEXT_SAMPLED_HEADS=1): their heads in one pass a step
++            // (the drafts each would get alone)
+             var batched: [mtp_ops.max_lanes]bool = @splat(false);
+             if (lanes_draft.batchHeads() and requests.len > 1 and requests.len <= mtp_ops.max_lanes) try lanes_draft.batched(self, requests, &batched);
+             for (requests, 0..) |r, ri| {
+diff --git a/zig/src/families/flashnext/cuda_lanes_draft.zig b/zig/src/families/flashnext/cuda_lanes_draft.zig
+index 1d6bae4..c1f1ce4 100644
+--- a/zig/src/families/flashnext/cuda_lanes_draft.zig
++++ b/zig/src/families/flashnext/cuda_lanes_draft.zig
+@@ -11,24 +11,34 @@ pub fn batchHeads() bool {
+     return !std.mem.eql(u8, std.mem.span(v), "0");
+ }
+ 
++/// TF_FLASHNEXT_SAMPLED_HEADS=1: a shared round's sampled streams (temperature above zero) join the batched head pass too,
++/// each drawing its drafts with its own key on the host from its row of the pass (the draws a lone head step makes), instead of
++/// drafting one stream at a time. Off by default: the drafts are only proposals, so replies do not depend on it.
++pub fn sampledHeads() bool {
++    const v = std.c.getenv("TF_FLASHNEXT_SAMPLED_HEADS") orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
++
+ /// TF_FLASHNEXT_DEPTH_LOG=1: every 200 draft calls, the drafts a stream got by round width (streams drafting together).
+ var depth_hist: [5][max_hist]u64 = @splat(@splat(0));
+ var depth_calls: u64 = 0;
+ const max_hist = 17;
+ 
+-/// Greedy requests (no trees, no media) drafted together: draftFn's rollbacks, one head pass a step; `done` marks them.
++/// Greedy requests (and sampled ones with TF_FLASHNEXT_SAMPLED_HEADS=1; no trees, no media) drafted together: draftFn's rollbacks, one head pass a step; `done` marks them.
+ pub fn batched(self: anytype, requests: []const be.DraftRequest, done: []bool) !void {
+     var ds: [mtp_ops.max_lanes]*mtp.Draft = undefined;
+     var nexts: [mtp_ops.max_lanes][]const u32 = undefined;
+     var firsts: [mtp_ops.max_lanes][1]u32 = undefined;
+     var rows: [mtp_ops.max_lanes]u64 = undefined;
++    var positions: [mtp_ops.max_lanes]u64 = undefined;
++    var sms: [mtp_ops.max_lanes]?mtp.Sampling = undefined;
+     var counts: [mtp_ops.max_lanes]usize = undefined;
+     var outs: [mtp_ops.max_lanes]*mtp.Chain = undefined;
+     var which: [mtp_ops.max_lanes]usize = undefined;
+     var n: usize = 0;
+     for (requests, 0..) |r, ri| {
+         if (r.lanes != null) continue;
+-        if (r.stream.sampling) |sm| if (sm.temperature > 0) continue;
++        if (mtp.isSampled(r.stream.sampling) and !sampledHeads()) continue;
+         const l = try self.lane(r.stream);
+         const d = if (l.draft) |*x| x else continue;
+         if (d.media != null) continue;
+@@ -51,6 +61,8 @@ pub fn batched(self: anytype, requests: []const be.DraftRequest, done: []bool) !
+             rows[n] = d.prompt_last;
+         }
+         ds[n] = d;
++        positions[n] = r.position;
++        sms[n] = r.stream.sampling;
+         outs[n] = &l.chain;
+         which[n] = ri;
+         n += 1;
+@@ -59,7 +71,7 @@ pub fn batched(self: anytype, requests: []const be.DraftRequest, done: []bool) !
+         // one greedy stream: it drafts alone below (its rollback is idempotent)
+         return;
+     }
+-    try self.ops().draftMany(ds[0..n], nexts[0..n], rows[0..n], counts[0..n], self.confidence, outs[0..n]);
++    try self.ops().draftMany(ds[0..n], nexts[0..n], rows[0..n], counts[0..n], self.confidence, outs[0..n], positions[0..n], sms[0..n]);
+     for (which[0..n]) |ri| done[ri] = true;
+ }
+ 
+@@ -83,3 +95,16 @@ pub fn depthLog(self: anytype, requests: []const be.DraftRequest) void {
+         std.debug.print("\n", .{});
+     }
+ }
++
++test "sampled streams join the batched head only with TF_FLASHNEXT_SAMPLED_HEADS=1" {
++    const env = @import("sys").env;
++    defer _ = env.unsetenv("TF_FLASHNEXT_SAMPLED_HEADS");
++    _ = env.unsetenv("TF_FLASHNEXT_SAMPLED_HEADS");
++    try std.testing.expect(!sampledHeads());
++    for ([_][*:0]const u8{ "0", "", "true" }) |v| {
++        _ = env.setenv("TF_FLASHNEXT_SAMPLED_HEADS", v, 1);
++        try std.testing.expect(!sampledHeads());
++    }
++    _ = env.setenv("TF_FLASHNEXT_SAMPLED_HEADS", "1", 1);
++    try std.testing.expect(sampledHeads());
++}
+diff --git a/zig/src/families/flashnext/cuda_mtp.zig b/zig/src/families/flashnext/cuda_mtp.zig
+index fc6b60a..37ad6c8 100644
+--- a/zig/src/families/flashnext/cuda_mtp.zig
++++ b/zig/src/families/flashnext/cuda_mtp.zig
+@@ -130,6 +130,25 @@ pub fn drawRow(gpa: std.mem.Allocator, row: []const u16, ids: ?[]const u32, posi
+     return @intCast(try lanes.sampling.choose(gpa, vals, keys, position, s));
+ }
+ 
++/// The draft head's keyed draw at `position` over its bf16 row (column j being token ids[j]) and the draw's temperature-1
++/// probability under the head, `lse` the row's log-sum-exp (Python Engine.sample_draft). A greedy `sm` takes the first best
++/// column. The lone head step (Ops.pick) and the batched one (Ops.draftMany) both draw through here, so a stream's drafts
++/// do not depend on whether it drafted alone.
++pub fn drawPick(gpa: std.mem.Allocator, row: []const u16, ids: []const u32, lse: f32, position: u64, sm: ?Sampling) !Pick {
++    const tok = try drawRow(gpa, row, ids, position, sm);
++    const col = std.sort.binarySearch(u32, ids, tok, struct {
++        fn order(t: u32, x: u32) std.math.Order {
++            return std.math.order(t, x);
++        }
++    }.order) orelse return .{ .token = tok, .prob = 0 };
++    return .{ .token = tok, .prob = @exp(@as(f64, promote(row[col])) - @as(f64, lse)) };
++}
++
++/// Whether `sm` draws keyed samples (a temperature above zero) rather than taking the best column.
++pub fn isSampled(sm: ?Sampling) bool {
++    return if (sm) |s| s.temperature > 0 else false;
++}
++
+ // ---- the head's weights --------------------------------------------------------------------------------------------
+ 
+ pub const Head = struct {
+@@ -286,6 +305,38 @@ test "a keyed draw over the top-k columns is the draw over every column" {
+     try std.testing.expectEqual(@as(u32, @intCast(argmaxRow(&row))), try drawRow(gpa, &row, null, 0, null));
+ }
+ 
++test "a draft pick is the keyed draw over the head's row and that token's probability under it" {
++    const gpa = std.testing.allocator;
++    var prng = std.Random.DefaultPrng.init(9);
++    var row: [400]u16 = undefined;
++    var ids: [400]u32 = undefined;
++    for (&row, &ids, 0..) |*v, *id, col| {
++        v.* = @as(u16, 0x3f00) + prng.random().int(u8);
++        id.* = @intCast(1000 + 3 * col); // the draft vocabulary: ascending ids, as draftIds gives them
++    }
++    var top: f32 = -std.math.inf(f32);
++    for (row) |b| top = @max(top, promote(b));
++    var sum: f64 = 0;
++    for (row) |b| sum += @exp(@as(f64, promote(b)) - top);
++    const lse: f32 = @floatCast(top + @log(sum));
++    const s: Sampling = .{ .seed = 3, .temperature = 1.0, .top_k = 20, .top_p = 0.95 };
++    for (0..64) |position| {
++        const got = try drawPick(gpa, &row, &ids, lse, position, s);
++        try std.testing.expectEqual(try drawRow(gpa, &row, &ids, position, s), got.token);
++        const col = std.mem.indexOfScalar(u32, &ids, got.token).?;
++        try std.testing.expectApproxEqAbs(@exp(@as(f64, promote(row[col])) - @as(f64, lse)), got.prob, 1e-12);
++        try std.testing.expect(got.prob > 0 and got.prob < 1);
++    }
++    // greedy (no sampling, or temperature 0): the first best column, its probability the head's confidence
++    const best = argmaxRow(&row);
++    for ([_]?Sampling{ null, .{ .seed = 3, .temperature = 0 } }) |greedy| {
++        const got = try drawPick(gpa, &row, &ids, lse, 5, greedy);
++        try std.testing.expectEqual(ids[best], got.token);
++        try std.testing.expectApproxEqAbs(@exp(@as(f64, promote(row[best])) - @as(f64, lse)), got.prob, 1e-12);
++    }
++    try std.testing.expect(isSampled(s) and !isSampled(null) and !isSampled(.{ .seed = 1, .temperature = 0 }));
++}
++
+ test "a masked row draws only allowed tokens, greedy the best of them" {
+     const gpa = std.testing.allocator;
+     var prng = std.Random.DefaultPrng.init(5);
+diff --git a/zig/src/families/flashnext/cuda_mtp_ops.zig b/zig/src/families/flashnext/cuda_mtp_ops.zig
+index 7a67f78..5e1799e 100644
+--- a/zig/src/families/flashnext/cuda_mtp_ops.zig
++++ b/zig/src/families/flashnext/cuda_mtp_ops.zig
+@@ -210,13 +210,7 @@ pub fn Ops(comptime Tri: type) type {
+             }
+             const row = d.host[0..n];
+             try download(o.stream(), std.mem.sliceAsBytes(row), d.dlogits.ptr);
+-            const tok = try drawRow(o.e.gpa, row, h.ids, position, sm);
+-            const col = std.sort.binarySearch(u32, h.ids, tok, struct {
+-                fn order(t: u32, x: u32) std.math.Order {
+-                    return std.math.order(t, x);
+-                }
+-            }.order) orelse return .{ .token = tok, .prob = 0 };
+-            return .{ .token = tok, .prob = @exp(@as(f64, promote(row[col])) - @as(f64, lse)) };
++            return mtp.drawPick(o.e.gpa, row, h.ids, lse, position, sm);
+         }
+ 
+         /// Python decode.draft: absorb the kept rows, then chain up to `count` drafts, the first always kept.
+@@ -350,8 +344,10 @@ pub fn Ops(comptime Tri: type) type {
+             for (ds, 0..) |d, i| try p.copy(d.dlogits.ptr, s.head_local + i * n_ids * 2, n_ids * 2);
+         }
+ 
+-        /// draft over several greedy drafts: kept rows in one pass, then a pass a step, each chaining as it would alone
+-        pub fn draftMany(o: Self, ds: []const *Draft, nexts: []const []const u32, rows: []const u64, counts: []const usize, confidence: f64, outs: []const *Chain) !void {
++        /// draft over several drafts: kept rows in one pass, then a pass a step, each chaining as it would alone. A lane whose
++        /// `sms` entry draws keyed samples takes the draw `pick` would at `positions[i]` + the step (its row downloaded and
++        /// drawn on the host), the others their best column.
++        pub fn draftMany(o: Self, ds: []const *Draft, nexts: []const []const u32, rows: []const u64, counts: []const usize, confidence: f64, outs: []const *Chain, positions: []const u64, sms: []const ?Sampling) !void {
+             const h = o.h;
+             const n_l = ds.len;
+             for (ds, outs) |d, out| {
+@@ -384,7 +380,13 @@ pub fn Ops(comptime Tri: type) type {
+                     const top = best_host[r * 4];
+                     const lse = best_host[r * 4 + 1];
+                     const col: usize = @intCast(@as(i32, @bitCast(best_host[r * 4 + 2])));
+-                    const got: Pick = .{ .token = h.ids[col], .prob = @exp(@as(f64, top) - @as(f64, lse)) };
++                    var got: Pick = .{ .token = h.ids[col], .prob = @exp(@as(f64, top) - @as(f64, lse)) };
++                    if (mtp.isSampled(sms[i])) {
++                        // the lane's whole row (the stream is idle after the download above): the keyed draw as pick makes it
++                        const row = ds[i].host[0..h.ids.len];
++                        try download(o.stream(), std.mem.sliceAsBytes(row), ds[i].dlogits.ptr);
++                        got = try mtp.drawPick(o.e.gpa, row, h.ids, lse, positions[i] + j, sms[i]);
++                    }
+                     const out = outs[i];
+                     const low = confidence > 0 and got.prob < confidence;
+                     if (low and j > 0) continue;
+diff --git a/zig/tests/cuda/flashnext_mtp_parity_tests.zig b/zig/tests/cuda/flashnext_mtp_parity_tests.zig
+index d3b4ee8..01951fa 100644
+--- a/zig/tests/cuda/flashnext_mtp_parity_tests.zig
++++ b/zig/tests/cuda/flashnext_mtp_parity_tests.zig
+@@ -55,13 +55,22 @@ pub fn run(gpu: check.Gpu, dir: []const u8, ids_path: []const u8) !void {
+     for (ids, 0..) |*t, i| t.* = base.items[i % base.items.len];
+     // no confidence stop (the whole chain), then a stop above every probability (each chain keeps one token)
+     for ([_]f64{ 0, 2 }) |confidence| {
+-        for (shapes) |widths| try shape(gpu, e, ops, &stream, ids, widths, confidence);
++        for (shapes) |widths| _ = try shape(gpu, e, ops, &stream, ids, widths, confidence, null);
+     }
++    // sampled streams (the model card's temperature 1, top_k 20, top_p 0.95; TF_FLASHNEXT_SAMPLED_HEADS): the shared pass draws
++    // each lane's drafts as its lone pass does
++    const sampled: mtp.Sampling = .{ .seed = 19, .temperature = 1.0, .top_k = 20, .top_p = 0.95 };
++    for ([_]f64{ 0, 0.5 }) |confidence| for (shapes) |widths| {
++        _ = try shape(gpu, e, ops, &stream, ids, widths, confidence, sampled);
++    };
++    check.pass("sampled heads: a shared pass's drafts equal each lone pass's", .{});
+ }
+ 
+ /// One shape's streams drafted alone and in one shared pass: the logits, the proposals, the probabilities and the stop.
+-fn shape(gpu: check.Gpu, e: *prompt.Engine, ops: mtp.Ops(flash.Tri), stream: *cuda.Stream, ids: []const u32, widths: []const usize, confidence: f64) !void {
++/// With `sm` the streams draw keyed samples (all at position 5 of their keys). Returns the lone chains.
++fn shape(gpu: check.Gpu, e: *prompt.Engine, ops: mtp.Ops(flash.Tri), stream: *cuda.Stream, ids: []const u32, widths: []const usize, confidence: f64, sm: ?mtp.Sampling) ![6]mtp.Chain {
+     const gpa = gpu.gpa;
++    const position: u64 = if (sm == null) 0 else 5;
+     const cap = ids.len + 64;
+     const count = 2;
+     const n = widths.len;
+@@ -89,7 +98,7 @@ fn shape(gpu: check.Gpu, e: *prompt.Engine, ops: mtp.Ops(flash.Tri), stream: *cu
+     // each stream's head alone: its own pass, its own chain
+     var alone_chains: [6]mtp.Chain = undefined;
+     for (widths, 0..) |w, i| {
+-        try ops.draft(&alone.drafts[i], nexts[i][0..w], rows[i], 0, count, null, confidence, &alone_chains[i]);
++        try ops.draft(&alone.drafts[i], nexts[i][0..w], rows[i], position, count, sm, confidence, &alone_chains[i]);
+     }
+     // the same heads in one shared pass: one lane a stream
+     var ds: [6]*mtp.Draft = undefined;
+@@ -98,14 +107,18 @@ fn shape(gpu: check.Gpu, e: *prompt.Engine, ops: mtp.Ops(flash.Tri), stream: *cu
+     var counts: [6]usize = undefined;
+     var chains: [6]mtp.Chain = undefined;
+     var outs: [6]*mtp.Chain = undefined;
++    var positions: [6]u64 = undefined;
++    var sms: [6]?mtp.Sampling = undefined;
+     for (widths, 0..) |w, i| {
++        positions[i] = position;
++        sms[i] = sm;
+         ds[i] = &together.drafts[i];
+         nexts_s[i] = nexts[i][0..w];
+         rows_s[i] = rows[i];
+         counts[i] = count;
+         outs[i] = &chains[i];
+     }
+-    try ops.draftMany(ds[0..n], nexts_s[0..n], rows_s[0..n], counts[0..n], confidence, outs[0..n]);
++    try ops.draftMany(ds[0..n], nexts_s[0..n], rows_s[0..n], counts[0..n], confidence, outs[0..n], positions[0..n], sms[0..n]);
+     try stream.synchronize();
+     for (widths, 0..) |_, i| {
+         try check.expect(try sameLogits(gpu, &alone.drafts[i], &together.drafts[i]), "a shared head's logits equal its lone pass's", .{});
+@@ -122,5 +135,6 @@ fn shape(gpu: check.Gpu, e: *prompt.Engine, ops: mtp.Ops(flash.Tri), stream: *cu
+         try stream.synchronize();
+         try check.expect(!(try sameLogits(gpu, &alone.drafts[1], &together.drafts[1])), "the planted broken gather is caught", .{});
+     }
+-    check.pass("a shared MTP head over {d} streams ({any} rows) equals each stream's own pass: logits, proposals, probabilities and the confidence stop", .{ n, widths });
++    check.pass("a shared MTP head over {d} streams ({any} rows, {s}) equals each stream's own pass: logits, proposals, probabilities and the confidence stop", .{ n, widths, if (sm == null) "greedy" else "sampled" });
++    return alone_chains;
+ }

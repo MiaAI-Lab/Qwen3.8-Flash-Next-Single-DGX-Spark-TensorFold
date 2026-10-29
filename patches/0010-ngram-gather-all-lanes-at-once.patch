@@ -1,0 +1,274 @@
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index 51de30b..5204806 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -11,6 +11,7 @@ const parts = @import("cuda_batch_state.zig");
+ const batch_lanes = @import("cuda_batch_lanes.zig");
+ const tiles = @import("cuda_tiles.zig");
+ const tk = @import("cuda_tile_kernels.zig");
++const knobs = @import("cuda_knobs.zig");
+ 
+ const layers_n = wt.layers_n;
+ const linear_n = wt.linear_n;
+@@ -89,6 +90,15 @@ fn profile() bool {
+     return std.mem.eql(u8, std.mem.span(v), "1");
+ }
+ 
++/// TF_FLASHNEXT_GATHER_LOG=1: what a shared pass waits for the n-gram gather at the PLE layer.
++const GatherStat = struct {
++    var passes: u64 = 0;
++    var wait_ns: u64 = 0;
++    var gather_ns: u64 = 0;
++    var ahead_ns: u64 = 0;
++    var rows: u64 = 0;
++};
++
+ pub fn Pass(comptime Tri: type) type {
+     return struct {
+         const Self = @This();
+@@ -548,8 +558,26 @@ pub fn Pass(comptime Tri: type) type {
+             for (self.m.layers, 0..) |*lw, layer| {
+                 const keep: LayerKeep = if (self.hooks.keep) |kp| kp.layers[layer] else .{};
+                 if (layer == ple_layer) {
++                    const log_gather = thread != null and self.lanes.len > 0 and knobs.gatherLog();
++                    const t_join = if (log_gather) std.Io.Clock.awake.now(self.io).toNanoseconds() else 0;
+                     if (thread) |th| th.join();
+                     thread = null;
++                    if (log_gather) {
++                        const t_done = std.Io.Clock.awake.now(self.io).toNanoseconds();
++                        GatherStat.passes += 1;
++                        GatherStat.wait_ns += @intCast(t_done - t_join);
++                        GatherStat.gather_ns += @intCast(gather.ns);
++                        GatherStat.ahead_ns += @intCast(t_join - t0);
++                        GatherStat.rows += n;
++                        if (GatherStat.passes % 100 == 0) {
++                            const f = @as(f64, 1e6) * 100.0;
++                            std.debug.print("gather: {d} shared passes, per pass: {d:.1} rows, gather {d:.2} ms, launched ahead {d:.2} ms, join wait {d:.2} ms\n", .{ GatherStat.passes, @as(f64, @floatFromInt(GatherStat.rows)) / 100.0, @as(f64, @floatFromInt(GatherStat.gather_ns)) / f, @as(f64, @floatFromInt(GatherStat.ahead_ns)) / f, @as(f64, @floatFromInt(GatherStat.wait_ns)) / f });
++                            GatherStat.wait_ns = 0;
++                            GatherStat.gather_ns = 0;
++                            GatherStat.ahead_ns = 0;
++                            GatherStat.rows = 0;
++                        }
++                    }
+                     if (gather.failed) |err| return err;
+                     if (profile()) std.debug.print("batch: {d} rows' n-gram rows gathered on the host in {d:.1} ms\n", .{ n, @as(f64, @floatFromInt(gather.ns)) / 1e6 });
+                     try self.upload(s.ple_emb, std.mem.sliceAsBytes(emb));
+diff --git a/zig/src/families/flashnext/cuda_batch_state.zig b/zig/src/families/flashnext/cuda_batch_state.zig
+index 2f6ba38..1b40b7e 100644
+--- a/zig/src/families/flashnext/cuda_batch_state.zig
++++ b/zig/src/families/flashnext/cuda_batch_state.zig
+@@ -4,6 +4,7 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const gdn = @import("cuda_gdn.zig");
+ const ple = @import("cuda_ple.zig");
++const knobs = @import("cuda_knobs.zig");
+ const wt = @import("cuda_prompt_wt.zig");
+ const tk = @import("cuda_tile_kernels.zig");
+ const load = @import("cuda_prompt_load.zig");
+@@ -585,6 +586,18 @@ pub const Gather = struct {
+             };
+             return;
+         }
++        if (knobs.gatherEarly() and g.lanes.len <= 64) {
++            var parts: [64]ple.Part = undefined;
++            var at: usize = 0;
++            for (g.lanes, 0..) |l, k| {
++                parts[k] = .{ .history = l.seq.history[0..], .tokens = g.ids[at..][0..l.rows], .out = g.emb[at * dims ..][0 .. l.rows * dims], .xs = g.xs[at * (dims / 32) ..][0 .. l.rows * (dims / 32)] };
++                at += l.rows;
++            }
++            ple.rowsMany(g.ngram, parts[0..g.lanes.len]) catch |err| {
++                g.failed = err;
++            };
++            return;
++        }
+         var row0: usize = 0;
+         for (g.lanes) |l| {
+             g.ngram.rows(l.seq.history[0..], g.ids[row0..][0..l.rows], g.emb[row0 * dims ..][0 .. l.rows * dims], g.xs[row0 * (dims / 32) ..][0 .. l.rows * (dims / 32)]) catch |err| {
+diff --git a/zig/src/families/flashnext/cuda_knobs.zig b/zig/src/families/flashnext/cuda_knobs.zig
+index 27f9e9b..ad60968 100644
+--- a/zig/src/families/flashnext/cuda_knobs.zig
++++ b/zig/src/families/flashnext/cuda_knobs.zig
+@@ -14,3 +14,21 @@ pub fn mx128MinN() usize {
+     const v = std.c.getenv("TF_FLASHNEXT_PROMPT_MX128") orelse return 1024;
+     return std.fmt.parseInt(usize, std.mem.span(v), 10) catch 1024;
+ }
++
++/// TF_FLASHNEXT_GATHER_EARLY=1: a shared pass gathers every stream's n-gram rows in one pool call (not one call a stream).
++pub fn gatherEarly() bool {
++    const v = std.c.getenv("TF_FLASHNEXT_GATHER_EARLY") orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
++
++/// TF_FLASHNEXT_GATHER_LOG=1: the gather's and the PLE layer's join wait of shared passes, averaged over 100 passes.
++pub fn gatherLog() bool {
++    const v = std.c.getenv("TF_FLASHNEXT_GATHER_LOG") orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
++
++/// TF_FLASHNEXT_GATHER_LOCK_SCALES=1: lock the n-gram table's scale arrays in memory at load (see Ngram.lockScales).
++pub fn gatherLockScales() bool {
++    const v = std.c.getenv("TF_FLASHNEXT_GATHER_LOCK_SCALES") orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
+diff --git a/zig/src/families/flashnext/cuda_ple.zig b/zig/src/families/flashnext/cuda_ple.zig
+index 3d3bb36..ddb8f3f 100644
+--- a/zig/src/families/flashnext/cuda_ple.zig
++++ b/zig/src/families/flashnext/cuda_ple.zig
+@@ -413,9 +413,27 @@ pub const Ngram = struct {
+             }
+         }
+         g.pool = try ple_pool.Pool.create(gpa, io);
++        if (@import("cuda_knobs.zig").gatherLockScales() and g.format == .nvfp4) g.lockScales(io);
+         return g;
+     }
+ 
++    /// TF_FLASHNEXT_GATHER_LOCK_SCALES=1: the tables' scale arrays (3 to 4 GiB; a row's ten bytes sit on a page of their
++    /// own, apart from its codes) read in and locked, so a gathered row faults one page from disk, not two.
++    fn lockScales(g: *Ngram, io: std.Io) void {
++        if (@import("builtin").os.tag != .linux) return;
++        var total: usize = 0;
++        var failed = false;
++        const t0 = std.Io.Clock.awake.now(io).toNanoseconds();
++        for (g.tables[0..g.hash.shards]) |t| {
++            const addr = @intFromPtr(t.scales.ptr);
++            const lo = addr & ~@as(usize, 4095);
++            const len = (addr + t.scales.len + 4095 - lo) & ~@as(usize, 4095);
++            const rc = std.os.linux.syscall2(.mlock, lo, len);
++            if (std.os.linux.errno(rc) != .SUCCESS) failed = true else total += len;
++        }
++        std.debug.print("info: flashnext: n-gram scale arrays locked in memory: {d:.2} GiB in {d:.1} s{s}\n", .{ @as(f64, @floatFromInt(total)) / (1 << 30), @as(f64, @floatFromInt(std.Io.Clock.awake.now(io).toNanoseconds() - t0)) / 1e9, if (failed) " (some mlock calls failed)" else "" });
++    }
++
+     pub fn deinit(g: *Ngram) void {
+         if (g.pool) |p| p.destroy();
+         for (g.files.items) |*o| o.close(g.gpa);
+@@ -450,7 +468,14 @@ pub const Ngram = struct {
+         fn part(ctx: *const anyopaque, i: usize) anyerror!void {
+             const s: *const Split = @ptrCast(@alignCast(ctx));
+             const lo = @min(s.ids.len, i * s.per);
++            const t0 = if (Stat.on) Stat.now() else 0;
+             try s.g.fill(s.ids, s.out, lo, @min(s.ids.len, lo + s.per));
++            if (Stat.on) {
++                const d = Stat.now() - t0;
++                _ = Stat.part_sum.fetchAdd(d, .monotonic);
++                var m = Stat.part_max.load(.monotonic);
++                while (d > m) m = Stat.part_max.cmpxchgWeak(m, d, .monotonic, .monotonic) orelse break;
++            }
+         }
+     };
+ 
+@@ -490,6 +515,114 @@ pub const Ngram = struct {
+     }
+ };
+ 
++/// TF_FLASHNEXT_GATHER_LOG=1: where the time of a shared gather goes.
++const Stat = struct {
++    const on_flag = struct {
++        var v: ?bool = null;
++    };
++    var on: bool = false;
++    var calls: u64 = 0;
++    var prep_ns: u64 = 0;
++    var run_ns: u64 = 0;
++    var post_ns: u64 = 0;
++    var parts_n: u64 = 0;
++    var items_n: u64 = 0;
++    var part_sum = std.atomic.Value(u64).init(0);
++    var part_max = std.atomic.Value(u64).init(0);
++    var max_sum: u64 = 0;
++    var run_sum_parts: u64 = 0;
++    fn now() u64 {
++        var t: std.c.timespec = undefined;
++        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &t);
++        return @as(u64, @intCast(t.sec)) * 1_000_000_000 + @as(u64, @intCast(t.nsec));
++    }
++};
++
++/// One stream's rows in a shared gather: its history (moved past the rows), tokens, and their slices of out and xs.
++pub const Part = struct { history: []i64, tokens: []const u32, out: []u16, xs: []f32 };
++
++/// `Ngram.rows` over several streams' rows in one pool call. Rows lie one after another in the caller's buffers; each
++/// stream's ids come from its own history, so every row's bits are the per-stream call's.
++pub fn rowsMany(g: *const Ngram, parts: []const Part) !void {
++    const heads = g.hash.heads;
++    const w = g.width();
++    var total: usize = 0;
++    for (parts) |q| {
++        if (q.history.len != g.hash.n - 1 or q.out.len != q.tokens.len * w or q.xs.len != q.out.len / 32) return error.UnexpectedTensor;
++        total += q.tokens.len;
++    }
++    const items = total * heads;
++    const ids = try g.gpa.alloc(i64, items);
++    defer g.gpa.free(ids);
++    Stat.on = @import("cuda_knobs.zig").gatherLog();
++    const ts0 = if (Stat.on) Stat.now() else 0;
++    var hists: [64][max_n]i64 = undefined;
++    if (parts.len > hists.len) return error.UnexpectedTensor;
++    var at: usize = 0;
++    for (parts, 0..) |q, k| {
++        const hist = &hists[k];
++        @memcpy(hist[0..q.history.len], q.history);
++        for (q.tokens) |token| {
++            try lastIds(g.hash, hist[0..q.history.len], @intCast(token), ids[at * heads ..][0..heads]);
++            for (0..q.history.len - 1) |i| hist[i] = hist[i + 1];
++            hist[q.history.len - 1] = token;
++            at += 1;
++        }
++    }
++    // the parts' outputs are consecutive in the caller's buffer (row0 on): one fill covers them all
++    const first = parts[0].out;
++    var out = first;
++    out.len = total * w;
++    for (parts[1..], 0..) |q, k| if (q.out.ptr != parts[k].out.ptr + parts[k].out.len) return error.UnexpectedTensor;
++    const n_threads = @min(ple_pool.max_parts, items / 4);
++    const ts1 = if (Stat.on) Stat.now() else 0;
++    if (Stat.on) {
++        Stat.part_sum.store(0, .monotonic);
++        Stat.part_max.store(0, .monotonic);
++    }
++    if (n_threads <= 1 or g.pool == null) {
++        try g.fill(ids, out, 0, items);
++    } else {
++        const split: Ngram.Split = .{ .g = g, .ids = ids, .out = out, .per = (items + n_threads - 1) / n_threads };
++        try g.pool.?.run(n_threads, .{ .ctx = &split, .run = Ngram.Split.part });
++    }
++    const ts2 = if (Stat.on) Stat.now() else 0;
++    defer if (Stat.on) {
++        Stat.calls += 1;
++        Stat.prep_ns += ts1 - ts0;
++        Stat.run_ns += ts2 - ts1;
++        Stat.post_ns += Stat.now() - ts2;
++        Stat.parts_n += n_threads;
++        Stat.items_n += items;
++        Stat.max_sum += Stat.part_max.load(.monotonic);
++        Stat.run_sum_parts += Stat.part_sum.load(.monotonic);
++        if (Stat.calls % 100 == 0) {
++            const f = 100.0 * 1e6;
++            std.debug.print("gather detail: per call prep {d:.2} ms, pool run {d:.2} ms (slowest part {d:.2} ms, sum of parts {d:.2} ms), post {d:.2} ms; {d:.0} parts, {d:.0} items\n", .{ @as(f64, @floatFromInt(Stat.prep_ns)) / f, @as(f64, @floatFromInt(Stat.run_ns)) / f, @as(f64, @floatFromInt(Stat.max_sum)) / f, @as(f64, @floatFromInt(Stat.run_sum_parts)) / f, @as(f64, @floatFromInt(Stat.post_ns)) / f, @as(f64, @floatFromInt(Stat.parts_n)) / 100.0, @as(f64, @floatFromInt(Stat.items_n)) / 100.0 });
++            Stat.prep_ns = 0;
++            Stat.run_ns = 0;
++            Stat.post_ns = 0;
++            Stat.parts_n = 0;
++            Stat.items_n = 0;
++            Stat.max_sum = 0;
++            Stat.run_sum_parts = 0;
++        }
++    };
++    for (parts) |q| {
++        for (0..q.tokens.len) |t| {
++            const row = q.out[t * w ..][0..w];
++            if (g.format == .mlx and g.scale != 1) {
++                for (row) |*v| {
++                    const f: f32 = @bitCast(@as(u32, v.*) << 16);
++                    v.* = toBf16(f * g.scale);
++                }
++            }
++            sumGroups(row, q.xs[t * (w / 32) ..][0 .. w / 32]);
++        }
++    }
++    for (parts, 0..) |q, k| @memcpy(q.history, hists[k][0..q.history.len]);
++}
++
+ test "a fresh window hashes token 7 into sixteen rows" {
+     const h = try Hash.init(.{
+         .vocab = 248320,

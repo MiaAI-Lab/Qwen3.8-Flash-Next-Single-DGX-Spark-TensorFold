@@ -82,8 +82,8 @@ def main():
     from tokenizers import Tokenizer
     tok = Tokenizer.from_file(str(args.tokenizer))
     spec = json.loads(args.tokenizer.read_text(encoding="utf-8"))
-    from nl_draft_vocab import default_ids_from_patch, DEFAULT_PATCH
-    base = read_ids(args.base, tok.get_vocab_size()) if args.base else set(default_ids_from_patch(DEFAULT_PATCH))
+    from nl_draft_vocab import validated_ids
+    base = read_ids(args.base, tok.get_vocab_size()) if args.base else set(validated_ids()[0])
     if any(i < 0 or i >= tok.get_vocab_size() for i in base):
         raise ValueError("Zig baseline contains IDs outside tokenizer vocabulary")
     pinned = {t["id"] for t in spec.get("added_tokens", [])}
@@ -98,6 +98,7 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     vocab = args.output_dir / "draft_vocab_nl.txt"
     vocab.write_text("".join(f"{i}\n" for i in ids), encoding="utf-8", newline="\n")
+    (args.output_dir / "draft_vocab_complete.txt").write_text("".join(f"{i}\n" for i in sorted(keep)), encoding="utf-8", newline="\n")
     report = {
         "schema": 1, "provenance": json.loads(args.provenance.read_text(encoding="utf-8")),
         "sha256": {"tokenizer": sha(args.tokenizer),

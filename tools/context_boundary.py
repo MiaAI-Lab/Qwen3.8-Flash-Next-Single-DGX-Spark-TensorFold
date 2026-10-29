@@ -46,8 +46,10 @@ def main():
             try:
                 client.chat(messages, max_tokens=room + 1, stream=stream, draft=draft, timeout=120)
             except client.ApiError as exc:
-                if "HTTP 400" not in str(exc) or "context" not in str(exc).lower():
-                    print(f"FAIL: expected a context HTTP 400 before any stream opens: {exc}")
+                # whole replies: HTTP 400; streamed ones (TensorFold v1.1.4): the same refusal reported inside the stream
+                refused = "HTTP 400" in str(exc) or (stream and "stream reported an error" in str(exc))
+                if not refused or "context" not in str(exc).lower():
+                    print(f"FAIL: expected a context refusal (HTTP 400, or an error in the stream): {exc}")
                     return client.FAIL
             else:
                 print("FAIL: the server accepted prompt + reply > context")

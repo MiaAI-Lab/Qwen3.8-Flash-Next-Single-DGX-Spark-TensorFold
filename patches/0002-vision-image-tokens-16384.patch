@@ -1,0 +1,36 @@
+diff --git a/zig/src/vision/qwen_cuda_media.zig b/zig/src/vision/qwen_cuda_media.zig
+index 87248f7..5cd9548 100644
+--- a/zig/src/vision/qwen_cuda_media.zig
++++ b/zig/src/vision/qwen_cuda_media.zig
+@@ -3,9 +3,11 @@ const std = @import("std");
+ const cuda = @import("cuda");
+ const lanes = @import("lanes");
+ const vision = @import("qwen_cuda.zig");
++/// The image rows one request holds in all (each image keeps one tower call's 4,096 at most).
++pub const max_image_tokens = 16384;
+ pub const Limits = struct { image_tokens: u32 = 4096, max_images: u32 = 4 };
+ pub fn checkLimits(l: Limits) !void {
+-    if (l.image_tokens == 0 or l.image_tokens > 4096 or l.max_images == 0 or l.max_images > 64)
++    if (l.image_tokens == 0 or l.image_tokens > max_image_tokens or l.max_images == 0 or l.max_images > 64)
+         return error.BadImageLimits;
+ }
+ pub const Run = extern struct {
+@@ -200,5 +202,17 @@ test "an image plan bounds its grids, counts and limits, and lays out interleave
+     try std.testing.expectError(error.BadImagePlaceholders, Plan.init(a, 5, &.{.{ .at = 2, .gh = 4, .gw = 4 }}, .{}));
+     try std.testing.expectError(error.BadImageCount, Plan.init(a, 20, &.{ .{ .at = 2, .gh = 2, .gw = 2 }, .{ .at = 8, .gh = 2, .gw = 2 } }, .{ .max_images = 1 }));
+     try std.testing.expectError(error.BadImageLimits, checkLimits(.{ .max_images = 65 }));
+-    try std.testing.expectError(error.BadImageLimits, checkLimits(.{ .image_tokens = 4097 }));
++    try std.testing.expectError(error.BadImageLimits, checkLimits(.{ .image_tokens = max_image_tokens + 1 }));
++    try checkLimits(.{ .image_tokens = max_image_tokens, .max_images = 64 });
++}
++
++test "a request's images share the configured token budget, each at most one tower call's" {
++    const a = std.testing.allocator;
++    const runs = [_]Run{ .{ .at = 2, .gh = 128, .gw = 128 }, .{ .at = 5000, .gh = 128, .gw = 128 }, .{ .at = 9500, .gh = 128, .gw = 128 } };
++    var p = try Plan.init(a, 14000, &runs, .{ .image_tokens = max_image_tokens, .max_images = 4 });
++    defer p.deinit();
++    try std.testing.expectEqual(@as(usize, 3 * 4096), p.rows);
++    try std.testing.expectEqual(@as(i32, 2 * 4096), p.src[9500]);
++    try std.testing.expectError(error.BadImageGrid, Plan.init(a, 14000, &runs, .{ .max_images = 4 }));
++    try std.testing.expectError(error.BadImageGrid, Plan.init(a, 14000, &.{.{ .at = 2, .gh = 130, .gw = 128 }}, .{ .image_tokens = max_image_tokens }));
+ }

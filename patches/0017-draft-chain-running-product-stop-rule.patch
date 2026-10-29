@@ -1,0 +1,232 @@
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 3a638f7..e2dfe58 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -317,6 +317,36 @@ pub const Engine = struct {
+         if (e.backend.round_observer != null) e.backend.observed(paths);
+     }
+ 
++    /// TF_FLASHNEXT_COPY_LOG=1: every 400 verified windows, the windows, rows and kept drafts by plan kind since the last line.
++    fn copyLog(p: Plan, rows: usize, kept: usize) void {
++        const st = struct {
++            var on: i8 = -1;
++            var n: [6]u64 = @splat(0);
++            var r: [6]u64 = @splat(0);
++            var k: [6]u64 = @splat(0);
++            var full: [6]u64 = @splat(0);
++            var calls: u64 = 0;
++        };
++        if (st.on < 0) st.on = if (std.c.getenv("TF_FLASHNEXT_COPY_LOG")) |v| @intFromBool(v[0] == '1') else 0;
++        if (st.on == 0) return;
++        const i = @intFromEnum(p.kind);
++        st.n[i] += 1;
++        st.r[i] += rows;
++        st.k[i] += kept;
++        if (rows > 1 and kept == rows - 1) st.full[i] += 1;
++        st.calls += 1;
++        if (st.calls % 400 != 0) return;
++        std.debug.print("COPYLOG", .{});
++        for (0..6) |j| {
++            if (st.n[j] > 0) std.debug.print(" {s}: win={d} rows={d} kept={d} full={d};", .{ @tagName(@as(win.Kind, @enumFromInt(j))), st.n[j], st.r[j], st.k[j], st.full[j] });
++        }
++        std.debug.print("\n", .{});
++        st.n = @splat(0);
++        st.r = @splat(0);
++        st.k = @splat(0);
++        st.full = @splat(0);
++    }
++
+     /// Commit the target-sampled path (after the thinking budget's cut), each token with its path row's logprob row.
+     fn conclude(e: *Engine, s: *Stream, p: Plan, sampled: []const u32, rows_lp: []const LogRow, tokens: []const u32, parents: []const i32, positions: []const u64) !Outcome {
+         const a = e.arena.allocator();
+@@ -333,6 +363,7 @@ pub const Engine = struct {
+             for (path[1..]) |r| try committed.append(a, accept.targetPick(sampled, parents, r));
+             try committed.append(a, sampled[path[path.len - 1]]);
+             if (s.proposer) |pr| pr.round(@intCast(rows), @intCast(path.len - 1));
++            copyLog(p, rows, path.len - 1);
+             if (rows > 1) {
+                 const kept = path.len - 1;
+                 e.drafted += rows - 1;
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 2b7cdbc..98bb339 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -147,6 +147,9 @@ pub fn Namespace(comptime Tri: type) type {
+             head: ?*mtp.Head = null,
+             depth: usize = mtp.default_depth,
+             confidence: f64 = mtp.default_confidence,
++            /// With a running-product confidence (< 0): the streams drafting together up to which it applies, the per-draft
++            /// mtp.wide_confidence above (TF_FLASHNEXT_PRODUCT_STREAMS, default 2: the old recipe engine's served hybrid)
++            product_streams: usize = 2,
+             /// A captured Triton set (TENSORFOLD_CUDA_KERNELS) for comparison, else null: our own glue.
+             set: ?cuda.aot.Set = null,
+             glue: Glue,
+@@ -230,6 +233,11 @@ pub fn Namespace(comptime Tri: type) type {
+                 };
+             }
+ 
++            /// The stop rule for a step drafting `drafting` streams together (mtp.confidenceFor).
++            pub fn confidenceNow(self: *const Cuda, drafting: usize) f64 {
++                return mtp.confidenceFor(self.confidence, drafting, self.product_streams);
++            }
++
+             fn take(self: *Cuda, token: u32) u64 {
+                 const h = self.next;
+                 self.drawn[h % ring] = token;
+@@ -529,11 +537,11 @@ pub fn Namespace(comptime Tri: type) type {
+                     for (path, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
+                     if (r.follow.len < path.len) return error.PositionMismatch;
+                     if (ahead) |a| a.push(0, r.follow[path.len - 1]);
+-                    try self.ops().draft(d, r.follow[0..path.len], d.streams.ptr, r.position, count, r.stream.sampling, self.confidence, &l.chain, ahead);
++                    try self.ops().draft(d, r.follow[0..path.len], d.streams.ptr, r.position, count, r.stream.sampling, self.confidenceNow(requests.len), &l.chain, ahead);
+                 } else {
+                     const first = self.value(r.first orelse return error.NoFirstToken);
+                     if (ahead) |a| a.push(0, first);
+-                    try self.ops().draft(d, &.{first}, d.prompt_last, r.position, count, r.stream.sampling, self.confidence, &l.chain, ahead);
++                    try self.ops().draft(d, &.{first}, d.prompt_last, r.position, count, r.stream.sampling, self.confidenceNow(requests.len), &l.chain, ahead);
+                 }
+             }
+         }
+diff --git a/zig/src/families/flashnext/cuda_lanes_draft.zig b/zig/src/families/flashnext/cuda_lanes_draft.zig
+index 16f5730..ea1ae53 100644
+--- a/zig/src/families/flashnext/cuda_lanes_draft.zig
++++ b/zig/src/families/flashnext/cuda_lanes_draft.zig
+@@ -79,7 +79,7 @@ pub fn batched(self: anytype, requests: []const be.DraftRequest, done: []bool) !
+         // one greedy stream: it drafts alone below (its rollback is idempotent)
+         return;
+     }
+-    try self.ops().draftMany(ds[0..n], nexts[0..n], rows[0..n], counts[0..n], self.confidence, outs[0..n], positions[0..n], sms[0..n], ahead);
++    try self.ops().draftMany(ds[0..n], nexts[0..n], rows[0..n], counts[0..n], self.confidenceNow(requests.len), outs[0..n], positions[0..n], sms[0..n], ahead);
+     for (which[0..n]) |ri| done[ri] = true;
+ }
+ 
+diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
+index 83e3b60..d5734fd 100644
+--- a/zig/src/families/flashnext/cuda_lanes_load.zig
++++ b/zig/src/families/flashnext/cuda_lanes_load.zig
+@@ -70,6 +70,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
+         own.head = try mtp.Head.init(gpa, io, driver, &own.stream, dir);
+         own.depth = @max(1, @min(mtp.max_chain, F.envUsize("TF_FLASHNEXT_DRAFTS", mtp.default_depth)));
+         if (std.c.getenv("TF_FLASHNEXT_CONFIDENCE")) |v| own.confidence = std.fmt.parseFloat(f64, std.mem.span(v)) catch mtp.default_confidence;
++        own.product_streams = F.envUsize("TF_FLASHNEXT_PRODUCT_STREAMS", 2);
+     }
+     errdefer if (own.head) |h| h.deinit();
+     const window = @min(o.context + mtp.max_rows, prompt.max_tokens);
+diff --git a/zig/src/families/flashnext/cuda_mtp.zig b/zig/src/families/flashnext/cuda_mtp.zig
+index f7d3613..fd5b451 100644
+--- a/zig/src/families/flashnext/cuda_mtp.zig
++++ b/zig/src/families/flashnext/cuda_mtp.zig
+@@ -33,6 +33,64 @@ pub const max_chain: usize = max_rows - 1;
+ pub const default_depth: usize = 6;
+ /// The live recipe's --mtp-confidence (Python's CONFIDENCE default is 0.7).
+ pub const default_confidence: f64 = 0.6;
++/// The served hybrid's per-draft floor above `product_streams` live streams (the old recipe engine's wide_confidence).
++pub const wide_confidence: f64 = 0.5;
++
++/// A chain's stop rule from a `confidence` value: c > 0, each later draft only at or above c; c < 0, a later draft j only while
++/// p1 * ... * pj >= -c (the running product: it keeps going on confident heads and stops early on lukewarm ones, whatever the
++/// depth); 0, every draft to the depth. The first draft is always proposed. Drafts only: the kept tokens are the target's either way.
++pub const Stop = struct {
++    c: f64,
++    product: f64 = 1.0,
++
++    /// Whether draft j (0-based) with probability `p` is proposed, and whether the chain may go on.
++    pub fn take(s: *Stop, j: usize, p: f64) struct { propose: bool, more: bool } {
++        if (s.c > 0) {
++            const low = p < s.c;
++            if (low and j > 0) return .{ .propose = false, .more = false };
++            return .{ .propose = true, .more = !low };
++        }
++        if (s.c < 0) {
++            s.product *= p;
++            // the first draft always goes; below the line it ends the chain (no later product can reach it)
++            if (s.product < -s.c) return .{ .propose = j == 0, .more = false };
++        }
++        return .{ .propose = true, .more = true };
++    }
++};
++
++/// The stop rule for a step drafting `drafting` streams together: a running product (c < 0) only up to `product_streams` of them,
++/// the per-draft `wide_confidence` above.
++pub fn confidenceFor(c: f64, drafting: usize, product_streams: usize) f64 {
++    if (c >= 0) return c;
++    return if (drafting <= product_streams) c else wide_confidence;
++}
++
++test "the product rule serves up to product_streams streams, the per-draft floor above" {
++    try std.testing.expectEqual(@as(f64, 0.6), confidenceFor(0.6, 9, 5));
++    try std.testing.expectEqual(@as(f64, -0.4), confidenceFor(-0.4, 1, 5));
++    try std.testing.expectEqual(@as(f64, -0.4), confidenceFor(-0.4, 5, 5));
++    try std.testing.expectEqual(wide_confidence, confidenceFor(-0.4, 6, 5));
++    try std.testing.expectEqual(wide_confidence, confidenceFor(-0.4, 3, 2));
++    try std.testing.expectEqual(@as(f64, 0), confidenceFor(0, 9, 1));
++}
++
++test "the stop rules: per draft, running product, none" {
++    var a: Stop = .{ .c = 0.7 };
++    try std.testing.expect(a.take(0, 0.5).propose and !a.take(0, 0.5).more);
++    try std.testing.expect(!a.take(1, 0.5).propose);
++    var low: Stop = .{ .c = -0.4 };
++    const first = low.take(0, 0.3); // a weak first draft: proposed, and the chain ends there
++    try std.testing.expect(first.propose and !first.more);
++    var b: Stop = .{ .c = -0.4 };
++    try std.testing.expect(b.take(0, 0.9).more); // 0.9
++    try std.testing.expect(b.take(1, 0.8).propose); // 0.72
++    try std.testing.expect(b.take(2, 0.6).propose); // 0.432
++    try std.testing.expect(!b.take(3, 0.9).propose); // 0.389
++    var c: Stop = .{ .c = 0 };
++    try std.testing.expect(c.take(5, 0.01).propose);
++}
++
+ /// A verify window's rows at most: the pending token and a chain, or a copied continuation.
+ pub const max_rows: usize = 16;
+ /// qmm.split_for(2560, 2560): fc_embedding and fc_hidden sum K in four slices, in order.
+diff --git a/zig/src/families/flashnext/cuda_mtp_ops.zig b/zig/src/families/flashnext/cuda_mtp_ops.zig
+index 692d55f..e5474f4 100644
+--- a/zig/src/families/flashnext/cuda_mtp_ops.zig
++++ b/zig/src/families/flashnext/cuda_mtp_ops.zig
+@@ -256,15 +256,16 @@ pub fn Ops(comptime Tri: type) type {
+             try o.absorb(d, next, rows, count > 0);
+             if (ahead) |a| a.flush();
+             var j: usize = 0;
++            var stop: mtp.Stop = .{ .c = confidence };
+             while (j < @min(count, max_chain)) : (j += 1) {
+                 const got = try o.pick(d, position + j, sm);
+-                const low = confidence > 0 and got.prob < confidence;
+-                if (low and j > 0) break;
++                const t = stop.take(j, got.prob);
++                if (!t.propose) break;
+                 out.tokens[out.n] = got.token;
+                 out.probs[out.n] = got.prob;
+                 out.n += 1;
+                 if (ahead) |a| a.push(0, got.token);
+-                if (low) break;
++                if (!t.more) break;
+                 if (j + 1 < count) {
+                     try o.forwardHead(d, &.{got.token}, d.out.ptr, true);
+                     // asked once the head's step is on the stream: the reads run while it does
+@@ -408,6 +409,7 @@ pub fn Ops(comptime Tri: type) type {
+                 n_act += 1;
+             };
+             var j: usize = 0;
++            var stops: [max_lanes]mtp.Stop = @splat(.{ .c = confidence });
+             var best_host: [max_lanes * 4]f32 = undefined;
+             var step_ds: [max_lanes]*Draft = undefined;
+             var step_next: [max_lanes][1]u32 = undefined;
+@@ -464,13 +466,13 @@ pub fn Ops(comptime Tri: type) type {
+                         }
+                     }
+                     const out = outs[i];
+-                    const low = confidence > 0 and got.prob < confidence;
+-                    if (low and j > 0) continue;
++                    const t = stops[i].take(j, got.prob);
++                    if (!t.propose) continue;
+                     out.tokens[out.n] = got.token;
+                     out.probs[out.n] = got.prob;
+                     out.n += 1;
+                     if (ahead) |a| a.push(i, got.token);
+-                    if (low) continue;
++                    if (!t.more) continue;
+                     if (j + 1 < @min(counts[i], max_chain)) {
+                         step_ds[n_step] = ds[i];
+                         step_next[n_step] = .{got.token};

@@ -35,8 +35,7 @@ for arg in "$@"; do [[ "$arg" == -h || "$arg" == --help ]] && { usage; exit 0; }
 [[ "$PARALLEL" =~ ^([1-9]|1[0-6])$ ]] || die "PARALLEL is 1 to 16, not $PARALLEL"
 [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] || die "MAX_TOKENS is a token count, not $MAX_TOKENS"
 for v in THINKING DRAFTS VISION VISION_URLS; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
-[[ "$TF_FLASHNEXT_YARN" =~ ^(0|4)$ ]] || die "TF_FLASHNEXT_YARN is 0 or 4, not $TF_FLASHNEXT_YARN"
-(( CONTEXT <= 262144 || TF_FLASHNEXT_YARN != 0 )) || die "CONTEXT=$CONTEXT is past 262,144: it needs YaRN (TF_FLASHNEXT_YARN=4)"
+(( CONTEXT <= 262144 )) || die "CONTEXT=$CONTEXT is past 262,144: TensorFold 1.1.4's Flash Next engine has no YaRN extension"
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 
 SERVE_ARGS=(--context "$CONTEXT" --parallel "$PARALLEL" --max-tokens "$MAX_TOKENS"
@@ -44,7 +43,7 @@ SERVE_ARGS=(--context "$CONTEXT" --parallel "$PARALLEL" --max-tokens "$MAX_TOKEN
 if [[ "$THINKING" == 1 ]]; then SERVE_ARGS+=(--thinking); else SERVE_ARGS+=(--no-thinking); fi
 [[ "$DRAFTS" == 1 ]] || SERVE_ARGS+=(--no-drafts)
 [[ "$KV_DTYPE" =~ ^(bf16|fp8)$ ]] || die "KV_DTYPE is bf16 or fp8, not $KV_DTYPE"
-SERVE_ARGS+=(--kv-dtype "$KV_DTYPE")
+SERVE_ARGS+=(--kv-cache "$KV_DTYPE")
 [[ "$MAX_VIDEOS" =~ ^[0-9]+$ ]] || die "MAX_VIDEOS is a count, not $MAX_VIDEOS"
 if [[ "$VISION" == 1 ]]; then
   SERVE_ARGS+=(--vision --vision-max-images "$TENSORFOLD_MAX_IMAGES" --vision-max-videos "$MAX_VIDEOS"
@@ -115,7 +114,7 @@ have_image=1
 docker image inspect "$IMAGE" >/dev/null 2>&1 || { have_image=0; missing "image $IMAGE missing: $why build it"; }
 if (( have_image )); then
   kernels=$(docker image inspect -f '{{index .Config.Labels "tf.kernels"}}' "$IMAGE" 2>/dev/null || true)
-  [[ "$kernels" == present ]] || missing "$IMAGE has no kernel set (tf.kernels=${kernels:-?}): scripts/prepare.sh --rebuild"
+  [[ "$kernels" == embedded ]] || missing "$IMAGE is not an image of this recipe (tf.kernels=${kernels:-?}): scripts/prepare.sh --rebuild"
 fi
 KCACHE=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || true)
 [[ "$KCACHE" =~ ^[0-9a-f]{12}$ ]] || KCACHE=$(image_hash)
@@ -166,9 +165,9 @@ if (( PARALLEL * full + WEIGHTS_GIB + TENSORFOLD_MEMORY_RESERVE_GIB > 121 )); th
   warn "$PARALLEL full windows are ~$((PARALLEL * full)) GiB of $KV_DTYPE cache beside ~$WEIGHTS_GIB GiB of weights: the engine keeps $TENSORFOLD_MEMORY_RESERVE_GIB GiB free and refuses a request that would not fit"
 fi
 
-ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" -e TENSORFOLD_CUDA_KERNELS="$KERNELS_PATH")
+ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}")
 while IFS='=' read -r name _; do
-  [[ "$name" == TENSORFOLD_API_KEY || "$name" == TENSORFOLD_CUDA_KERNELS ]] && continue
+  [[ "$name" == TENSORFOLD_API_KEY ]] && continue
   ENV_ARGS+=(-e "$name=${!name}")
 done < <(env | grep -E '^(TENSORFOLD|TF_FLASHNEXT)_[A-Z0-9_]+=' || true)
 KEY_ARGS=(); [[ -z "${TENSORFOLD_API_KEY:-}" ]] || { export TENSORFOLD_API_KEY; KEY_ARGS=(-e TENSORFOLD_API_KEY); }
@@ -252,7 +251,7 @@ cat <<EOF
     API      http://${IP:-<spark-address>}:$PORT/v1   (model: $SERVED)
     Loaded   in ${LOADED_S}s · ${avail_gb} GiB was free
     Model    $MODEL_ID @ ${MODEL_REVISION:0:8} ($QUANT_LABEL)
-    Window   $(arg_value --context) tokens$( [[ "$TF_FLASHNEXT_YARN" != 0 ]] && echo " (YaRN x$TF_FLASHNEXT_YARN)") · $(arg_value --parallel) at once · $KV_DTYPE KV · drafts $( [[ "$DRAFTS" == 1 ]] && echo MTP || echo off)
+    Window   $(arg_value --context) tokens · $(arg_value --parallel) at once · $KV_DTYPE KV · drafts $( [[ "$DRAFTS" == 1 ]] && echo MTP || echo off)
     Logs     docker logs -f $CONTAINER_NAME
     Restart  ./start.sh restart
     Stop     ./stop.sh
