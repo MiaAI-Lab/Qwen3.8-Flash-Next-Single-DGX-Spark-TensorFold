@@ -5,6 +5,26 @@ Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:
 
 ## Unreleased
 
+**Patch 0018: a document re-sent with a new question resumes from the prompt cache (2026-10-27).**
+The engine resumes a prompt only from a kept state whose whole token sequence is a prefix of the new prompt. A client that re-sends the same
+document inside one user message with a new question has no history, so the shared part ends inside that message and nothing matched:
+128k took 59.9 s with 0 tokens reused. Patch 0018 is ashhart's TensorFold commit `3abeeff` (fixes ashhart/TensorFold#1262, in TensorFold v1.1.5),
+backported to v1.1.4. It keeps an interior state in a final user message of at least 8,192 tokens with at least 2,048 tokens after the cut.
+One difference from upstream: the metrics block reading `info.prompt_cache_capacity` is left out, v1.1.4 has no such field.
+One Spark, thinking off, temperature 0, one run each:
+
+| 128k | v1.1.4 (0001 to 0017) | + 0018 |
+| --- | ---: | ---: |
+| same document re-sent with a new question | 59.9 s, 0 reused | 2.60 s, 125,954 of 130,255 reused |
+| next question in the same chat | 0.53 s | 0.51 s |
+
+At 32k the re-sent document goes from 14.0 s to 2.4 s (27,650 of 32,732 reused). Greedy replies at 12k and 30k padding are byte-identical to
+v1.1.4 (`tools/exact.py`: serial, without drafts, concurrent), the resumed answer at 128k equals the cold answer, decode (55.0 and 54.9 t/s prose,
+47.0 and 47.0 code, one stream) and prefill are unchanged, and `tools/toolcheck.py`, `visioncheck.py`, `context_boundary.py --context 262144`,
+`needle.py 128k` and `prompt_reuse.py` (30k, 128k, with another conversation in between) pass. With `--prompt-cache-gib 1`, a state that does not fit is
+not kept: a 122k re-sent document is recomputed (about 52 s), the reply is right and the server logs no errors.
+The kept state costs prompt-cache space, so the 5.1 GiB prompt cache holds fewer long conversations at once. Measured with several chats started together, each document about 58k tokens unless noted: two chats keep the next-question state of both on v1.1.4 and with 0018 (116,063 of 116,130 tokens resumed); four chats keep 2 of 4 on both builds; two 128k chats keep 0 of 2 on v1.1.4 and 1 of 2 with 0018. Two documents re-sent together resume 110,596 of 116,059 tokens with 0018, four re-sent together resume 2 of 4. Which chat loses its state varies from run to run.
+
 **Measured gains of the v1.1.4 build (patches 0001 to 0017) over the db281878 build (patches 0001 to 0015), sparkDash on the same Spark, 2026-10-27.**
 The "before" numbers are the sparkDash tables the README carried (db281878 + patches, patch 0014 era); the "after" numbers are a new sparkDash run on the
 v1.1.4 build. Prose was run at temperature 0.7 with thinking on, code at temperature 0 with thinking off; the README did not record the earlier run's
