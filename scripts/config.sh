@@ -45,18 +45,22 @@ MODEL_REVISION="${MODEL_REVISION:-}"
 # export HF_TOKEN or `hf auth login` with that account. It only fits the nvfp4 checkpoint at the revision it was made from. The model has had safety
 # refusals removed. Its author's own checks (refusal32 32/32) ran on the vLLM/TensorFold recipe, not on this build: validate it here (tools/exact.py,
 # tools/needle.py) before relying on it.
+# ABLIT=2 serves the same house-qsa abliteration per request instead (patches 0018 to 0020): the stock model as SERVED_NAME and the
+# abliterated one as SERVED_NAME-abliterated, both from the stock weights. Its directions file, recovered from the sidecar, is downloaded from
+# ABLIT_DIRECTIONS (gated with automatic approval, like the overlay). A TENSORFOLD_IDENTITIES of your own takes precedence.
 ABLIT="${ABLIT:-0}"
-[[ "$ABLIT" =~ ^[01]$ ]] || { echo "ABLIT must be 0 or 1, not $ABLIT" >&2; exit 1; }
+[[ "$ABLIT" =~ ^[012]$ ]] || { echo "ABLIT must be 0, 1 or 2, not $ABLIT" >&2; exit 1; }
+ABLIT_DIRECTIONS="${ABLIT_DIRECTIONS:-hf:Loke-60000/Qwen3.8-Flash-Next-FP4-Local-house-qsa-directions/house-qsa.safetensors@5983c8cc876085905ab2837492dcd8d28c657da0}"
 ABLIT_ID=drowzeys/keys-Qwen3.8-Flash-Next-NVFP4-FP4-QAD-house-qsa-L3-47
 ABLIT_REVISION="${ABLIT_REVISION:-c44f5b92ee3d307b82aab1c55f4cc4ae1d440344}"
 ABLIT_SIDECAR=fp4-local/house-qsa-oproj-mxfp8-L3-47.safetensors
 ABLIT_STOCK_REVISION=b9ce18a6887e18c089fdea8509a33e63429a3300     # the nvidia/Qwen3.8-Flash-Next-FP4-Local snapshot the sidecar was made from
-if [[ "$ABLIT" == 1 ]]; then
+if [[ "$ABLIT" != 0 ]]; then
   if [[ "$CHECKPOINT" != nvfp4 || "$_pin" != 1 || "$MODEL_REVISION" != "$ABLIT_STOCK_REVISION" ]]; then
-    echo "ABLIT=1 grafts onto nvidia/Qwen3.8-Flash-Next-FP4-Local @ ${ABLIT_STOCK_REVISION:0:8} (CHECKPOINT=nvfp4, no MODEL_ID or MODEL_REVISION of your own)" >&2
+    echo "ABLIT=$ABLIT fits nvidia/Qwen3.8-Flash-Next-FP4-Local @ ${ABLIT_STOCK_REVISION:0:8} only (CHECKPOINT=nvfp4, no MODEL_ID or MODEL_REVISION of your own)" >&2
     exit 1
   fi
-  QUANT_LABEL+=" + Keys house-qsa ablit"
+  [[ "$ABLIT" == 1 ]] && QUANT_LABEL+=" + Keys house-qsa ablit"
 fi
 unset _pin
 
@@ -96,6 +100,7 @@ prebuilt_image() {
 CONTAINER_NAME="${CONTAINER_NAME:-qwen38-flash-next-tf}"
 
 SERVED_NAME="${SERVED_NAME:-Qwen3.8-Flash-Next}"
+[[ "$ABLIT" != 2 || -n "${TENSORFOLD_IDENTITIES:-}" ]] || export TENSORFOLD_IDENTITIES="$SERVED_NAME-abliterated=$ABLIT_DIRECTIONS"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
 # Native window 262,144; the Flash Next CUDA engine of TensorFold 1.1.4 has no YaRN extension, so this is also the maximum.
@@ -222,12 +227,49 @@ model_sub() {
   else echo "hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)"; fi
 }
 
+# A TENSORFOLD_IDENTITIES entry may name a directions file on Hugging Face, id=hf:owner/repo/path/in/repo[@revision]
+# (revision default main): prepare.sh downloads it into HF_CACHE, and start.sh hands the engine its path in the container.
+hf_identities() {   # one "owner/repo revision path" line per hf: entry
+  local entry ref repo rev
+  local -a entries
+  IFS=',' read -ra entries <<< "${TENSORFOLD_IDENTITIES:-}"
+  for entry in "${entries[@]}"; do
+    ref=${entry#*=}; ref=${ref//[[:space:]]/}
+    [[ "$ref" == hf:* ]] || continue
+    ref=${ref#hf:}; rev=main
+    [[ "$ref" == *@* ]] && { rev=${ref##*@}; ref=${ref%@*}; }
+    repo=$(cut -d/ -f1-2 <<< "$ref")
+    ref=${ref#"$repo"}; echo "$repo $rev ${ref#/}"
+  done
+}
+hf_snapshot() {     # hf_snapshot <repo> <revision>: the downloaded snapshot's folder name, empty when not downloaded
+  if [[ "$2" =~ ^[0-9a-f]{40}$ ]]; then echo "$2"
+  else cat "$HF_CACHE/hub/models--${1//\//--}/refs/$2" 2>/dev/null; fi
+}
+identities_resolved() {   # TENSORFOLD_IDENTITIES with every hf: entry replaced by its file's path in the container
+  local entry id ref repo rev path snap out=""
+  local -a entries
+  IFS=',' read -ra entries <<< "$TENSORFOLD_IDENTITIES"
+  for entry in "${entries[@]}"; do
+    id=${entry%%=*}; ref=${entry#*=}
+    if [[ "${ref//[[:space:]]/}" == hf:* ]]; then
+      read -r repo rev path <<< "$(TENSORFOLD_IDENTITIES="x=$ref" hf_identities)"
+      snap=$(hf_snapshot "$repo" "$rev")
+      [[ -n "$path" && -n "$snap" && -f "$HF_CACHE/hub/models--${repo//\//--}/snapshots/$snap/$path" && -s "$HF_CACHE/hub/models--${repo//\//--}/snapshots/$snap/$path" ]] || return 1
+      ref="/root/.cache/huggingface/hub/models--${repo//\//--}/snapshots/$snap/$path"
+    fi
+    out+="${out:+,}$id=$ref"
+  done
+  echo "$out"
+}
+
 PREPARED_MARKER="$STATE_DIR/prepared"
 prepared_state() {
-  local hash label rev extra=""
+  local hash label rev extra="" hf
   hash=$(image_hash)
   label=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo missing)
   rev=$(snapshot_rev)
   [[ "$ABLIT" != 1 ]] || extra=" ablit=$ABLIT_ID@$ABLIT_REVISION"
+  hf=$(hf_identities | tr '\n' ' '); [[ -z "$hf" ]] || extra+=" identities=${hf% }"
   echo "model=$MODEL_ID@$rev image=$label patches=$hash$extra"
 }

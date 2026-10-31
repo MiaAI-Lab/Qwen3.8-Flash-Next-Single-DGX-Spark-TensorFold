@@ -7,6 +7,7 @@
 #   3. the checkpoint in the Hugging Face cache (~96 GiB for the NVIDIA FP4 default, ~122 GiB for CHECKPOINT=int4), at its pinned revision
 #   4. verify it: every shard its index names is there, and it is a checkpoint format this engine serves (ModelOpt NVFP4 or GPTQ int4)
 #   5. ABLIT=1 only: the Keys overlay's sidecar (~190 MB, gated) and the checkpoint folder with it grafted in (scripts/ablit_view.py)
+#   6. hf: identities in TENSORFOLD_IDENTITIES (ABLIT=2 sets one): their directions files (KB, gated or not)
 # ./start.sh runs this by itself when needed. Safe to re-run: every step skips work that is already done.
 # Pass --rebuild to rebuild the image from scratch.
 set -euo pipefail
@@ -264,5 +265,17 @@ if [[ "$ABLIT" == 1 ]]; then
   info=$(python3 -I -c "$CHECK_PY" "$HF_CACHE/$ABLIT_VIEW_SUB" 2>&1) || die "the checkpoint at $HF_CACHE/$ABLIT_VIEW_SUB is not ready: $info"
   log "ABLIT=1 checkpoint OK ($ABLIT_VIEW_SUB): $info"
 fi
+
+while read -r repo rev path; do
+  [[ -n "$repo" ]] || continue
+  [[ -n "$path" ]] || die "TENSORFOLD_IDENTITIES: hf:$repo names no file (the form is hf:owner/repo/file[@revision])"
+  log "Downloading the identity file $path from $repo @ $rev"
+  idfile() { echo "$HF_CACHE/hub/models--${repo//\//--}/snapshots/$(hf_snapshot "$repo" "$rev")/$path"; }
+  if ! download "$repo" "$rev" "$path"; then
+    [[ -s "$(idfile)" ]] || die "$repo: the download of $path failed (a gated repo needs its terms accepted by the account of HF_TOKEN)"
+    warn "$repo: could not reach Hugging Face; using the $path already here"
+  fi
+  [[ -s "$(idfile)" ]] || die "$repo: no $path at $(idfile) after the download"
+done < <(hf_identities)
 prepared_state > "$PREPARED_MARKER"
 log "Done. Start the server with ./start.sh (port $PORT)."
