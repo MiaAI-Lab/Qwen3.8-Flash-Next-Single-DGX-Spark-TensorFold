@@ -1,0 +1,48 @@
+diff --git a/zig/src/families/flashnext/cuda_mtp.zig b/zig/src/families/flashnext/cuda_mtp.zig
+index fd5b4517..fd2182eb 100644
+--- a/zig/src/families/flashnext/cuda_mtp.zig
++++ b/zig/src/families/flashnext/cuda_mtp.zig
+@@ -114,6 +114,21 @@ pub fn draftIds(gpa: std.mem.Allocator) ![]u32 {
+     return proposal.legacy.ids(gpa, @import("proposal_table.zig").text, .{ .vocab = vocab, .skip_past_vocab = true, .delimiters = " \t\r\n," });
+ }
+ 
++/// Load an optional CUDA draft vocabulary once; the same IDs drive head rows and sampling.
++fn runtimeDraftIds(gpa: std.mem.Allocator, io: std.Io) ![]u32 {
++    const raw = std.c.getenv("TENSORFOLD_DRAFT_VOCAB") orelse return draftIds(gpa);
++    const path = std.mem.trim(u8, std.mem.span(raw), " \t");
++    if (path.len == 0 or std.mem.eql(u8, path, "default")) return draftIds(gpa);
++    const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 26)) catch |err| {
++        std.log.err("TENSORFOLD_DRAFT_VOCAB={s}: {s}", .{ path, @errorName(err) });
++        return err;
++    };
++    defer gpa.free(text);
++    const ids = try proposal.legacy.ids(gpa, text, .{ .vocab = vocab, .delimiters = " \t\r\n," });
++    std.log.info("draft vocabulary: {d} ids from TENSORFOLD_DRAFT_VOCAB", .{ids.len});
++    return ids;
++}
++
+ // ---- sampling ------------------------------------------------------------------------------------------------------
+ 
+ pub fn promote(bits: u16) f32 {
+@@ -410,7 +425,7 @@ pub const Head = struct {
+             h.layer = try load.loadLayerAt(gpa, driver, stream, &store, pack_fn, "language_model.mtp.layers.0", false, false);
+         }
+         errdefer h.layer.free(gpa);
+-        const ids = try draftIds(gpa);
++        const ids = try runtimeDraftIds(gpa, io);
+         defer gpa.free(ids);
+         const head_load = @import("cuda_mtp_load.zig");
+         const role = try head_load.mode();
+diff --git a/zig/src/server/cli.zig b/zig/src/server/cli.zig
+index 5b77bc1e..d4c36869 100644
+--- a/zig/src/server/cli.zig
++++ b/zig/src/server/cli.zig
+@@ -151,7 +151,7 @@ pub const flags = [_]Flag{
+ };
+ 
+ /// The variables this binary honours as the Python engine does, then the CUDA build's.
+-pub const env = [_][]const u8{ "TENSORFOLD_API_KEY", "TENSORFOLD_NO_LIVE", "TENSORFOLD_SEED_SALT", "TENSORFOLD_REQUEST_LOG", "TENSORFOLD_NO_UPDATE_CHECK", "HF_HOME", "HF_HUB_CACHE", "HF_HUB_OFFLINE", "BRAVE_SEARCH_API_KEY" } ++
++pub const env = [_][]const u8{ "TENSORFOLD_API_KEY", "TENSORFOLD_NO_LIVE", "TENSORFOLD_SEED_SALT", "TENSORFOLD_REQUEST_LOG", "TENSORFOLD_NO_UPDATE_CHECK", "TENSORFOLD_DRAFT_VOCAB", "HF_HOME", "HF_HUB_CACHE", "HF_HUB_OFFLINE", "BRAVE_SEARCH_API_KEY" } ++
+     (if (cuda_build) [_][]const u8{ "TF_CUDA_DEVICE", "TF_CUDA_SEGMENTS", "TENSORFOLD_CUDA_KERNELS", "TENSORFOLD_MEMORY_RESERVE_GIB", "TENSORFOLD_CUDA_MEMORY_LIMIT_GB" } else [_][]const u8{});
+ 
+ pub const Args = struct {
