@@ -1,0 +1,250 @@
+diff --git a/zig/kernels/cuda/flashnext_batch.cu b/zig/kernels/cuda/flashnext_batch.cu
+index e3e0cb13..3dd7e5d1 100644
+--- a/zig/kernels/cuda/flashnext_batch.cu
++++ b/zig/kernels/cuda/flashnext_batch.cu
+@@ -534,14 +534,52 @@ extern "C" __global__ void __launch_bounds__(256) fn_gdn_chain_tpr(const float*
+ // floats apart, R orthonormal rows, k <= 4; `meta` its k and first layer (below it the row is left alone); `kind` 0 reads
+ // lam_attn, 1 lam_shared. One block of 256 threads a row; the dot products are reduced in a fixed order (each thread's
+ // columns, the warp tree, then the warps in order), so a row's result never depends on the batch.
++// An identity with k 0 is per-layer: `layer_map` [n * layers] names its entry in `layer_table` for this layer (-1: left
++// alone), [v (d) | D (d) | lam], and the mixer's output becomes D (y - lam (v . y) v); kind 1 (shared expert) is left alone.
++// Slice 0 takes y's whole change: y0 += (D - 1) y - D lam (v . y) v.
+ extern "C" __global__ void __launch_bounds__(256) fn_ablate_rows(float* __restrict__ y, long long row_stride,
+                                                                  long long slice_stride, int slices,
+                                                                  const float* __restrict__ who, const float* __restrict__ table,
+-                                                                 const int* __restrict__ meta, int stride, int kind, int layer, int d) {
++                                                                 const int* __restrict__ meta, int stride, int kind, int layer, int d,
++                                                                 const float* __restrict__ layer_table,
++                                                                 const int* __restrict__ layer_map, int layers) {
+     const int id = static_cast<int>(who[blockIdx.x]);
+     if (id == 0) return;
+     const int k = meta[2 * (id - 1)];
+     if (layer < meta[2 * (id - 1) + 1]) return;
++    if (k == 0) {
++        if (kind != 0) return;
++        const int e = layer_map[static_cast<long long>(id - 1) * layers + layer];
++        if (e < 0) return;
++        const float* __restrict__ v = layer_table + static_cast<long long>(e) * (2 * d + 1);
++        const float* __restrict__ D = v + d;
++        float* row = y + static_cast<long long>(blockIdx.x) * row_stride;
++        float acc = 0.0f;
++        for (int i = threadIdx.x; i < d; i += blockDim.x) {
++            float x = row[i];
++            for (int s = 1; s < slices; ++s) x = __fadd_rn(x, row[static_cast<long long>(s) * slice_stride + i]);
++            acc = __fadd_rn(acc, __fmul_rn(v[i], x));
++        }
++        __shared__ float lpart[8];
++        __shared__ float lcoef;
++        const unsigned lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++        for (int o = 16; o > 0; o >>= 1) acc = __fadd_rn(acc, __shfl_down_sync(0xffffffffu, acc, o));
++        if (lane == 0) lpart[warp] = acc;
++        __syncthreads();
++        if (threadIdx.x == 0) {
++            float s = 0.0f;
++            for (unsigned w = 0; w < blockDim.x / 32; ++w) s = __fadd_rn(s, lpart[w]);
++            lcoef = __fmul_rn(s, v[2 * d]);
++        }
++        __syncthreads();
++        for (int i = threadIdx.x; i < d; i += blockDim.x) {
++            float x = row[i];
++            for (int s = 1; s < slices; ++s) x = __fadd_rn(x, row[static_cast<long long>(s) * slice_stride + i]);
++            const float target = __fmul_rn(D[i], __fsub_rn(x, __fmul_rn(lcoef, v[i])));
++            row[i] = __fadd_rn(row[i], __fsub_rn(target, x));
++        }
++        return;
++    }
+     const float* __restrict__ R = table + static_cast<long long>(id - 1) * stride;
+     const float* __restrict__ lam = R + k * d + kind * k;
+     float* row = y + static_cast<long long>(blockIdx.x) * row_stride;
+diff --git a/zig/src/families/flashnext/cuda_ablate.zig b/zig/src/families/flashnext/cuda_ablate.zig
+index 60c76234..6c4081e5 100644
+--- a/zig/src/families/flashnext/cuda_ablate.zig
++++ b/zig/src/families/flashnext/cuda_ablate.zig
+@@ -9,6 +9,11 @@
+ //! TENSORFOLD_IDENTITIES lists the identities (core/lanes/identities.zig), each a safetensors file: `directions` [k, d] fp32
+ //! (orthonormal rows), `lam_attn` [k] and `lam_shared` [k] fp32, `first_layer` [1] int64. TENSORFOLD_ABLATE_SCALE
+ //! multiplies every strength (default 1). With no identity listed nothing here runs and the forward is unchanged.
++//!
++//! A per-layer file edits only the mixers of the layers it lists, each with a direction of its own, the way a baked
++//! W' = D (W - lam v v^T W) does (D a per-row rescale, as after a row-norm restore): `layers` [n] int64 (increasing),
++//! `directions` [n, d] fp32 (unit rows, one a layer), `lam` [n] fp32, and optionally `row_scale` [n, d] fp32 (D's
++//! diagonal; ones when absent). The mixer's output becomes D (y - lam (v . y) v); the shared expert is left alone.
+ 
+ const std = @import("std");
+ const cuda = @import("cuda");
+@@ -22,20 +27,30 @@ fn strideOf(d: usize) usize {
+     return max_k * d + 2 * max_k;
+ }
+ 
++/// Floats one per-layer entry takes: its direction, its row scale, its lam.
++fn entryOf(d: usize) usize {
++    return 2 * d + 1;
++}
++
+ pub const Ablation = struct {
+     /// [n * stride] fp32: each identity's [k * d directions | k lam_attn | k lam_shared], packed from its block's start
+     table: cuda.DeviceBuffer,
+-    /// [n * 2] i32: each identity's k and first layer
++    /// [n * 2] i32: each identity's k (0: a per-layer identity) and first layer
+     meta: cuda.DeviceBuffer,
++    /// [entries * entryOf(d)] fp32: the per-layer identities' [direction | row scale | lam], one entry a listed layer
++    layer_table: cuda.DeviceBuffer,
++    /// [n * layers] i32: identity i's entry for a layer, -1 where it leaves the layer alone (global identities: all -1)
++    layer_map: cuda.DeviceBuffer,
+     n: usize,
+     d: usize,
++    layers: usize,
+     /// The lowest first layer of them: the launch is skipped below it.
+     first: usize,
+ 
+     pub const Kind = enum(u8) { attn = 0, shared = 1 };
+ 
+     /// The listed identities' files on the device; null when none is listed.
+-    pub fn fromEnv(gpa: std.mem.Allocator, io: std.Io, drv: *const cuda.Driver, hidden: usize, world: usize) !?Ablation {
++    pub fn fromEnv(gpa: std.mem.Allocator, io: std.Io, drv: *const cuda.Driver, hidden: usize, layers: usize, world: usize) !?Ablation {
+         var names: [identities.max]identities.Identity = undefined;
+         const listed = try identities.list(env("TENSORFOLD_IDENTITIES"), env("TENSORFOLD_ABLATE"), env("TENSORFOLD_ABLATE_MODEL"), &names);
+         if (listed.len == 0) return null;
+@@ -48,15 +63,33 @@ pub const Ablation = struct {
+         @memset(host, 0);
+         const meta = try gpa.alloc(i32, listed.len * 2);
+         defer gpa.free(meta);
++        const map = try gpa.alloc(i32, listed.len * layers);
++        defer gpa.free(map);
++        @memset(map, -1);
++        var entries: std.ArrayList(f32) = .empty;
++        defer entries.deinit(gpa);
+         var first: usize = std.math.maxInt(usize);
+         for (listed, 0..) |ident, i| {
+-            const loaded = try load(gpa, io, ident.path, hidden, scale, host[i * stride ..][0..stride]);
++            var file = try core.safetensors.File.open(gpa, io, ident.path);
++            defer file.close(io);
++            if (file.get("layers") != null) {
++                const before = entries.items.len / entryOf(hidden);
++                const lowest = try loadLayers(gpa, &file, hidden, layers, scale, &entries, map[i * layers ..][0..layers]);
++                meta[2 * i] = 0;
++                meta[2 * i + 1] = @intCast(lowest);
++                first = @min(first, lowest);
++                std.log.info("identity {d} {s}: {s}, one direction at each of {d} layers from layer {d} (mixers only, scale {d})", .{ i + 1, ident.id, ident.path, entries.items.len / entryOf(hidden) - before, lowest, scale });
++                continue;
++            }
++            const loaded = try load(&file, hidden, scale, host[i * stride ..][0..stride]);
+             meta[2 * i] = @intCast(loaded.k);
+             meta[2 * i + 1] = @intCast(loaded.first);
+             first = @min(first, loaded.first);
+             const block = host[i * stride ..];
+             std.log.info("identity {d} {s}: {s}, {d} directions from layer {d}, lam_attn {any}, lam_shared {any} (scale {d})", .{ i + 1, ident.id, ident.path, loaded.k, loaded.first, block[loaded.k * hidden ..][0..loaded.k], block[loaded.k * hidden + loaded.k ..][0..loaded.k], scale });
+         }
++        // a buffer is never empty: a list with no per-layer identity keeps one unused entry
++        if (entries.items.len == 0) try entries.appendNTimes(gpa, 0, entryOf(hidden));
+ 
+         var table = try cuda.DeviceBuffer.alloc(drv, host.len * 4);
+         errdefer table.free();
+@@ -64,15 +97,19 @@ pub const Ablation = struct {
+         var meta_dev = try cuda.DeviceBuffer.alloc(drv, meta.len * 4);
+         errdefer meta_dev.free();
+         try meta_dev.upload(0, std.mem.sliceAsBytes(meta));
+-        return .{ .table = table, .meta = meta_dev, .n = listed.len, .d = hidden, .first = first };
++        var layer_table = try cuda.DeviceBuffer.alloc(drv, entries.items.len * 4);
++        errdefer layer_table.free();
++        try layer_table.upload(0, std.mem.sliceAsBytes(entries.items));
++        var layer_map = try cuda.DeviceBuffer.alloc(drv, map.len * 4);
++        errdefer layer_map.free();
++        try layer_map.upload(0, std.mem.sliceAsBytes(map));
++        return .{ .table = table, .meta = meta_dev, .layer_table = layer_table, .layer_map = layer_map, .n = listed.len, .d = hidden, .layers = layers, .first = first };
+     }
+ 
+     const Loaded = struct { k: usize, first: usize };
+ 
+     /// One identity's file into its block: directions, then lam_attn and lam_shared times `scale`.
+-    fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, hidden: usize, scale: f32, block: []f32) !Loaded {
+-        var file = try core.safetensors.File.open(gpa, io, path);
+-        defer file.close(io);
++    fn load(file: *const core.safetensors.File, hidden: usize, scale: f32, block: []f32) !Loaded {
+         const dirs = file.get("directions") orelse return error.AblateFileMissesDirections;
+         if (dirs.dtype != .f32 or dirs.rank != 2 or dirs.shape[1] != hidden) return error.AblateDirectionsShape;
+         const k = dirs.shape[0];
+@@ -93,15 +130,58 @@ pub const Ablation = struct {
+             var dot: f64 = 0;
+             for (block[a * hidden ..][0..hidden], block[b * hidden ..][0..hidden]) |x, y| dot += @as(f64, x) * y;
+             const want: f64 = if (a == b) 1 else 0;
+-            if (@abs(dot - want) > 1e-3) return error.AblateDirectionsNotOrthonormal;
++            // written so a NaN fails it too
++            if (!(@abs(dot - want) <= 1e-3)) return error.AblateDirectionsNotOrthonormal;
+         };
+-        for (block[k * hidden ..][0 .. 2 * k]) |*l| l.* *= scale;
++        for (block[k * hidden ..][0 .. 2 * k]) |*l| {
++            if (!std.math.isFinite(l.*)) return error.AblateLambdaShape;
++            l.* *= scale;
++        }
+         return .{ .k = k, .first = @intCast(first) };
+     }
+ 
++    /// A per-layer file: one [direction | row scale | lam * scale] entry a listed layer appended to `entries`, and each
++    /// layer's entry index in `map` (its row of the layer map). Returns the lowest listed layer.
++    fn loadLayers(gpa: std.mem.Allocator, file: *const core.safetensors.File, hidden: usize, layers: usize, scale: f32, entries: *std.ArrayList(f32), map: []i32) !usize {
++        const which = file.get("layers").?;
++        if (which.dtype != .i64 or which.rank != 1 or which.shape[0] < 1 or which.shape[0] > layers) return error.AblateLayersShape;
++        const n = which.shape[0];
++        const dirs = file.get("directions") orelse return error.AblateFileMissesDirections;
++        if (!dirs.is(.f32, &.{ n, hidden })) return error.AblateDirectionsShape;
++        const lam = file.get("lam") orelse return error.AblateFileMissesLambdas;
++        if (!lam.is(.f32, &.{n})) return error.AblateLambdaShape;
++        const rows = file.get("row_scale");
++        if (rows) |r| if (!r.is(.f32, &.{ n, hidden })) return error.AblateRowScaleShape;
++
++        const width = entryOf(hidden);
++        const base = entries.items.len / width;
++        const block = try entries.addManyAsSlice(gpa, n * width);
++        var last: i64 = -1;
++        for (0..n) |j| {
++            const layer = std.mem.readInt(i64, which.bytes[8 * j ..][0..8], .little);
++            if (layer <= last or layer >= @as(i64, @intCast(layers))) return error.AblateLayersShape;
++            last = layer;
++            const e = block[j * width ..][0..width];
++            // the mapped bytes may be unaligned: copied out before they are read as floats
++            @memcpy(std.mem.sliceAsBytes(e[0..hidden]), dirs.bytes[4 * hidden * j ..][0 .. 4 * hidden]);
++            if (rows) |r| @memcpy(std.mem.sliceAsBytes(e[hidden..][0..hidden]), r.bytes[4 * hidden * j ..][0 .. 4 * hidden]) else @memset(e[hidden..][0..hidden], 1);
++            @memcpy(std.mem.sliceAsBytes(e[2 * hidden ..][0..1]), lam.bytes[4 * j ..][0..4]);
++            var norm: f64 = 0;
++            for (e[0..hidden]) |x| norm += @as(f64, x) * x;
++            if (!(@abs(norm - 1) <= 1e-3)) return error.AblateDirectionsNotOrthonormal;
++            for (e[hidden..][0..hidden]) |x| if (!std.math.isFinite(x) or x <= 0) return error.AblateRowScaleShape;
++            if (!std.math.isFinite(e[2 * hidden])) return error.AblateLambdaShape;
++            e[2 * hidden] *= scale;
++            map[@intCast(layer)] = @intCast(base + j);
++        }
++        return @intCast(std.mem.readInt(i64, which.bytes[0..8], .little));
++    }
++
+     pub fn deinit(a: *Ablation) void {
+         a.table.free();
+         a.meta.free();
++        a.layer_table.free();
++        a.layer_map.free();
+         a.* = undefined;
+     }
+ 
+@@ -123,6 +203,9 @@ pub const Ablation = struct {
+         args.add(@as(c_int, @intFromEnum(kind)));
+         args.add(@as(c_int, @intCast(layer)));
+         args.add(@as(c_int, @intCast(a.d)));
++        args.add(a.layer_table.ptr);
++        args.add(a.layer_map.ptr);
++        args.add(@as(c_int, @intCast(a.layers)));
+         try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &args);
+     }
+ };
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index 2d616884..548ce216 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -241,7 +241,7 @@ pub const Engine = struct {
+         e.store.closeFile();
+         e.ngram = try ple.Ngram.init(gpa, io, e.model_dir);
+         errdefer e.ngram.deinit();
+-        e.abl = try ablate.Ablation.fromEnv(gpa, io, driver, dims, world);
++        e.abl = try ablate.Ablation.fromEnv(gpa, io, driver, dims, e.n_layers, world);
+         errdefer if (e.abl) |*a| a.deinit();
+         e.batch_k = try batch.Kernels.load(driver, expert_tile);
+         e.batch_s = null;

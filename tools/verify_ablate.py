@@ -1,4 +1,4 @@
-"""Per-request abliteration (patches 0018, 0019): every model id given (default: `abliterated` and the stock SERVED_NAME)
+"""Per-request abliteration (patches 0018, 0019): every model id given (default: the stock SERVED_NAME and SERVED_NAME-abliterated)
 is sent one long prompt twice; the second pass resumes that id's own kept state (the prompt cache line says so) and its
 greedy reply matches the cold one. Ids never resume each other's states: each cold pass starts from zero.
 Usage: tools/verify_ablate.py [model id ...]   (API_URL, default http://127.0.0.1:$PORT with PORT 8888; CONTAINER for the logs)"""
@@ -6,7 +6,8 @@ import json, os, sys, time, urllib.request, subprocess
 
 API_URL = os.environ.get("API_URL", "http://127.0.0.1:" + os.environ.get("PORT", "8888")).rstrip("/").removesuffix("/v1")
 CONTAINER = os.environ.get("CONTAINER", "qwen38-flash-next-tf")
-MODELS = sys.argv[1:] or ["abliterated", os.environ.get("SERVED_NAME", "Qwen3.8-Flash-Next")]
+SERVED = os.environ.get("SERVED_NAME", "Qwen3.8-Flash-Next")
+MODELS = sys.argv[1:] or [SERVED + "-abliterated", SERVED]
 filler = " ".join(f"Record {i}: the valve on line {i % 97} was inspected at {i % 24:02d}:00 and logged as nominal." for i in range(450))
 msgs = [
     {"role": "system", "content": "You are a terse maintenance assistant. Answer in one short sentence."},
