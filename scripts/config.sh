@@ -222,12 +222,49 @@ model_sub() {
   else echo "hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)"; fi
 }
 
+# A TENSORFOLD_IDENTITIES entry may name a directions file on Hugging Face, id=hf:owner/repo/path/in/repo[@revision]
+# (revision default main): prepare.sh downloads it into HF_CACHE, and start.sh hands the engine its path in the container.
+hf_identities() {   # one "owner/repo revision path" line per hf: entry
+  local entry ref repo rev
+  local -a entries
+  IFS=',' read -ra entries <<< "${TENSORFOLD_IDENTITIES:-}"
+  for entry in "${entries[@]}"; do
+    ref=${entry#*=}; ref=${ref//[[:space:]]/}
+    [[ "$ref" == hf:* ]] || continue
+    ref=${ref#hf:}; rev=main
+    [[ "$ref" == *@* ]] && { rev=${ref##*@}; ref=${ref%@*}; }
+    repo=$(cut -d/ -f1-2 <<< "$ref")
+    ref=${ref#"$repo"}; echo "$repo $rev ${ref#/}"
+  done
+}
+hf_snapshot() {     # hf_snapshot <repo> <revision>: the downloaded snapshot's folder name, empty when not downloaded
+  if [[ "$2" =~ ^[0-9a-f]{40}$ ]]; then echo "$2"
+  else cat "$HF_CACHE/hub/models--${1//\//--}/refs/$2" 2>/dev/null; fi
+}
+identities_resolved() {   # TENSORFOLD_IDENTITIES with every hf: entry replaced by its file's path in the container
+  local entry id ref repo rev path snap out=""
+  local -a entries
+  IFS=',' read -ra entries <<< "$TENSORFOLD_IDENTITIES"
+  for entry in "${entries[@]}"; do
+    id=${entry%%=*}; ref=${entry#*=}
+    if [[ "${ref//[[:space:]]/}" == hf:* ]]; then
+      read -r repo rev path <<< "$(TENSORFOLD_IDENTITIES="x=$ref" hf_identities)"
+      snap=$(hf_snapshot "$repo" "$rev")
+      [[ -n "$path" && -n "$snap" && -f "$HF_CACHE/hub/models--${repo//\//--}/snapshots/$snap/$path" && -s "$HF_CACHE/hub/models--${repo//\//--}/snapshots/$snap/$path" ]] || return 1
+      ref="/root/.cache/huggingface/hub/models--${repo//\//--}/snapshots/$snap/$path"
+    fi
+    out+="${out:+,}$id=$ref"
+  done
+  echo "$out"
+}
+
 PREPARED_MARKER="$STATE_DIR/prepared"
 prepared_state() {
-  local hash label rev extra=""
+  local hash label rev extra="" hf
   hash=$(image_hash)
   label=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo missing)
   rev=$(snapshot_rev)
   [[ "$ABLIT" != 1 ]] || extra=" ablit=$ABLIT_ID@$ABLIT_REVISION"
+  hf=$(hf_identities | tr '\n' ' '); [[ -z "$hf" ]] || extra+=" identities=${hf% }"
   echo "model=$MODEL_ID@$rev image=$label patches=$hash$extra"
 }

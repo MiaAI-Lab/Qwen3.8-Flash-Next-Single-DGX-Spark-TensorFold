@@ -166,6 +166,10 @@ if (( PARALLEL * full + WEIGHTS_GIB + TENSORFOLD_MEMORY_RESERVE_GIB > 121 )); th
   warn "$PARALLEL full windows are ~$((PARALLEL * full)) GiB of $KV_DTYPE cache beside ~$WEIGHTS_GIB GiB of weights: the engine keeps $TENSORFOLD_MEMORY_RESERVE_GIB GiB free and refuses a request that would not fit"
 fi
 
+if [[ -n "$(hf_identities)" ]]; then
+  if resolved=$(identities_resolved); then export TENSORFOLD_IDENTITIES="$resolved"
+  else missing "TENSORFOLD_IDENTITIES names a Hugging Face file that is not downloaded: $why download it"; fi
+fi
 ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}")
 while IFS='=' read -r name _; do
   [[ "$name" == TENSORFOLD_API_KEY ]] && continue

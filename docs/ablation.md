@@ -18,7 +18,7 @@ A baked checkpoint requantises the edited weights, so it is close to, not bit-eq
 
 | Setting | Meaning |
 |---|---|
-| `TENSORFOLD_IDENTITIES` | `id=path` entries separated by commas (at most 32): the model id a request names and the path inside the container of its directions file. `/v1/models` lists every id |
+| `TENSORFOLD_IDENTITIES` | `id=path` entries separated by commas (at most 32): the model id a request names and its directions file, either a path inside the container or `hf:owner/repo/file[@revision]` on Hugging Face. `/v1/models` lists every id |
 | `TENSORFOLD_ABLATE`, `TENSORFOLD_ABLATE_MODEL` | one identity the short way (the file, the model id); read only while `TENSORFOLD_IDENTITIES` is unset |
 | `TENSORFOLD_ABLATE_SCALE` | multiplies every identity's strengths (default 1), for tuning runs |
 
@@ -27,6 +27,14 @@ A baked checkpoint requantises the edited weights, so it is close to, not bit-eq
 
 ```bash
 TENSORFOLD_IDENTITIES="Qwen3.8-Flash-Next-abliterated=/root/.cache/huggingface/ablate/abliterated.safetensors" ./start.sh
+```
+
+A file on Hugging Face is downloaded by `scripts/prepare.sh` into the same cache, like the checkpoint, and `start.sh`
+gives the engine its path. A gated repo needs its terms accepted by the account of `HF_TOKEN` (or `hf auth login`).
+drowzeys's house-qsa abliteration (the overlay `ABLIT=1` grafts) as a directions file, for example:
+
+```bash
+TENSORFOLD_IDENTITIES="Qwen3.8-Flash-Next-abliterated=hf:Loke-60000/Qwen3.8-Flash-Next-FP4-Local-house-qsa-directions/house-qsa.safetensors" ./start.sh
 ```
 
 The engine logs one `identity i id: ...` line each at load; a file that fails its checks stops the load with the reason.
@@ -54,7 +62,7 @@ mixer's output becomes `D (y - lam (v . y) v)`; other layers and the shared expe
 | `row_scale` [n, d] fp32 | optional: each layer's `D` (ones when absent) |
 
 `tools/ablate_from_overlay.py` writes a per-layer file from a baked overlay of `self_attn.o_proj` weights (MXFP8, like the
-stock checkpoint) and each layer's `lam`, for example the `ABLIT=1` house-qsa sidecar and its `HOUSE_QSA_MXFP8.json`.
+stock checkpoint) and each layer's `lam`, for example drowzeys's house-qsa sidecar (the one `ABLIT=1` downloads) and its `HOUSE_QSA_MXFP8.json`.
 It prints each layer's reconstruction error, which should match the overlay's own requantisation error. It needs torch,
 which the image's base has:
 

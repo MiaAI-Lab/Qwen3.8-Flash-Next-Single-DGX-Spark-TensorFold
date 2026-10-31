@@ -264,5 +264,17 @@ if [[ "$ABLIT" == 1 ]]; then
   info=$(python3 -I -c "$CHECK_PY" "$HF_CACHE/$ABLIT_VIEW_SUB" 2>&1) || die "the checkpoint at $HF_CACHE/$ABLIT_VIEW_SUB is not ready: $info"
   log "ABLIT=1 checkpoint OK ($ABLIT_VIEW_SUB): $info"
 fi
+
+while read -r repo rev path; do
+  [[ -n "$repo" ]] || continue
+  [[ -n "$path" ]] || die "TENSORFOLD_IDENTITIES: hf:$repo names no file (the form is hf:owner/repo/file[@revision])"
+  log "Downloading the identity file $path from $repo @ $rev"
+  idfile() { echo "$HF_CACHE/hub/models--${repo//\//--}/snapshots/$(hf_snapshot "$repo" "$rev")/$path"; }
+  if ! download "$repo" "$rev" "$path"; then
+    [[ -s "$(idfile)" ]] || die "$repo: the download of $path failed (a gated repo needs its terms accepted by the account of HF_TOKEN)"
+    warn "$repo: could not reach Hugging Face; using the $path already here"
+  fi
+  [[ -s "$(idfile)" ]] || die "$repo: no $path at $(idfile) after the download"
+done < <(hf_identities)
 prepared_state > "$PREPARED_MARKER"
 log "Done. Start the server with ./start.sh (port $PORT)."
