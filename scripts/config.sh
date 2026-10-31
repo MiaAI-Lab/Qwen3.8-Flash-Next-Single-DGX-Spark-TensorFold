@@ -37,6 +37,27 @@ case "$CHECKPOINT" in
   *) echo "CHECKPOINT is nvfp4 or int4, not $CHECKPOINT" >&2; exit 1 ;;
 esac
 MODEL_REVISION="${MODEL_REVISION:-}"
+
+# ABLIT=1 serves NVIDIA's FP4-Local with drowzeys's Keys "house-qsa" abliteration overlay grafted in: the 12 QSA layers' self_attn.o_proj
+# (L3, 7, ... 47; MXFP8 g32, requantized after a rank-1 refusal-direction projection) come from the overlay's ~190 MB sidecar. GDN out_proj,
+# every expert, the MTP head, the n-gram table, vision and the chat template stay NVIDIA's. The overlay is gated, free, with automatic approval after you accept
+# its Responsible Use Agreement at https://huggingface.co/drowzeys/keys-Qwen3.8-Flash-Next-NVFP4-FP4-QAD-house-qsa-L3-47 while logged in;
+# export HF_TOKEN or `hf auth login` with that account. It only fits the nvfp4 checkpoint at the revision it was made from. The model has had safety
+# refusals removed. Its author's own checks (refusal32 32/32) ran on the vLLM/TensorFold recipe, not on this build: validate it here (tools/exact.py,
+# tools/needle.py) before relying on it.
+ABLIT="${ABLIT:-0}"
+[[ "$ABLIT" =~ ^[01]$ ]] || { echo "ABLIT must be 0 or 1, not $ABLIT" >&2; exit 1; }
+ABLIT_ID=drowzeys/keys-Qwen3.8-Flash-Next-NVFP4-FP4-QAD-house-qsa-L3-47
+ABLIT_REVISION="${ABLIT_REVISION:-c44f5b92ee3d307b82aab1c55f4cc4ae1d440344}"
+ABLIT_SIDECAR=fp4-local/house-qsa-oproj-mxfp8-L3-47.safetensors
+ABLIT_STOCK_REVISION=b9ce18a6887e18c089fdea8509a33e63429a3300     # the nvidia/Qwen3.8-Flash-Next-FP4-Local snapshot the sidecar was made from
+if [[ "$ABLIT" == 1 ]]; then
+  if [[ "$CHECKPOINT" != nvfp4 || "$_pin" != 1 || "$MODEL_REVISION" != "$ABLIT_STOCK_REVISION" ]]; then
+    echo "ABLIT=1 grafts onto nvidia/Qwen3.8-Flash-Next-FP4-Local @ ${ABLIT_STOCK_REVISION:0:8} (CHECKPOINT=nvfp4, no MODEL_ID or MODEL_REVISION of your own)" >&2
+    exit 1
+  fi
+  QUANT_LABEL+=" + Keys house-qsa ablit"
+fi
 unset _pin
 
 # The engine: TensorFold's Zig engine (tensorfold-native), built from TF_REPO at TF_REF (the v1.1.4 release) with patches/*.patch
@@ -65,8 +86,9 @@ image_hash() {
   ) | sha256sum | cut -c1-12
 }
 GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold}"
-IMAGE_TAG="${IMAGE_TAG:-}"
-IMAGE_DIGEST="${IMAGE_DIGEST:-}"
+# The published image of the current patch set (scripts/publish-image.sh, 2026-10-30): prepare.sh pulls it by digest while the patch hash matches IMAGE_TAG.
+IMAGE_TAG="${IMAGE_TAG:-v1.1.4-eab8582-4baf16137ecd}"
+IMAGE_DIGEST="${IMAGE_DIGEST:-sha256:5c6c42b9747318c1cd8b6cb85cb69493fff2e82cb23b61e49b9cf54cd09ac28e}"
 prebuilt_image() {
   local tag="${TF_TAG}-$(image_hash)"
   if [[ "$tag" == "$IMAGE_TAG" && -n "$IMAGE_DIGEST" ]]; then echo "$GHCR_IMAGE@$IMAGE_DIGEST"; else echo "$GHCR_IMAGE:$tag"; fi
@@ -191,11 +213,21 @@ snapshot_rev() {
   else cat "$(model_cache_dir)/refs/main" 2>/dev/null; fi
 }
 
+# The folder under HF_CACHE that holds the checkpoint the engine reads: the snapshot, or with ABLIT=1 the view scripts/ablit_view.py builds
+# (the snapshot's files linked, plus the overlay's sidecar). It stays under HF_CACHE because that is all the container mounts.
+ABLIT_VIEW_SUB="tensorfold-qwen38/ablit-${MODEL_REVISION:0:8}-${ABLIT_REVISION:0:8}"
+ablit_cache_dir() { echo "$HF_CACHE/hub/models--${ABLIT_ID//\//--}"; }
+model_sub() {
+  if [[ "$ABLIT" == 1 ]]; then echo "$ABLIT_VIEW_SUB"
+  else echo "hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)"; fi
+}
+
 PREPARED_MARKER="$STATE_DIR/prepared"
 prepared_state() {
-  local hash label rev
+  local hash label rev extra=""
   hash=$(image_hash)
   label=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo missing)
   rev=$(snapshot_rev)
-  echo "model=$MODEL_ID@$rev image=$label patches=$hash"
+  [[ "$ABLIT" != 1 ]] || extra=" ablit=$ABLIT_ID@$ABLIT_REVISION"
+  echo "model=$MODEL_ID@$rev image=$label patches=$hash$extra"
 }

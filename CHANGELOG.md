@@ -5,6 +5,12 @@ Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:
 
 ## Unreleased
 
+**2026-10-30: `ABLIT` (new, off by default).** `ABLIT=1` serves NVIDIA's FP4 checkpoint with drowzeys's Keys house-qsa abliteration overlay
+(`drowzeys/keys-Qwen3.8-Flash-Next-NVFP4-FP4-QAD-house-qsa-L3-47` @ `c44f5b92`): `self_attn.o_proj` of the 12 attention (QSA) layers (L3 to L47), from a
+~190 MB sidecar. `scripts/prepare.sh` downloads the sidecar (the overlay is gated: `HF_TOKEN`) and `scripts/ablit_view.py` builds a folder of symlinks to the stock snapshot plus the
+sidecar, with an index that maps the 24 names to it; the stock checkpoint is not modified. Folder builder checked against the real sidecar and the stock index and shard header
+(`tools/test_ablit_view.py` offline); a server booted from the overlaid folder on a Spark and answered `/health` (v1.1.4, CUDA); no exactness, needle or refusal run on it yet. `ABLIT=0` changes nothing: the prepared-state marker only gains a field when `ABLIT=1`.
+
 **Measured gains of the v1.1.4 build (patches 0001 to 0017) over the db281878 build (patches 0001 to 0015), sparkDash on the same Spark, 2026-10-27.**
 The "before" numbers are the sparkDash tables the README carried (db281878 + patches, patch 0014 era); the "after" numbers are a new sparkDash run on the
 v1.1.4 build. Prose was run at temperature 0.7 with thinking on, code at temperature 0 with thinking off; the README did not record the earlier run's
@@ -74,6 +80,34 @@ recipe now carries seventeen patches on v1.1.4 (`patches/0001` to `0017`):
 - Image: libjpeg-turbo 3.1.4.1 and libwebp 1.6.0's decoder are built from checksummed sources (JPEG and WebP input); `fatbins native` only, since v1.1.4's `install` step does not compile (`contract_controls.cu`, `w4a8_tests.zig`; fixed inside patch 0004).
 - Already in v1.1.4 and dropped from our series: image-prompt reuse (#5), random seeds without a `seed` (`--prompt-seed` restores prompt-keyed seeds), supersede-style cache eviction, the free-after-drain fix for #67. Checkpoint `CHECKPOINT=int4` is not supported by this engine.
 - Measured on one Spark against the previous build (db281878 + the old patches), 5 streams, 300 tokens, same prompts: greedy prose 100.6 vs 110.7 tok/s (distinct prompts), sampled prose 91.7 vs 100.8, 1 stream sampled 38.6 vs 37.3 (faster); prefill 1,713 / 1,964 tok/s at 3k / 13k tokens vs 2,223 / 2,312. v1.1.4 is 10 to 15% behind the previous build at 5 streams and 10 to 15% behind on prefill, and ahead at 1 stream. `tools/exact.py`, `toolcheck.py`, `visioncheck.py`, `prompt_reuse.py` and a 200k needle all pass. The earlier "193 tok/s at 5 streams" came from 5 identical prompts.
+
+**Published image and `scripts/publish-image.sh` (2026-10-30).**
+
+- The image of this patch set (patches `0001` to `0017`, with the `0013` fix; `tf.patches=4baf16137ecd`) is published as
+  `ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold:v1.1.4-eab8582-4baf16137ecd` and `:latest` (digest `sha256:5c6c42b9747318c1cd8b6cb85cb69493fff2e82cb23b61e49b9cf54cd09ac28e`). It was built from `main` at
+  `fd6fa8b` by `scripts/prepare.sh` and checked to run (`tensorfold-native 1.1.4`); it has not been started on a GPU with a model. `:latest` used to be the
+  1.0.0 image (`zig-db28187-4144696f21e3`, INT4); that tag stays in the registry. `scripts/config.sh` now names the tag and digest, so `prepare.sh` pulls this image by digest instead of building it; `PULL=0` still builds locally.
+- `scripts/publish-image.sh` works again: it required the label `tf.kernels=present`, but `prepare.sh` sets `embedded`, so it refused every image. Its description label said
+  INT4-AutoRound; it now says NVIDIA FP4 QAD.
+
+**Triage fixes (2026-10-30): a failed n-gram read, `stop.sh`, and the prefill benchmark's cache guard.**
+
+- Patch `0013`: when a `pread` of the n-gram table failed, `Ngram.fill` returned from the whole gather, so the rows after the failed one kept whatever the output
+  buffer held and the reply was computed from the wrong n-gram embeddings, with no error. It now takes that one row from the mapping and goes on. Only the error path
+  changes; a read that succeeds takes the same code as before. Reported by [slogonomo](https://github.com/slogonomo) (#83). Test, in the patch (`cuda_ple_reader_test.zig`): it
+  fails every read of one shard and compares the gathered rows with the mapped ones; before the fix the rows after the first failure came back unwritten. The image hash changes (the patch text did), so
+  `scripts/prepare.sh` built the image locally until the prebuilt one below was published.
+- `stop.sh` no longer evaluates what `/health` answers. It compared the `running` value in `(( ... ))`, where bash runs a command inside an array subscript (`HOME[$(cmd)]`) as the user
+  who ran `stop.sh`, and a value that was not a number (a boolean, a name) stopped `stop.sh` before it stopped the container. The count is now read as a non-negative integer in Python and checked
+  again in bash; anything else counts as 0. Reported by [slogonomo](https://github.com/slogonomo) (#82). Test: `tools/test_stop_health.py`.
+- `tools/bench_streams.py` and `tools/bench.py` no longer stop on v1.1.4: every prompt starts with the same 44 tokens of the chat template, which the engine resumes from, so `cached == 0` never held. A prompt
+  counts as fresh while it reuses at most 256 tokens; a real prompt-cache hit still stops the run. The prefill rate is the tokens actually prefilled (prompt minus cached) over the
+  server's prefill seconds, and `bench_streams.py` prints `cached` on each row. Reported by [zankie](https://github.com/zankie) (#86). Test: `tools/test_bench_stats.py` runs `bench_streams.py` against a fake server.
+- README: how sparkDash takes its decode figures (formula and prompts; the code prompt forbids comments and docstrings, so other prompts decode at another speed) for #85, and that
+  `--prompt-cache-gib` is a cap, not a reservation, with `--prompt-cache-over-cap` refused on CUDA, for #81.
+- Reviewed and not merged: PR #84 (patch `0018`, TensorFold's `3abeeff` backported by [devopsfortunato](https://github.com/devopsfortunato): applies on `0001` to `0017`, unit tests pass, waits for a byte-identical check on a GPU) and
+  PR #20 (Dutch draft vocabulary by [Timminater](https://github.com/Timminater): adds CI and a dependency file and lab data; its 48-line loader patch could come alone). Still open and unfixed: #40 (v1.1.4 puts a call to an
+  undeclared tool back into `content`; upstream's fix no longer applies, so it needs a recipe patch to `tool_parse.zig` and `tool_stream.zig`), #81 (the resume cost at 220k tokens needs a GPU profile) and #68, #76, #77, #21, #25, #16 as feature requests.
 
 **Triage of the open pull requests and issues (2026-10-25): two ports, one new setting and README notes.**
 

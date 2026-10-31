@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Prefill and decode benchmark against the running server.
 
-Every prompt is fresh random prose (a new seed per run), so the prompt cache never hits and each prompt looks up
-n-gram rows it has not touched before. Reports the server's own prefill seconds and decode tokens/s.
+Every prompt is fresh random prose (a new seed per run), so the prompt cache never resumes more than the chat template's
+opening, which every prompt shares (44 tokens on v1.1.4), and each prompt looks up n-gram rows it has not touched before.
+Reports the server's own prefill seconds, the prefill rate over the tokens it did prefill (prompt minus cached), and decode tokens/s.
 
 Usage: tools/bench.py [label]      (API_URL, default http://127.0.0.1:$PORT with PORT 8888; DECODE_ONLY=1 skips prefill)
 """
@@ -25,6 +26,9 @@ WORDS = ("time year people way day man thing woman life child world school state
          "art war history party result change morning reason research girl guy moment air teacher force education "
          "river mountain signal engine garden theory market winter method bridge letter window voice paper field").split()
 SIZES = [(8_000, 1), (16_000, 1), (32_000, 1), (64_000, 1), (128_000, 1)]
+# The engine resumes a new conversation from the chat template's opening, which every prompt shares (44 tokens on v1.1.4).
+# A prompt of random prose that reuses more than this has hit the prompt cache, and its prefill time says nothing about prefill.
+MAX_SHARED_PREFIX = 256
 
 
 def prose(tokens: int, seed: int) -> str:
@@ -45,6 +49,18 @@ def open_url(req: urllib.request.Request, timeout: float):
         sys.exit(f"the server at {API_URL} answered {exc.code}: {exc.read().decode(errors='replace')[:300]}")
     except urllib.error.URLError as exc:
         sys.exit(f"cannot reach the server at {API_URL} ({exc.reason}): is it running? (./start.sh)")
+
+
+def check_fresh(rs: list) -> None:
+    """Exit if a prompt of `rs` (results of run) reused more than the template's opening from the prompt cache."""
+    assert all(r["cached"] is not None for r in rs), "the server's reply carries no cached-token count: cannot tell whether the prompts are fresh"
+    hits = [r["cached"] for r in rs if r["cached"] > MAX_SHARED_PREFIX]
+    assert not hits, f"prompt cache hit ({hits[0]} tokens reused, more than the {MAX_SHARED_PREFIX} the chat template shares): prompts are not fresh"
+
+
+def prefilled(r: dict) -> int:
+    """The prompt tokens the server prefilled: all but the cached ones."""
+    return r["prompt_tokens"] - r["cached"]
 
 
 def run(prompt: str, max_tokens: int, temperature=None) -> dict:
@@ -96,13 +112,15 @@ def main() -> None:
         missing = [k for k in ("prompt_tokens", "cached", "prefill_s") if any(r[k] is None for r in rs)]
         if missing:
             sys.exit(f"the server's reply carries no {', '.join(missing)}: this script does not know its stats layout")
-        assert all(r["cached"] == 0 for r in rs), "prompt cache hit: prompts are not fresh"
+        check_fresh(rs)
         n = statistics.median(r["prompt_tokens"] for r in rs)
+        done = statistics.median(prefilled(r) for r in rs)
+        shared = statistics.median(r["cached"] for r in rs)
         pre = statistics.median(r["prefill_s"] for r in rs)
         ttft = statistics.median(r["ttft"] for r in rs)
         each = ", ".join("%.2f" % r["prefill_s"] for r in rs)
-        print(f"prefill {n:>7,.0f} tok: {pre:7.2f} s  {n / pre:6.0f} tok/s  TTFT {ttft:6.2f} s"
-              f"  ({runs} run{'s' if runs > 1 else ''}, each {each} s)")
+        print(f"prefill {n:>7,.0f} tok: {pre:7.2f} s  {done / pre:6.0f} tok/s  TTFT {ttft:6.2f} s"
+              f"  ({shared:,.0f} cached; {runs} run{'s' if runs > 1 else ''}, each {each} s)")
     for name, prompt, temp in (("code greedy", "Write a Python quicksort with docstring and tests.", 0),
                                ("chat sampled", "Explain why the sky is blue in a few paragraphs.", None)):
         rs = [run(prompt, 256, temp) for _ in range(5)]

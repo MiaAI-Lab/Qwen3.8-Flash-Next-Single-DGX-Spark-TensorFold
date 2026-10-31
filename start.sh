@@ -14,6 +14,7 @@
 # Settings, from the environment or ./.env (scripts/config.sh):
 #   serving  CONTEXT, PARALLEL, MAX_TOKENS, THINKING, DRAFTS, TEMPERATURE, TOP_P, TOP_K, SERVED_NAME, HOST, PORT
 #   files    CHECKPOINT (nvfp4 | int4), MODEL_ID, MODEL_REVISION, HF_CACHE, KERNEL_CACHE, STATE_DIR
+#   ablit    ABLIT=1 serves NVIDIA's FP4 with the Keys house-qsa abliteration overlay (gated; needs an HF token); 0 is stock (default)
 #   image    IMAGE, TF_REPO, TF_REF, ZIG_VERSION, BASE_IMAGE, GHCR_IMAGE, CONTAINER_NAME
 #   setup    PREPARE (auto | 1 | 0), PULL, FOREGROUND=1, WAIT_TIMEOUT, DRY_RUN=1, MEM_NEED_GIB, MEM_CHECK=0
 #   engine   every TENSORFOLD_* and TF_FLASHNEXT_* variable goes into the container
@@ -78,7 +79,7 @@ source ./scripts/banner.sh
 echo
 banner
 printf '\n%s  Mia'"'"'s TensorFold Start Script%s\n' "$M" "$R"
-printf '%s  %s · %s at once · %s-token window · %s KV · vision %s · drafts %s · port %s%s\n\n' "$D" "$MODEL_ID" \
+printf '%s  %s · %s at once · %s-token window · %s KV · vision %s · drafts %s · port %s%s\n\n' "$D" "$MODEL_ID$( [[ "$ABLIT" == 1 ]] && echo ' + ablit')" \
   "$(arg_value --parallel)" "$(arg_value --context)" "$KV_DTYPE" \
   "$( [[ "$VISION" == 1 ]] && echo on || echo off)" \
   "$( [[ "$DRAFTS" == 1 ]] && echo MTP || echo off)" "$PORT" "$R"
@@ -119,8 +120,8 @@ fi
 KCACHE=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || true)
 [[ "$KCACHE" =~ ^[0-9a-f]{12}$ ]] || KCACHE=$(image_hash)
 rev=$(snapshot_rev)
-sub="hub/models--${MODEL_ID//\//--}/snapshots/$rev"
-if [[ ! -f "$HF_CACHE/$sub/config.json" ]]; then missing "$MODEL_ID @ ${rev:0:8} not in $HF_CACHE: $why download it"; fi
+sub=$(model_sub)
+if [[ ! -f "$HF_CACHE/$sub/config.json" ]]; then missing "$MODEL_ID @ ${rev:0:8} not in $HF_CACHE ($sub): $why download it"; fi
 MODEL_ARG="/root/.cache/huggingface/$sub"
 
 step 2 "Checks: arguments, previous server, port, memory"

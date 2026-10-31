@@ -3,7 +3,8 @@
 
 usage: bench.py URL [--decode-only] [--prefill-only] [--streams 1,2,3,4,5] [--sizes 5000,10000,...] (sizes count generated words: about 0.8 prompt tokens each, so the defaults give 4k to 126k tokens) [--tokens 256]
 Decode: total tok/s = sum of the server's per-stream decode speeds, greedy, median of --reps runs.
-Prefill: fresh prose each run (no prompt-cache hit), prompt tokens / the server's prefill seconds.
+Prefill: fresh prose each run (nothing resumed from the prompt cache but the chat template's opening, a few dozen tokens every prompt shares and
+the row shows as "cached"), prompt tokens the server prefilled (prompt minus cached) / its prefill seconds.
 """
 import argparse
 import os
@@ -63,12 +64,12 @@ def main():
           rr=[]
           for k in range(a.reps):
             r = B.run(B.prose(n, seed + n + k*7919) + "\n\nSummarize the text above in one sentence.", 16)
-            assert r["cached"] == 0, "prompt cache hit"
             rr.append(r)
+          B.check_fresh(rr)
           if 1:
             r=sorted(rr,key=lambda x:x["prefill_s"])[len(rr)//2]
-            print(f"prefill {r['prompt_tokens']:>7,} tok: {r['prefill_s']:7.2f} s  {r['prompt_tokens'] / r['prefill_s']:6.0f} tok/s"
-                  f"  TTFT {r['ttft']:6.2f} s", flush=True)
+            print(f"prefill {r['prompt_tokens']:>7,} tok: {r['prefill_s']:7.2f} s  {B.prefilled(r) / r['prefill_s']:6.0f} tok/s"
+                  f"  TTFT {r['ttft']:6.2f} s  ({r['cached']} cached)", flush=True)
 
 
 if __name__ == "__main__":

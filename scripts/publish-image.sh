@@ -13,7 +13,7 @@ REPO_URL="${REPO_URL:-https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX
 docker image inspect "$IMAGE" >/dev/null 2>&1 || die "image $IMAGE missing, run scripts/prepare.sh first"
 hash=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE")
 [[ "$hash" == "$(image_hash)" ]] || die "$IMAGE was built from other patches; run scripts/prepare.sh first"
-[[ "$(docker image inspect -f '{{index .Config.Labels "tf.kernels"}}' "$IMAGE")" == present ]] ||
+[[ "$(docker image inspect -f '{{index .Config.Labels "tf.kernels"}}' "$IMAGE")" == embedded ]] ||
   die "$IMAGE has no kernel set: it cannot serve, so it is not published"
 tag="${TF_TAG}-${hash}"
 alias=latest
@@ -25,7 +25,7 @@ user="${GHCR_USER:-$(gh api user --jq .login 2>/dev/null || echo "${GHCR_IMAGE#g
 log "Labelling $IMAGE as $GHCR_IMAGE:$tag"
 docker build -q -t "$GHCR_IMAGE:$tag" -t "$GHCR_IMAGE:$alias" \
   --label org.opencontainers.image.source="$REPO_URL" \
-  --label org.opencontainers.image.description="Qwen3.8 Flash Next INT4-AutoRound on one DGX Spark: TensorFold's Zig engine (${TF_REF:0:12}) with patches $hash" \
+  --label org.opencontainers.image.description="Qwen3.8 Flash Next on one DGX Spark (NVIDIA FP4 QAD checkpoint): TensorFold's Zig engine (${TF_REF:0:12}) with patches $hash" \
   - <<<"FROM $IMAGE" >/dev/null
 log "Pushing $GHCR_IMAGE:$tag and :$alias (~24 GB uncompressed; only changed layers upload)"
 # log in with a throwaway Docker config, so no registry credential stays in ~/.docker after the push

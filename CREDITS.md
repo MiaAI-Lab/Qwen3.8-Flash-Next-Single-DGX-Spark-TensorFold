@@ -18,6 +18,10 @@ license files from the pinned checkout.
   numbers it scores 91.5% on GPQA Diamond and 88.7% on ToolEvalBench against 92.2% and 89.4% for bf16 (its model card, not measured here). Used under the
   [NVIDIA Open Model Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-agreement/); the base model's
   Qwen Community License 1.0 applies as well.
+- **drowzeys** ([drowzeys](https://huggingface.co/drowzeys)): the Keys house-qsa abliteration overlay for the NVIDIA checkpoint,
+  [`drowzeys/keys-Qwen3.8-Flash-Next-NVFP4-FP4-QAD-house-qsa-L3-47`](https://huggingface.co/drowzeys/keys-Qwen3.8-Flash-Next-NVFP4-FP4-QAD-house-qsa-L3-47): the requantized
+  `self_attn.o_proj` weights of 12 layers that `ABLIT=1` grafts onto the checkpoint. Gated; its license is NVIDIA's and the Qwen license. Not part of this repository:
+  `scripts/prepare.sh` downloads the sidecar when `ABLIT=1`. `scripts/ablit_view.py` is MiaAI-Lab's own and uses none of the overlay's scripts.
 - **azampatti** ([azampatti](https://huggingface.co/azampatti)): the optional INT4 checkpoint (`CHECKPOINT=int4`),
   [`azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound`](https://huggingface.co/azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound):
   azampatti authored its top-5 expert cut, the shared-expert healing, and the checkpoint. Under the license on

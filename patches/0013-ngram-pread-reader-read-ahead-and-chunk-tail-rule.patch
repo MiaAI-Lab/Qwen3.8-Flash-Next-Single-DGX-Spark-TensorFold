@@ -321,7 +321,7 @@ index ddb8f3f..e187420 100644
          if (g.pool) |p| p.destroy();
          for (g.files.items) |*o| o.close(g.gpa);
          g.files.deinit(g.gpa);
-@@ -453,11 +480,63 @@ pub const Ngram = struct {
+@@ -453,11 +480,66 @@ pub const Ngram = struct {
              const row = out[i * dh ..][0..dh];
              switch (g.format) {
                  .mlx => try embed.dequant(g.w[loc.shard], g.s[loc.shard], g.b[loc.shard], dh, loc.local, row),
@@ -329,8 +329,11 @@ index ddb8f3f..e187420 100644
 +                .nvfp4 => if (g.reader) |rd| {
 +                    // the row's bytes from the cache or the file, dequantized as the mapped row is
 +                    var raw: [reader_mod.max_row]u8 = undefined;
-+                    // a read that fails leaves the row to the mapping
-+                    rd.get(ids[i], &raw) catch return g.tables[loc.shard].gather(&.{loc.local}, row);
++                    // a read that fails leaves this row to the mapping; the rows after it still go through the reader
++                    rd.get(ids[i], &raw) catch {
++                        try g.tables[loc.shard].gather(&.{loc.local}, row);
++                        continue;
++                    };
 +                    const t = g.tables[loc.shard];
 +                    const rc = t.width / 2;
 +                    const one: core.nvfp4_rows.Table = .{ .codes = raw[0..rc], .scales = raw[rc..][0 .. t.width / 16], .rows = 1, .width = t.width, .global = t.global };
@@ -386,7 +389,7 @@ index ddb8f3f..e187420 100644
      /// One call's rows split into `parts` equal ranges, part i filling [i * per, (i + 1) * per).
      const Split = struct {
          g: *const Ngram,
-@@ -515,6 +594,45 @@ pub const Ngram = struct {
+@@ -515,6 +597,45 @@ pub const Ngram = struct {
      }
  };
  
@@ -432,7 +435,7 @@ index ddb8f3f..e187420 100644
  /// TF_FLASHNEXT_GATHER_LOG=1: where the time of a shared gather goes.
  const Stat = struct {
      const on_flag = struct {
-@@ -599,6 +717,10 @@ pub fn rowsMany(g: *const Ngram, parts: []const Part) !void {
+@@ -599,6 +720,10 @@ pub fn rowsMany(g: *const Ngram, parts: []const Part) !void {
          if (Stat.calls % 100 == 0) {
              const f = 100.0 * 1e6;
              std.debug.print("gather detail: per call prep {d:.2} ms, pool run {d:.2} ms (slowest part {d:.2} ms, sum of parts {d:.2} ms), post {d:.2} ms; {d:.0} parts, {d:.0} items\n", .{ @as(f64, @floatFromInt(Stat.prep_ns)) / f, @as(f64, @floatFromInt(Stat.run_ns)) / f, @as(f64, @floatFromInt(Stat.max_sum)) / f, @as(f64, @floatFromInt(Stat.run_sum_parts)) / f, @as(f64, @floatFromInt(Stat.post_ns)) / f, @as(f64, @floatFromInt(Stat.parts_n)) / 100.0, @as(f64, @floatFromInt(Stat.items_n)) / 100.0 });
@@ -443,7 +446,7 @@ index ddb8f3f..e187420 100644
              Stat.prep_ns = 0;
              Stat.run_ns = 0;
              Stat.post_ns = 0;
-@@ -651,4 +773,6 @@ test {
+@@ -651,4 +776,6 @@ test {
      _ = @import("cuda_ple_nvfp4_test.zig");
      _ = @import("cuda_ple_pool.zig");
      _ = @import("cuda_ple_pool_gather_test.zig");
@@ -827,7 +830,7 @@ new file mode 100644
 index 0000000..788e770
 --- /dev/null
 +++ b/zig/src/families/flashnext/cuda_ple_reader_test.zig
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,233 @@
 +//! The positional reader returns the mapping's rows, bit for bit, however they were asked for.
 +const std = @import("std");
 +const ple = @import("cuda_ple.zig");
@@ -932,6 +935,33 @@ index 0000000..788e770
 +        try std.testing.expectEqualSlices(u16, &want, &got);
 +        g.reader.?.prefetch(&.{ 0, 1, 2, 3, 4, 5, 6, 7 });
 +    }
++}
++
++test "NVFP4 rows read by pread: a failed read leaves that row to the mapping and the others are still gathered" {
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try fixture(tmp.dir, true);
++    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
++    defer a.free(path);
++    var g = try ple.Ngram.init(a, io, path);
++    defer g.deinit();
++    var tokens: [257]u32 = undefined;
++    for (&tokens, 0..) |*v, i| v.* = @intCast((i * 5 + 2) % 100);
++    var want: [257 * 32]u16 = undefined;
++    var want_xs: [257]f32 = undefined;
++    var h0 = [_]i64{99};
++    try g.rows(&h0, &tokens, &want, &want_xs);
++    try g.openReader(io);
++    // every read of shard 0 now starts far past the end of the file and fails; shard 1's reads are good, the mapping is untouched
++    g.reader.?.shards[0].codes_at = 1 << 40;
++    var got: [257 * 32]u16 = undefined;
++    var got_xs: [257]f32 = undefined;
++    @memset(&got, 0xdead);
++    var h1 = [_]i64{99};
++    try g.rows(&h1, &tokens, &got, &got_xs);
++    try std.testing.expectEqualSlices(u16, &want, &got);
++    try std.testing.expectEqualSlices(f32, &want_xs, &got_xs);
++    try std.testing.expect(g.reader.?.take().own > 0);
 +}
 +
 +fn ms(io_: std.Io, t0: i96) f64 {

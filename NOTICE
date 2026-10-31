@@ -63,6 +63,9 @@ Model files (downloaded from Hugging Face by scripts/prepare.sh; not included in
   FP4 export (NVIDIA Model Optimizer) of Qwen/Qwen3.8-Flash-Next by the Qwen team (Alibaba). Its use is governed by the NVIDIA Open
   Model Agreement (https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-agreement/); the base model is under the
   Qwen Community License 1.0 (https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE).
+  The optional overlay (ABLIT=1), drowzeys/keys-Qwen3.8-Flash-Next-NVFP4-FP4-QAD-house-qsa-L3-47 by drowzeys, replaces 24 self_attn.o_proj tensors (weight and scale of 12 layers) of the
+  checkpoint above; it is gated (Responsible Use Agreement) and inherits the NVIDIA Open Model License and the Qwen Community License 1.0. scripts/prepare.sh downloads
+  its sidecar only when ABLIT=1; none of its files is part of this repository or its image.
   The optional checkpoint (CHECKPOINT=int4, served by the db281878 recipe on main, not by this branch), azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound, is by azampatti (the
   top-5 expert cut and the shared-expert healing), built on Intel's AutoRound int4 quantization
   (Intel/Qwen3.8-Flash-Next-W4A16-AutoRound) and on Saren-Arterius's hybrid checkpoint and FP8 n-gram table

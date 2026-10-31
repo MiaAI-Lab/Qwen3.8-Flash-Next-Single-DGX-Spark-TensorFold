@@ -44,6 +44,14 @@ window, 5 requests at once, fp8 KV, vision on, MTP drafts, TensorFold v1.1.4 wit
 them). Prose: temperature 0.7, thinking on. Code: temperature 0, thinking off. Aggregate is the sum of the per-request decode speeds; TTFT is the
 time to the first token.
 
+How a decode figure is taken (sparkDash's `DecodeBench`): each request streams, and its decode speed is `(completion_tokens - 1) / (time of the last streamed token - time of
+the first)`, so TTFT is not in it. The prose prompt asks for a step-by-step explanation of how a hash map works. The code prompts (`DECODE_CODE_TASKS` in sparkDash's
+`src/shared/llmPrompts.js`) each name a small Python function or class and end "Output only Python source. No comments, no docstrings, no markdown fences. Then add tests and the helpers this
+needs. Keep writing code.", and every concurrent stream gets a different task. MTP drafts pay only when they are accepted, so decode speed depends on the text: a code request that asks for docstrings and
+comments, or a different prose prompt, decodes at another speed, and a figure from another harness is comparable only with the same prompts, sampling and thinking setting. `tools/bench_streams.py`
+uses its own, shorter prompts and does not turn thinking off for code, so its code rows are not comparable with the table's ([#85](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/issues/85),
+[#86](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/issues/86)).
+
 **Decode, prose**
 
 | Concurrent requests | Aggregate | Per request | TTFT |
@@ -112,7 +120,7 @@ integration build with patches 0001 to 0016 (patch 0017 changes only how many dr
 - ~160 GB free disk on a fresh machine: ~96 GiB for the checkpoint under `~/.cache/huggingface` and the image under
   Docker's root. `scripts/prepare.sh` checks both. Keep at least 100 GB free.
 - Optional: the `hf` CLI on the host and a Hugging Face token in `~/.cache/huggingface/token` or `HF_TOKEN`. The
-  checkpoint is public.
+  checkpoint is public. `ABLIT=1` (below) needs a token, because its overlay is gated.
 
 ## Quick start
 
@@ -156,6 +164,35 @@ or patches here were tried with it. The db281878 recipe on `main` still serves i
 Check which checkpoint is running with `docker inspect -f '{{.Config.Cmd}}' qwen38-flash-next-tf`: the path after `serve` names it. `DRY_RUN=1 ./start.sh`
 prints what a start would do (the model, the memory it needs and the docker command) without stopping or starting anything. To serve a different model directory of the same
 format, set `MODEL_ID` (and `MODEL_REVISION`, or leave it empty for the latest) instead of `CHECKPOINT`. A `MODEL_ID` set by hand takes no preset revision pin.
+
+## ABLIT (opt-in)
+
+`ABLIT=1` serves NVIDIA's FP4 checkpoint with [drowzeys's Keys "house-qsa" abliteration overlay](https://huggingface.co/drowzeys/keys-Qwen3.8-Flash-Next-NVFP4-FP4-QAD-house-qsa-L3-47)
+grafted in. The overlay replaces 24 tensors: `self_attn.o_proj` (weight and scale, MXFP8) of the 12 attention (QSA) layers (L3, 7, 11, ... 47), edited by a
+rank-1 refusal-direction projection and requantized. DeltaNet `out_proj`, every expert, the MTP head, the n-gram table, the vision tower and the chat template stay NVIDIA's
+(see the overlay's own `ABLIT_META.json`). The model has had its safety refusals removed; read the overlay's Responsible Use Agreement, which you accept to download it.
+
+The overlay is gated, free and approved automatically. Accept its terms at its Hugging Face page while logged in, then `export HF_TOKEN=hf_...` or `hf auth login`
+with that account, before:
+
+```bash
+ABLIT=1 ./start.sh restart
+```
+
+Set `ABLIT=0` (the default) to return to the stock checkpoint. The first `ABLIT=1` start downloads the overlay's ~190 MB sidecar; the checkpoint itself is not downloaded
+again and is not modified. The replaced tensors have the stock tensors' dtypes and shapes, so the memory a start needs is the same; speed has not been measured with the overlay.
+
+How it is applied: `scripts/prepare.sh` runs [`scripts/ablit_view.py`](scripts/ablit_view.py), which builds a folder `$HF_CACHE/tensorfold-qwen38/ablit-b9ce18a6-c44f5b92` holding
+symlinks to every file of the stock snapshot, the sidecar as `tensors/house-qsa-oproj-mxfp8-L3-47.safetensors`, and a `model.safetensors.index.json` that points the 24 tensor
+names at it. TensorFold's engine reads the shards its index names, in path order, and takes a tensor from the first shard that holds it; the sidecar's path sorts before the
+stock `tensors/model-*` shards. The script refuses to build the folder if the sidecar does not hold exactly those 24 names, if a stock tensor has another dtype or shape, or if the
+sidecar would not sort first. It only works for `CHECKPOINT=nvfp4` at the pinned revision (`ABLIT=1` with another `MODEL_ID`, `MODEL_REVISION` or `CHECKPOINT=int4` stops with a message). Check it
+is active with `docker inspect -f '{{.Config.Cmd}}' qwen38-flash-next-tf`: the path after `serve` ends in `ablit-b9ce18a6-c44f5b92`.
+
+**What has been checked.** The folder builder against the real sidecar and the real stock index and shard headers (24 of 24 names, same dtypes and shapes), and offline tests
+(`tools/test_ablit_view.py`). A server has booted with `ABLIT=1` on this build and answered `/health`; `tools/exact.py`, `tools/needle.py` and a refusal check on it have **not** been run yet. The overlay author's own
+numbers (refusal32 32/32 on a thinking-off run of their TensorFold recipe) are theirs, not measured here. The edit changes the weights, so replies differ from the stock checkpoint's: the byte-identical
+checks in this repository compare a build against itself, not `ABLIT=1` against `ABLIT=0`.
 
 ## Images and video
 
@@ -213,9 +250,10 @@ the docker command and changes nothing.
 2. The image `tensorfold-qwen38:v1.1.4-eab8582`: TensorFold v1.1.4 (`TF_REF`) with every `patches/*.patch` applied, Zig 0.17.0, libjpeg-turbo and libwebp's decoder
    (built from checksummed sources), on `nvcr.io/nvidia/pytorch:26.07-py3`; the build runs `fatbins native` only. `libtfgrammar.so` is copied out of TensorFold's v1.1.4 release archive
    (SHA-256 pinned in `config.sh`). It tries a matching prebuilt image from GitHub
-   Container Registry first (`PULL=0` builds locally; there is no published image for the current patch set yet).
+   Container Registry first, by digest (`PULL=0` builds locally; the published image of the current patch set is `v1.1.4-eab8582-4baf16137ecd`, also `:latest`).
 3. The checkpoint, at the pinned revision.
 4. A check that it is a `qwen4_exp` ModelOpt NVFP4 checkpoint and every shard present.
+5. With `ABLIT=1` only: the overlay's sidecar from Hugging Face, and the checkpoint folder with it grafted in ([ABLIT](#ablit-opt-in)).
 
 ```bash
 scripts/prepare.sh
@@ -252,6 +290,11 @@ on the starts above). A `PARALLEL` whose windows do not all fit is refused at st
 "the CUDA memory budget leaves 27.22 GiB". Within the pool, a request is admitted when its prompt plus its reply budget (`max_tokens`) fits beside the others;
 one that does not fit is refused, not queued.
 
+**The prompt cache is a cap, not a reservation.** On CUDA the prompt cache takes at most what the weights and the streams leave, so `--prompt-cache-gib` (pass it after the defaults:
+`./start.sh restart --prompt-cache-gib 12`) can only lower the 3.4 to 5.1 GiB above, never raise it: at 5 streams a larger value changes nothing, and it binds only when the leftover is bigger
+(a smaller `PARALLEL` or `--context`). `--prompt-cache-over-cap` is refused on CUDA (it lifts a Mac's 70% cap). A larger cache for long multi-turn prompts costs streams or
+window length: `PARALLEL=4` leaves one window's 4.78 GiB more for the cache than five do ([#81](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/issues/81)).
+
 `PARALLEL=6` at 262,144 tokens (28.7 GiB) fits only with a smaller reserve. We tried `TENSORFOLD_MEMORY_RESERVE_GIB=7`: it started ("28.9 GiB left after a 7.0 GiB
 reserve"), `tools/exact.py`, `toolcheck.py` and `visioncheck.py` passed and decode speed was unchanged, but the prompt cache fell to 0.2 GiB and
 `tools/prompt_reuse.py 30000` failed (a 32k-token follow-up resumed 4.7% of its prompt and prefilled again, 13.8 s). Multi-turn use then re-reads its history on
@@ -275,8 +318,6 @@ The driver-side workaround is independent of the engine: the nvidia module optio
 system-memory allocations start at 4 KiB. In one 45-minute run on kernel 6.17.0-1031-nvidia with the 1.0.0 engine it gave 0 messages against 139, at 58.6 instead of 62.8 tok/s.
 
 ## Configuration
-
-An opt-in Dutch CUDA draft vocabulary for TensorFold 1.1.4 is documented in [docs/nl.md](docs/nl.md).
 
 Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it from the environment
 (`PARALLEL=2 ./start.sh`; the memory a `PARALLEL` needs is explained under [KV and memory](#kv-and-memory)) or from `.env` next to `start.sh` (`KEY=value`; the environment wins).
@@ -312,6 +353,7 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `TF_FLASHNEXT_SHARED_SIDE` / `TF_FLASHNEXT_GDN_LANES` | `1` / `1` | the shared expert runs on a second stream in decode rounds, and a shared round takes every lane's DeltaNet rows in three launches a layer (needs `KEEP_LATE=1`) (patch 0016). Bit-identical |
 | `CHECKPOINT` | `nvfp4` | `nvfp4` serves `nvidia/Qwen3.8-Flash-Next-FP4-Local`. `int4` is not supported on this branch. `MODEL_ID` / `MODEL_REVISION` override the model |
 | `MODEL_REVISION` | `b9ce18a6…` | the checkpoint commit this recipe serves |
+| `ABLIT` | `0` | `1` serves the checkpoint with drowzeys's Keys house-qsa abliteration overlay ([above](#ablit-opt-in)); gated, needs `HF_TOKEN`. Only with `CHECKPOINT=nvfp4` at the pinned revision |
 
 KV is fp8 (or bf16). The NVIDIA checkpoint's NVFP4 n-gram table (26.8 GiB) is read from disk by the host
 (`TF_FLASHNEXT_GATHER_READ=pread` by default, with read-ahead of the next prompt chunk; `TF_FLASHNEXT_WARM_AHEAD=0` turns that off).
@@ -402,7 +444,7 @@ Every knob is an environment variable with its default in `scripts/config.sh`; t
 ```
 start.sh      set up (first run) and start the server
 stop.sh       stop it
-scripts/      prepare.sh, config.sh, publish-image.sh, banner.sh
+scripts/      prepare.sh, config.sh, publish-image.sh, banner.sh, ablit_view.py
 patches/      this recipe's changes, applied onto TensorFold v1.1.4 at TF_REF
 tools/        checks
 .github/      issue and pull request templates, GitHub Sponsors
@@ -414,7 +456,7 @@ NOTICE        third-party notices
 ## License
 
 MIT, see [`LICENSE`](LICENSE). The model weights, downloaded from Hugging Face and not part of this repository, are
-under the checkpoint's own license: the default NVIDIA FP4 checkpoint under the
+under the checkpoint's own license (the `ABLIT=1` overlay inherits NVIDIA's and the Qwen license, and has its own Responsible Use Agreement): the default NVIDIA FP4 checkpoint under the
 [NVIDIA Open Model Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-agreement/) (its base model, Qwen3.8 Flash Next, is under the
 Qwen Community License 1.0), and the INT4 checkpoint (db281878 recipe only) under the Qwen Community License 1.0 per its model card.
 

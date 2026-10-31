@@ -6,6 +6,7 @@
 #      that), else built locally
 #   3. the checkpoint in the Hugging Face cache (~96 GiB for the NVIDIA FP4 default, ~122 GiB for CHECKPOINT=int4), at its pinned revision
 #   4. verify it: every shard its index names is there, and it is a checkpoint format this engine serves (ModelOpt NVFP4 or GPTQ int4)
+#   5. ABLIT=1 only: the Keys overlay's sidecar (~190 MB, gated) and the checkpoint folder with it grafted in (scripts/ablit_view.py)
 # ./start.sh runs this by itself when needed. Safe to re-run: every step skips work that is already done.
 # Pass --rebuild to rebuild the image from scratch.
 set -euo pipefail
@@ -195,14 +196,14 @@ docker run --rm --network none --entrypoint test "$IMAGE" -x /opt/tensorfold/nat
 log "Image $IMAGE: tensorfold-native, kernel set present"
 
 command -v hf >/dev/null || warn "host 'hf' CLI not found, downloading from inside the container"
-download() {
+download() {   # download <repo> [revision] [include pattern]
   if command -v hf >/dev/null; then
-    hf download "$1" ${2:+--revision "$2"} --cache-dir "$HF_CACHE/hub" >/dev/null
+    hf download "$1" ${2:+--revision "$2"} --cache-dir "$HF_CACHE/hub" ${3:+--include "$3"} >/dev/null
   else
     docker run --rm --user "$(id -u):$(id -g)" --network host --entrypoint python ${HF_TOKEN:+-e HF_TOKEN} \
       ${HF_HUB_OFFLINE:+-e HF_HUB_OFFLINE} \
       -v "$HF_CACHE":/hf -e HF_HOME=/hf -e HOME=/tmp "$IMAGE" -c \
-      'import sys; from huggingface_hub import snapshot_download; snapshot_download(sys.argv[1], revision=sys.argv[2] or None)' "$1" "$2"
+      'import sys; from huggingface_hub import snapshot_download; snapshot_download(sys.argv[1], revision=sys.argv[2] or None, allow_patterns=sys.argv[3] or None)' "$1" "${2:-}" "${3:-}"
   fi
 }
 dir=$(model_cache_dir)
@@ -248,5 +249,20 @@ print("qwen4_exp, %s, %d tensors in %d shards" % (what, len(idx["weight_map"]), 
 snap="$dir/snapshots/$rev"
 info=$(python3 -I -c "$CHECK_PY" "$snap" 2>&1) || die "the checkpoint at $snap is not ready: $info"
 log "Checkpoint OK: $info"
+
+if [[ "$ABLIT" == 1 ]]; then
+  warn "ABLIT=1: $ABLIT_ID is gated and its model has had safety refusals removed. Accept its terms at" \
+       "https://huggingface.co/$ABLIT_ID while logged in, with a read token for that account: export HF_TOKEN=hf_... or hf auth login."
+  side_snap="$(ablit_cache_dir)/snapshots/$ABLIT_REVISION"
+  log "Downloading the overlay's sidecar ($ABLIT_SIDECAR, ~190 MB) from $ABLIT_ID @ ${ABLIT_REVISION:0:8}"
+  if ! download "$ABLIT_ID" "$ABLIT_REVISION" "$ABLIT_SIDECAR"; then
+    [[ -s "$side_snap/$ABLIT_SIDECAR" ]] || die "$ABLIT_ID: the download failed (is its gate accepted by the account of this HF_TOKEN?)"
+    warn "$ABLIT_ID: could not reach Hugging Face; using the sidecar already here (${ABLIT_REVISION:0:8})"
+  fi
+  [[ -s "$side_snap/$ABLIT_SIDECAR" ]] || die "$ABLIT_ID: no sidecar at $side_snap/$ABLIT_SIDECAR after the download"
+  python3 -I scripts/ablit_view.py "$snap" "$side_snap/$ABLIT_SIDECAR" "$HF_CACHE/$ABLIT_VIEW_SUB" || die "could not build the ABLIT=1 checkpoint folder"
+  info=$(python3 -I -c "$CHECK_PY" "$HF_CACHE/$ABLIT_VIEW_SUB" 2>&1) || die "the checkpoint at $HF_CACHE/$ABLIT_VIEW_SUB is not ready: $info"
+  log "ABLIT=1 checkpoint OK ($ABLIT_VIEW_SUB): $info"
+fi
 prepared_state > "$PREPARED_MARKER"
 log "Done. Start the server with ./start.sh (port $PORT)."
