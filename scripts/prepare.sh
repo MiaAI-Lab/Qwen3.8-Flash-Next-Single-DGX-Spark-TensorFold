@@ -7,6 +7,7 @@
 #   3. the checkpoint in the Hugging Face cache (~96 GiB for the NVIDIA FP4 default, ~122 GiB for CHECKPOINT=int4), at its pinned revision
 #   4. verify it: every shard its index names is there, and it is a checkpoint format this engine serves (ModelOpt NVFP4 or GPTQ int4)
 #   5. ABLIT=1 only: the Keys overlay's sidecar (~190 MB, gated) and the checkpoint folder with it grafted in (scripts/ablit_view.py)
+#   6. hf: identities in TENSORFOLD_IDENTITIES (ABLIT=2 sets one): their directions files (KB, gated or not)
 # ./start.sh runs this by itself when needed. Safe to re-run: every step skips work that is already done.
 # Pass --rebuild to rebuild the image from scratch.
 set -euo pipefail

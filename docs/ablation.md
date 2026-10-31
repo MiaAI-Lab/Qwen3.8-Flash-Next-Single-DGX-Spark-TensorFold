@@ -38,7 +38,10 @@ TENSORFOLD_IDENTITIES="Qwen3.8-Flash-Next-abliterated=hf:Loke-60000/Qwen3.8-Flas
 ```
 
 The engine logs one `identity i id: ...` line each at load; a file that fails its checks stops the load with the reason.
-Leave `ABLIT=0`: with `ABLIT=1` every request, the stock id included, already runs on abliterated weights.
+`ABLIT=2` sets this up for drowzeys's house-qsa abliteration in one switch: the stock model as `SERVED_NAME` and the
+abliterated one as `SERVED_NAME-abliterated`, with the directions file downloaded at a pinned revision (`ABLIT_DIRECTIONS`).
+A `TENSORFOLD_IDENTITIES` of your own takes precedence. Don't list identities with `ABLIT=1`: then every request, the
+stock id included, already runs on the overlay's abliterated weights.
 
 ## Directions files
 
