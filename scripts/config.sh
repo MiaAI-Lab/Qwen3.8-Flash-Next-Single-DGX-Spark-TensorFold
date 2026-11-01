@@ -72,6 +72,9 @@ LIBJPEG_TURBO_VERSION=3.1.4.1
 LIBJPEG_TURBO_SHA256=ecae8008e2cc9ade2f2c1bb9d5e6d4fb73e7c433866a056bd82980741571a022
 LIBWEBP_VERSION=1.6.0
 LIBWEBP_SHA256=e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564
+PYPDFIUM2_VERSION=5.14.0
+PYPDFIUM2_WHEEL_URL="https://files.pythonhosted.org/packages/92/b4/0c31aa51887cd6cd032191dfe010a6d01ed43cf03204cfbd2184ebe4b715/pypdfium2-5.14.0-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl"
+PYPDFIUM2_AARCH64_SHA256=f1b696e6901e16f114a2ec6332e5e3f8f5033a901614ead28499ab18ca6024f5
 # libtfgrammar.so (structured output, tool_choice "required" and named functions) comes prebuilt from TensorFold's own release archive, checked against its SHA-256;
 # the archive ships it with xgrammar's Apache-2.0 notices. TF_RELEASE is the release that matches TF_REF.
 TF_RELEASE_VERSION=1.1.4
@@ -82,7 +85,7 @@ image_hash() {
   ( cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
     cat patches/*.patch 2>/dev/null
     sed -n "/<<'DOCKERFILE'/,/^DOCKERFILE\$/p" scripts/prepare.sh
-    echo "$TF_REPO $TF_REF zig-$ZIG_VERSION $ZIG_SHA256 $BASE_IMAGE jpeg-$LIBJPEG_TURBO_VERSION-$LIBJPEG_TURBO_SHA256 webp-$LIBWEBP_VERSION-$LIBWEBP_SHA256 grammar-$TF_RELEASE_VERSION-$TF_RELEASE_AARCH64_SHA256"
+    echo "$TF_REPO $TF_REF zig-$ZIG_VERSION $ZIG_SHA256 $BASE_IMAGE jpeg-$LIBJPEG_TURBO_VERSION-$LIBJPEG_TURBO_SHA256 webp-$LIBWEBP_VERSION-$LIBWEBP_SHA256 pdfium-$PYPDFIUM2_VERSION-$PYPDFIUM2_AARCH64_SHA256 grammar-$TF_RELEASE_VERSION-$TF_RELEASE_AARCH64_SHA256"
   ) | sha256sum | cut -c1-12
 }
 GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold}"
