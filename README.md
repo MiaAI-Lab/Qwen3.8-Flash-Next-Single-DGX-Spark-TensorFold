@@ -221,9 +221,19 @@ A video is a `video_url` part (`{"type": "video_url", "video_url": {"url": "data
 | Tokens | up to 16,384 for all images, at most 4,096 an image (`"detail": "low"`: 256 an image) | 2 frames a second (at most 256 frames), two frames a group, up to 16,384 tokens a request (`TENSORFOLD_VIDEO_TOKENS`) |
 
 Each group of two frames, about one second of footage, counts as one image against the 50 a request may hold (`TENSORFOLD_MAX_IMAGES`; the engine's cap is
-64), so a request's videos and images together come to about 50 seconds. A longer clip is refused with `image count or row budget exceeds the configured
-limits` (a 66-second clip, measured). Measured with patch `0018` (NVIDIA FP4, `--vision-max-images 50 --vision-max-videos 4`): a 3-second 480p MP4 took 1,269
-prompt tokens and a 12-second one 4,989; both were described correctly, and image and text-only prompts kept their token counts.
+64), so a request's videos and images together come to 50 seconds at the default (64 with `TENSORFOLD_MAX_IMAGES=64`). A longer clip is refused before
+decoding, with HTTP 500 and `image count or row budget exceeds the configured limits`. Measured with patch `0018` (NVIDIA FP4, `--vision-max-images 50
+--vision-max-videos 4`, thinking off, temperature 0) on 416x416 H.264 clips, red for the first two seconds and blue for the last two:
+
+| Clip | Frame groups | Result | Prompt tokens | Time to first token |
+| --- | ---: | --- | ---: | ---: |
+| 3 s | 3 | 200, "Red, Blue" | 574 | 0.95 s |
+| 45 s | 45 | 200, "Red, Blue" | 8,043 | 5.9 s |
+| 50 s | 50 | 200, "Red, Blue" | 7,683 | 5.9 s |
+| 51 s | 51 | 500, refused | | 0.54 s |
+
+The processor shrinks the frames as their number grows, so a group's token cost is not fixed (about 178 a group at 3 and 45 seconds, 154 at 50); the
+16,384-token video budget did not bind on these clips.
 
 By default only data URLs are accepted. `VISION_URLS=1` also lets the server fetch public `https://` URLs. Image prompts are kept for prefix reuse
 (each image matched by a hash of its bytes, built into TensorFold v1.1.4), so a chat's next turn after an image

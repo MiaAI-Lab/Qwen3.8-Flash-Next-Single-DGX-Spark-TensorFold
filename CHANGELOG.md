@@ -13,9 +13,11 @@ take a group of `<|video_pad|>` rows instead of returning `error.QwenVideoUnsupp
 `core/qwen_vl/video.zig`; the tower, M-RoPE and the media plan treat each pair as an image. `scripts/prepare.sh` now builds FFmpeg 9.0.2 (pinned in
 `config.sh`, with TensorFold's `tools/zig/build_ffmpeg.sh`) and `zig build video`, which installs `native/lib/libtfvideo.so`; the release archive carries no such
 library. `start.sh` passes `--vision-video-tokens "$TENSORFOLD_VIDEO_TOKENS"` (the CUDA path takes its budget from the flag, not from the environment variable;
-both default to 16,384, so nothing changes at the defaults). Each two-frame group counts against `TENSORFOLD_MAX_IMAGES` (50), so a request holds about 50 seconds of footage. Measured on NVIDIA FP4:
-a 3-second 480p clip 1,269 prompt tokens, a 12-second one 4,989, both described correctly; a 336x336 PNG (122 tokens) and a text-only prompt (20 tokens) unchanged;
-a 66-second clip refused. The patch hash changes, so `prepare.sh` builds the image locally until a new one is published.
+both default to 16,384, so nothing changes at the defaults). Each two-frame group counts against `TENSORFOLD_MAX_IMAGES` (50), so a request holds 50 seconds of footage.
+Measured on NVIDIA FP4 with an image built by `prepare.sh` from this change: 416x416 clips of 3, 45 and 50 seconds answered correctly (574, 8,043 and 7,683
+prompt tokens), a 51-second clip refused (HTTP 500, before decoding). Eight greedy text prompts replied byte-identically to the image without the change, and an
+image prompt gave the same reply with the same 153 prompt tokens; prefill and decode speed within run-to-run noise. The patch hash changes, so `prepare.sh`
+builds the image locally until a new one is published.
 
 **2026-10-30: `ABLIT` (new, off by default).** `ABLIT=1` serves NVIDIA's FP4 checkpoint with drowzeys's Keys house-qsa abliteration overlay
 (`drowzeys/keys-Qwen3.8-Flash-Next-NVFP4-FP4-QAD-house-qsa-L3-47` @ `c44f5b92`): `self_attn.o_proj` of the 12 attention (QSA) layers (L3 to L47), from a
