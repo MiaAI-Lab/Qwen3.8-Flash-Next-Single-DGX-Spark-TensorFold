@@ -197,8 +197,9 @@ checks in this repository compare a build against itself, not `ABLIT=1` against 
 ## Images and video
 
 The model's own vision tower (27 layers, 0.84 GiB, from the same checkpoint) turns images and video frames into
-tokens. A Python helper in the image decodes them (Pillow, PyAV) and runs the tower. Send them as OpenAI-style
-content parts in a user message:
+tokens. The engine decodes images with libjpeg-turbo and libwebp and videos with `libtfvideo` (TensorFold's decoder over a static FFmpeg 9.0.2, built
+into the image), then runs the tower on the GPU. On TensorFold v1.1.4 the CUDA engine reads video only with patch `0018`; without it a `video_url` part is
+refused. Send them as OpenAI-style content parts in a user message:
 
 ```bash
 IMG=$(base64 -w0 photo.jpg)
@@ -215,9 +216,14 @@ A video is a `video_url` part (`{"type": "video_url", "video_url": {"url": "data
 
 | | Images | Videos |
 | --- | --- | --- |
-| Formats | JPEG, PNG, WebP | MP4, WebM, MOV, MKV (anything FFmpeg decodes) |
-| Per request | up to 50 (all of a chat's turns count), 10 MB each, 64 MB in all | up to 4 (`MAX_VIDEOS`), 64 MB each, 96 MB in all, up to an hour of footage |
-| Tokens | up to 16,384 for all images, at most 4,096 an image (`"detail": "low"`: 256 an image) | 2 frames a second (at most 256 frames), up to 16,384 tokens a request (`TENSORFOLD_VIDEO_TOKENS`) |
+| Formats | JPEG, PNG, WebP | MP4, MOV, MKV, WebM with H.264, HEVC, VP8, VP9 or MPEG-4 video (no audio) |
+| Per request | up to 50 (all of a chat's turns count), 10 MB each, 64 MB in all | up to 4 (`MAX_VIDEOS`), 16 MB each, 20 MB in all; about 50 seconds of footage in all (below) |
+| Tokens | up to 16,384 for all images, at most 4,096 an image (`"detail": "low"`: 256 an image) | 2 frames a second (at most 256 frames), two frames a group, up to 16,384 tokens a request (`TENSORFOLD_VIDEO_TOKENS`) |
+
+Each group of two frames, about one second of footage, counts as one image against the 50 a request may hold (`TENSORFOLD_MAX_IMAGES`; the engine's cap is
+64), so a request's videos and images together come to about 50 seconds. A longer clip is refused with `image count or row budget exceeds the configured
+limits` (a 66-second clip, measured). Measured with patch `0018` (NVIDIA FP4, `--vision-max-images 50 --vision-max-videos 4`): a 3-second 480p MP4 took 1,269
+prompt tokens and a 12-second one 4,989; both were described correctly, and image and text-only prompts kept their token counts.
 
 By default only data URLs are accepted. `VISION_URLS=1` also lets the server fetch public `https://` URLs. Image prompts are kept for prefix reuse
 (each image matched by a hash of its bytes, built into TensorFold v1.1.4), so a chat's next turn after an image
@@ -247,8 +253,8 @@ the docker command and changes nothing.
 **`scripts/prepare.sh`:**
 
 1. Preflight: Docker, disk.
-2. The image `tensorfold-qwen38:v1.1.4-eab8582`: TensorFold v1.1.4 (`TF_REF`) with every `patches/*.patch` applied, Zig 0.17.0, libjpeg-turbo and libwebp's decoder
-   (built from checksummed sources), on `nvcr.io/nvidia/pytorch:26.07-py3`; the build runs `fatbins native` only. `libtfgrammar.so` is copied out of TensorFold's v1.1.4 release archive
+2. The image `tensorfold-qwen38:v1.1.4-eab8582`: TensorFold v1.1.4 (`TF_REF`) with every `patches/*.patch` applied, Zig 0.17.0, libjpeg-turbo, libwebp's decoder
+   and a static FFmpeg 9.0.2 for `libtfvideo.so` (built from checksummed sources), on `nvcr.io/nvidia/pytorch:26.07-py3`; the build runs `fatbins native video` only. `libtfgrammar.so` is copied out of TensorFold's v1.1.4 release archive
    (SHA-256 pinned in `config.sh`). It tries a matching prebuilt image from GitHub
    Container Registry first, by digest (`PULL=0` builds locally; the published image of the current patch set is `v1.1.4-eab8582-4baf16137ecd`, also `:latest`).
 3. The checkpoint, at the pinned revision.
@@ -331,9 +337,9 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `THINKING` | `1` | think before answering; `0` passes `--no-thinking` |
 | `MAX_TOKENS` | `32768` | the reply budget when a request sets none |
 | `VISION` / `VISION_URLS` | `1` / `0` | image and video (`--vision`); `VISION_URLS=1` also accepts public `https://` URLs |
-| `TENSORFOLD_MAX_IMAGES` / `TENSORFOLD_IMAGE_TOKENS` | `50` / `16384` | images a request may carry, and the tokens they share (4,096 at most an image) |
+| `TENSORFOLD_MAX_IMAGES` / `TENSORFOLD_IMAGE_TOKENS` | `50` / `16384` | images a request may carry, and the tokens they share (4,096 at most an image). A video's two-frame groups count here too, one a second of footage |
 | `MAX_VIDEOS` | `4` | videos a request (`--vision-max-videos`) |
-| `TENSORFOLD_VIDEO_TOKENS` | `16384` | a request's video token budget |
+| `TENSORFOLD_VIDEO_TOKENS` | `16384` | a request's video token budget (`--vision-video-tokens`) |
 | `TENSORFOLD_VISION_WORKSPACE_MIB` | `2048` | kept out of the KV budget for the helper |
 | `SERVED_NAME` | `Qwen3.8-Flash-Next` | the model id in `/v1/models` |
 | `PORT` / `HOST` | `8888` / `0.0.0.0` | where the API listens |
@@ -422,6 +428,7 @@ targeted. Drafted replies are still checked: a drafted reply matches `"draft": f
 | `0014`, `0015` | fused hyper-connection kernels, expert row tiles and MTP head pieces for prompt passes; a two-stage MX128 prompt tile |
 | `0016` | the shared expert runs on a second stream in decode rounds; a shared round takes every lane's DeltaNet rows in three launches a layer |
 | `0017` | the draft chain stops on the running product of its draft probabilities (the rule of the earlier build) |
+| `0018` | the CUDA engine reads `video_url` parts: TensorFold's shared Qwen-VL frame sampling and pairing feed the tower as image groups (stock v1.1.4 reads video only on Metal) |
 
 Every knob is an environment variable with its default in `scripts/config.sh`; the CHANGELOG lists them with the measured effect of each round.
 
@@ -481,6 +488,8 @@ covers this repository's scripts only.
   expert tile and prefill (0004, 0006, 0014, 0015), sampled streams (0007 to 0011; the GPU top-k idea from MiaAI-Lab's DeepSeek recipe), rollback, `pread` n-gram reader and
   decode (0012, 0013, 0016, 0017; 0013, 0016 and 0017 carry forward parts of the earlier db281878 series, whose NVIDIA FP4 port is by MiaAI-Lab from
   the TensorFold Contributors' Python implementation of the same formats).
+- **Patch 0018** (`video_url` on CUDA): by [chai-md](https://github.com/chai-md), MIT License; it wires TensorFold's own Qwen-VL video preparation (Ash Hart and the
+  TensorFold contributors) into the CUDA Flash Next vision type. Video is decoded by TensorFold's `libtfvideo` over [FFmpeg](https://ffmpeg.org/) 9.0.2 (LGPL-2.1-or-later).
 - **Earlier db281878 series** (on `main`): free after drain and admission reclaim (patch 0029) and image prompts in the prompt cache (patch 0030) by [tempeste](https://github.com/tempeste), now built
   into TensorFold v1.1.4; sliced fills one at a time (patch 0021) by [BadAd84](https://github.com/BadAd84) (PR #53).
 - **Model:** [Qwen3.8 Flash Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team (Alibaba).

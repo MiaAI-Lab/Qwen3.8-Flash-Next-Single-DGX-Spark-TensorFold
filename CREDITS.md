@@ -73,6 +73,9 @@ license files from the pinned checkout.
   - `0016-decode-shared-expert-side-stream-and-lane-batched-deltanet`: MiaAI-Lab; running the shared expert on a second stream comes from the earlier
     db281878 series.
   - `0017-draft-chain-running-product-stop-rule`: MiaAI-Lab; the stop rule is the one of the earlier db281878 series, re-implemented on v1.1.4.
+- **Patch `0018-flashnext-cuda-video`** (`video_url` on the CUDA engine) is by [chai-md](https://github.com/chai-md), under this repository's MIT License. It adds no decoder
+  and no kernel: it gives the CUDA Flash Next vision type the video hooks TensorFold's generic CUDA vision offer already looks for, delegating to
+  TensorFold's shared Qwen-VL video preparation (`core/qwen_vl/video.zig`, the code the Metal host uses), by Ash Hart and the TensorFold contributors.
 - **Earlier series on TensorFold db281878** (patches 0011 to 0015, 0021 and 0029 to 0031, on `main`, retired on this branch):
   - NVIDIA FP4 support in the Zig engine (`0011` to `0015`): by MiaAI-Lab, as a port of TensorFold's Python implementation of the same formats (CSF scale
     decoding, MXFP8 linears, the NVFP4 n-gram table and its read-ahead), written by the TensorFold Contributors, to the Zig engine and its CUDA kernels.
@@ -147,8 +150,9 @@ This recipe no longer applies those patches (the serving path is the Zig engine)
   the engine replays their compiled cubins.
 - **[Hugging Face transformers](https://github.com/huggingface/transformers)** (Apache 2.0): the Qwen vision tower's
   modules and the image processor.
-- **[PyAV](https://github.com/PyAV-Org/PyAV)** (BSD-3-Clause) and **[FFmpeg](https://ffmpeg.org/)** (LGPL): video
-  decoding. **[Pillow](https://python-pillow.org/)** (MIT-CMU): image decoding.
+- **[FFmpeg](https://ffmpeg.org/)** 9.0.2 (LGPL-2.1-or-later): video decoding, built statically by TensorFold's `tools/zig/build_ffmpeg.sh`
+  (decoders only) into TensorFold's `libtfvideo.so`; its license files are in `/opt/tensorfold/share/doc/ffmpeg` in the image.
+  **[PyAV](https://github.com/PyAV-Org/PyAV)** (BSD-3-Clause): the reference TensorFold checks its frame sampling against. **[Pillow](https://python-pillow.org/)** (MIT-CMU): image decoding.
 - **[Hugging Face Hub](https://huggingface.co/)**: model hosting, the `hf` CLI and `huggingface_hub` (Apache 2.0), and
   the [safetensors](https://github.com/huggingface/safetensors) format (Apache 2.0) the checkpoint ships in.
 - **[Docker](https://www.docker.com/)** and the

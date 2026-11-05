@@ -13,8 +13,8 @@ TensorFold
   scripts/prepare.sh builds TensorFold's Zig engine (tensorfold-native) from TensorFold's source at the commit pinned
   in scripts/config.sh; the image carries that build in /opt/tensorfold and TensorFold's LICENSE, LICENSES/, NOTICE and
   THIRD_PARTY_NOTICES.md in /opt/tensorfold/share/doc/tensorfold. The files in patches/ modify TensorFold's source and
-  are applied to it with git apply before the build. The changes in patches/ (0001 to 0017) are this project's work, written by MiaAI-Lab (Mia's AI Lab) and listed
-  one by one in CREDITS.md, under the MIT
+  are applied to it with git apply before the build. The changes in patches/ (0001 to 0017) are this project's work, written by MiaAI-Lab (Mia's AI Lab), and
+  patch 0018 by chai-md, listed one by one in CREDITS.md, under the MIT
   License; the TensorFold code they modify, and quote as diff context, stays under TensorFold's licenses: Apache-2.0,
   and for code written before 0.6.0 also its MIT notice (TensorFold's LICENSES/MIT.txt), so keep TensorFold's NOTICE
   and this copyright and permission notice with any copy of a patched tree:
@@ -83,5 +83,10 @@ Third-party software in the image
   (Apache 2.0), PyAV (BSD-3-Clause) with its bundled FFmpeg libraries (LGPL), Pillow, and TensorFold's Python source
   (under TensorFold's licenses, above). This project's MIT License covers its own work only, not the software in the
   image.
+  The image also carries libtfvideo.so (TensorFold's tf_video.c, under TensorFold's licenses) statically linked with
+  FFmpeg 9.0.2's libavformat, libavcodec, libswscale and libavutil, LGPL-2.1-or-later. scripts/prepare.sh builds FFmpeg from
+  https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz (SHA-256 pinned in scripts/config.sh) with TensorFold's
+  tools/zig/build_ffmpeg.sh, so the source and the build that produced the library can be rebuilt and relinked; FFmpeg's
+  COPYING.LGPLv2.1 and LICENSE.md are in /opt/tensorfold/share/doc/ffmpeg.
 
 See CREDITS.md for everyone this project builds on.
