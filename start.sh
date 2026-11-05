@@ -48,7 +48,7 @@ SERVE_ARGS+=(--kv-cache "$KV_DTYPE")
 [[ "$MAX_VIDEOS" =~ ^[0-9]+$ ]] || die "MAX_VIDEOS is a count, not $MAX_VIDEOS"
 if [[ "$VISION" == 1 ]]; then
   SERVE_ARGS+=(--vision --vision-max-images "$TENSORFOLD_MAX_IMAGES" --vision-max-videos "$MAX_VIDEOS"
-               --vision-image-tokens "$TENSORFOLD_IMAGE_TOKENS")
+               --vision-image-tokens "$TENSORFOLD_IMAGE_TOKENS" --vision-video-tokens "$TENSORFOLD_VIDEO_TOKENS")
   [[ "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)
 fi
 USER_ARGS=("$@")

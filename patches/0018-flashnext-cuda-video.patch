@@ -1,0 +1,93 @@
+diff --git a/zig/src/families/flashnext/cuda_images.zig b/zig/src/families/flashnext/cuda_images.zig
+index e513de2..53fab66 100644
+--- a/zig/src/families/flashnext/cuda_images.zig
++++ b/zig/src/families/flashnext/cuda_images.zig
+@@ -8,6 +8,10 @@ const media = @import("cuda_media.zig");
+ pub const Limits = shared.media.Limits;
+ pub const Vision = struct {
+     pub const template_wraps = true;
++    /// the core Qwen-VL video prep (frame sampling and pairing), shared with the Metal host
++    pub const video = core.qwen_vl.video;
++    /// Qwen's video groups put the timestamp before the group's rows
++    pub const video_time_first = true;
+     a: std.mem.Allocator,
+     io: std.Io,
+     tower: ?*shared.Tower,
+@@ -17,6 +21,7 @@ pub const Vision = struct {
+     limits: Limits,
+     marks: struct { open: u32, image: u32, close: u32 },
+     mark_ids: [3]u32,
++    video_ids: ?[3]u32, // vision_start, video_pad, vision_end: null when the checkpoint reads no video
+     prep: cuda.Function,
+     pool: cuda.Function,
+     /// fn_attn_prep_media into fp8 caches (--kv-cache fp8); null: bf16 caches.
+@@ -44,7 +49,7 @@ pub const Vision = struct {
+         var module: ?cuda.Module = if (t == null) try cuda.Module.load(d, cuda.kernels.qwen_vision) else null;
+         errdefer if (module) |*m| m.unload();
+         const splice = try (if (t) |x| &x.mod else &module.?).function("tf_qv_splice");
+-        self.* = .{ .a = a, .io = io, .tower = t, .processor = settings.processor, .module = module, .limits = limits, .marks = .{ .open = c.vision_start, .image = c.image_token, .close = c.vision_end }, .mark_ids = .{ c.vision_start, c.image_token, c.vision_end }, .prep = prep, .pool = pool, .encoder = .{ .ctx = self, .config = c, .driver = d, .stream = s, .splice = splice, .encode = encode } };
++        self.* = .{ .a = a, .io = io, .tower = t, .processor = settings.processor, .module = module, .limits = limits, .marks = .{ .open = c.vision_start, .image = c.image_token, .close = c.vision_end }, .mark_ids = .{ c.vision_start, c.image_token, c.vision_end }, .video_ids = if (c.video_token) |vt| [3]u32{ c.vision_start, vt, c.vision_end } else null, .prep = prep, .pool = pool, .encoder = .{ .ctx = self, .config = c, .driver = d, .stream = s, .splice = splice, .encode = encode } };
+         return self;
+     }
+     fn encode(ptr: *anyopaque, pixels: []const f32, grids: []const shared.Grid, out: u64) anyerror!void {
+@@ -68,6 +73,10 @@ pub const Vision = struct {
+         const p = try settings.prepare(v.io, a, bytes, max_tokens);
+         return .{ .pixels = p.pixels, .gh = p.gh, .gw = p.gw, .tokens = p.tokens, .hash = p.hash };
+     }
++    /// Info.vision's video prepare: the decoded frames to the tower's pairs, on the HTTP thread.
++    pub fn prepareVideo(v: *Vision, a: std.mem.Allocator, s: video.Source, max_tokens: u32, max_frames: u32) anyerror!video.Prepared {
++        return video.prepare(a, s, v.processor, max_tokens, max_frames);
++    }
+     pub fn state(v: *Vision, ids: []const u32, images: []const @import("lanes").stream.Image) !media.State {
+         return .{ .image = try shared.media.Media.init(v.a, v.encoder, ids, images, v.limits), .prep = v.prep, .pool = v.pool, .prep8 = v.prep8 };
+     }
+diff --git a/zig/src/native/cuda_vision_offer.zig b/zig/src/native/cuda_vision_offer.zig
+index 70dea6b..06e693c 100644
+--- a/zig/src/native/cuda_vision_offer.zig
++++ b/zig/src/native/cuda_vision_offer.zig
+@@ -43,7 +43,7 @@ pub fn offer(v: anytype, open: ?api.VisionOpen) ?api.Vision {
+         return out;
+     }
+     if (comptime @hasDecl(T, "prepareVideo")) if (x.video_ids) |*vm| {
+-        out.video = .{ .prepare = Video(T).prepare, .video_token = vm[1], .group_open = x.marks.open, .group_close = x.marks.close, .markers = vm, .video_tokens = x.limits.video_tokens, .max_videos = x.limits.max_videos, .max_frames = x.limits.max_frames };
++        out.video = .{ .prepare = Video(T).prepare, .video_token = vm[1], .group_open = x.marks.open, .group_close = x.marks.close, .markers = vm, .video_tokens = x.limits.video_tokens, .max_videos = x.limits.max_videos, .max_frames = x.limits.max_frames, .time_first = if (comptime @hasDecl(T, "video_time_first")) vm[1] else null };
+     };
+     return out;
+ }
+diff --git a/zig/src/vision/qwen_cuda_media.zig b/zig/src/vision/qwen_cuda_media.zig
+index 5cd9548..98895b1 100644
+--- a/zig/src/vision/qwen_cuda_media.zig
++++ b/zig/src/vision/qwen_cuda_media.zig
+@@ -5,7 +5,7 @@ const lanes = @import("lanes");
+ const vision = @import("qwen_cuda.zig");
+ /// The image rows one request holds in all (each image keeps one tower call's 4,096 at most).
+ pub const max_image_tokens = 16384;
+-pub const Limits = struct { image_tokens: u32 = 4096, max_images: u32 = 4 };
++pub const Limits = struct { image_tokens: u32 = 4096, max_images: u32 = 4, video_tokens: u32 = 0, max_videos: u32 = 0, max_frames: u32 = 0 };
+ pub fn checkLimits(l: Limits) !void {
+     if (l.image_tokens == 0 or l.image_tokens > max_image_tokens or l.max_images == 0 or l.max_images > 64)
+         return error.BadImageLimits;
+@@ -66,16 +66,20 @@ pub fn placeholders(a: std.mem.Allocator, c: vision.Config, ids: []const u32, im
+     errdefer p.deinit();
+     var j: usize = 0;
+     for (ids, 0..) |id, at| {
+-        if (c.video_token) |video| if (id == video) return error.QwenVideoUnsupported;
+         if (j < p.runs.len and at == p.runs[j].at) {
+             const r = p.runs[j];
+             const im = images[j];
+             if (im.tokens != r.tokens() or im.pixels.len != r.patches() * vision.patch_width) return error.BadImagePatches;
+             if (ids[at - 1] != c.vision_start or ids[at + r.tokens()] != c.vision_end) return error.BadImagePlaceholders;
+-            for (ids[at..][0..r.tokens()]) |x| if (x != c.image_token) return error.BadImagePlaceholders;
++            // an image group's rows are <|image_pad|>; a video group's are <|video_pad|>
++            const mark = ids[at];
++            if (mark != c.image_token and (c.video_token == null or mark != c.video_token.?))
++                return error.BadImagePlaceholders;
++            for (ids[at..][0..r.tokens()]) |x| if (x != mark) return error.BadImagePlaceholders;
+             j += 1;
+         }
+-        if (id == c.image_token and p.src[at] < 0) return error.BadImagePlaceholders;
++        if ((id == c.image_token or (c.video_token != null and id == c.video_token.?)) and p.src[at] < 0)
++            return error.BadImagePlaceholders;
+     }
+     return p;
+ }

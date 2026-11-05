@@ -5,6 +5,20 @@ Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:
 
 ## Unreleased
 
+**2026-11-06: video input on the CUDA engine (patch 0018), `libtfvideo.so` in the image.** Stock v1.1.4 refused `video_url` parts on CUDA
+(`content parts must be text or image_url; audio and video inputs are unsupported`), although the README listed video: only the Metal host reads it.
+Patch `0018-flashnext-cuda-video` (3 files, +19/-6) gives `families/flashnext/cuda_images.zig` the `video` source, `video_time_first`, `video_ids` and
+`prepareVideo` that `native/cuda_vision_offer.zig` already looks for, adds the video limits to `vision/qwen_cuda_media.zig`, and lets its placeholder check
+take a group of `<|video_pad|>` rows instead of returning `error.QwenVideoUnsupported`. Frame sampling (2 a second) and pairing are TensorFold's shared
+`core/qwen_vl/video.zig`; the tower, M-RoPE and the media plan treat each pair as an image. `scripts/prepare.sh` now builds FFmpeg 9.0.2 (pinned in
+`config.sh`, with TensorFold's `tools/zig/build_ffmpeg.sh`) and `zig build video`, which installs `native/lib/libtfvideo.so`; the release archive carries no such
+library. `start.sh` passes `--vision-video-tokens "$TENSORFOLD_VIDEO_TOKENS"` (the CUDA path takes its budget from the flag, not from the environment variable;
+both default to 16,384, so nothing changes at the defaults). Each two-frame group counts against `TENSORFOLD_MAX_IMAGES` (50), so a request holds 50 seconds of footage.
+Measured on NVIDIA FP4 with an image built by `prepare.sh` from this change: 416x416 clips of 3, 45 and 50 seconds answered correctly (574, 8,043 and 7,683
+prompt tokens), a 51-second clip refused (HTTP 500, before decoding). Eight greedy text prompts replied byte-identically to the image without the change, and an
+image prompt gave the same reply with the same 153 prompt tokens; prefill and decode speed within run-to-run noise. The patch hash changes, so `prepare.sh`
+builds the image locally until a new one is published.
+
 **2026-10-30: `ABLIT` (new, off by default).** `ABLIT=1` serves NVIDIA's FP4 checkpoint with drowzeys's Keys house-qsa abliteration overlay
 (`drowzeys/keys-Qwen3.8-Flash-Next-NVFP4-FP4-QAD-house-qsa-L3-47` @ `c44f5b92`): `self_attn.o_proj` of the 12 attention (QSA) layers (L3 to L47), from a
 ~190 MB sidecar. `scripts/prepare.sh` downloads the sidecar (the overlay is gated: `HF_TOKEN`) and `scripts/ablit_view.py` builds a folder of symlinks to the stock snapshot plus the
