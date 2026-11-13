@@ -6,14 +6,14 @@ This project's own code, scripts and documentation are licensed under the MIT Li
 This project builds on third-party work that keeps its own license:
 
 TensorFold
-  https://github.com/ashhart/TensorFold (release v1.1.4, commit eab85828)
+  https://github.com/ashhart/TensorFold (release v1.2.7, commit 93a2e93e)
   Copyright 2026 TensorFold contributors. Apache License, Version 2.0 from 0.6.0; code written before 0.6.0 keeps its
   MIT notice (below). TensorFold's NOTICE reads: "TensorFold / Copyright 2026 TensorFold contributors /
   https://github.com/ashhart/TensorFold".
   scripts/prepare.sh builds TensorFold's Zig engine (tensorfold-native) from TensorFold's source at the commit pinned
   in scripts/config.sh; the image carries that build in /opt/tensorfold and TensorFold's LICENSE, LICENSES/, NOTICE and
   THIRD_PARTY_NOTICES.md in /opt/tensorfold/share/doc/tensorfold. The files in patches/ modify TensorFold's source and
-  are applied to it with git apply before the build. The changes in patches/ (0001 to 0017) are this project's work, written by MiaAI-Lab (Mia's AI Lab) and listed
+  are applied to it with git apply before the build. The changes in patches/ (0001 to 0004) are this project's work, written by MiaAI-Lab (Mia's AI Lab) and listed
   one by one in CREDITS.md, under the MIT
   License; the TensorFold code they modify, and quote as diff context, stays under TensorFold's licenses: Apache-2.0,
   and for code written before 0.6.0 also its MIT notice (TensorFold's LICENSES/MIT.txt), so keep TensorFold's NOTICE
@@ -53,7 +53,7 @@ Zig
 
 xgrammar and dlpack (inside libtfgrammar.so)
   https://github.com/mlc-ai/xgrammar (MLC-AI team), https://github.com/dmlc/dlpack (DLPack contributors). Apache License, Version 2.0.
-  scripts/prepare.sh copies the prebuilt lib/libtfgrammar.so out of TensorFold's v1.1.4 release archive (aarch64, checked against its
+  scripts/prepare.sh copies the prebuilt lib/libtfgrammar.so out of TensorFold's v1.2.7 release archive (aarch64, checked against its
   SHA-256 in scripts/config.sh) into /opt/tensorfold/native/lib, with the archive's xgrammar and dlpack license and notice files in
   /opt/tensorfold/share/doc/tensorfold/LICENSES-grammar. The library serves structured output and required tool calls; nothing of it is
   modified or compiled here.
