@@ -16,7 +16,7 @@
 Serve **Qwen3.8 Flash Next** from a single NVIDIA DGX Spark (GB10, 128 GB) through an OpenAI-compatible API. It runs
 [TensorFold](https://github.com/ashhart/TensorFold)'s Zig engine, `tensorfold-native` (release
 [v1.2.7](https://github.com/ashhart/TensorFold/releases/tag/v1.2.7), commit `93a2e93e`, with this recipe's patches on top), in NVIDIA's PyTorch container. One GPU,
-with image input (`VISION=1`; this build serves no video, see [Images and video](#images-and-video)). `VISION=0` serves text only.
+with image input (`VISION=1`) and, with `VIDEO=1`, video too (see [Images and video](#images-and-video)). `VISION=0` serves text only.
 
 The default checkpoint is NVIDIA's FP4 QAD export: routed experts in NVFP4 (group size 16, CSF-compressed scale factors),
 attention and shared-expert linears in MXFP8, the MTP experts and the vision tower quantized too (MXFP8 attention, W4A16
@@ -33,13 +33,14 @@ is unchanged.
 - API model id: `Qwen3.8-Flash-Next`
 - Context: **262,144 tokens** a request (the native window). Up to 5 requests at once (`PARALLEL`). A full
   262,144-token window takes 4.78 GiB a stream with the fp8 cache, and a `PARALLEL` whose windows do not all fit is refused when the server starts
-  (see [KV and memory](#kv-and-memory)). The engine keeps 9 GiB free, and another 2 GiB for the vision helper.
+  (see [KV and memory](#kv-and-memory)). The engine keeps 9 GiB free, and another 2 GiB for the vision path.
 - One command: `./start.sh` sets everything up on the first run and starts the server; `./stop.sh` stops it
 
 ## Performance
 
 > **The sparkDash tables below are the v1.1.4 build's** (TensorFold v1.1.4 with its patches `0001` to `0017`, 2026-10-27). The recipe now builds
-> TensorFold v1.2.7 with patches `0001` to `0004` ([What the patches are](#what-the-patches-are)); sparkDash has not been re-run on it. What has been
+> TensorFold v1.2.7 with patches `0001` to `0005` ([What the patches are](#what-the-patches-are); the A/B below ran on `0001` to `0004`); sparkDash has not been
+> re-run on it. What has been
 > measured is an A/B of the two builds with `tools/bench_streams.py` on the same Spark (2026-11-12, defaults, greedy, 256 tokens, median of 3,
 > every stream the same prompt; v1.2.7 here with its default 1,536-row passes):
 >
@@ -121,6 +122,10 @@ On the v1.2.7 build with patches `0001` to `0004` (2026-11-13, one Spark, the de
 `tools/context_boundary.py --context 262144` (16 checks), and `tf-cuda-test qmmf-prompt-mx` on the GPU (the prompt tile's FP64 bound and row-independent bytes).
 With patches `0001` to `0003` (2026-11-12) the same checks passed, plus live `tool_choice: "required"`, a named function, Anthropic `{"type":"any"}` and a
 `response_format` JSON schema. Not re-run on v1.2.7: the sampled-exactness check.
+
+`0005` (video) has not been run on a Spark: it compiles (`zig build check-native-cuda-host`, zig 0.17.0) and its library builds (`zig build video`), but no
+server has served a video from this image. Nothing a text request runs goes through it, and an image request meets only its placeholder check, which now
+accepts a group of `<|video_pad|>` rows beside the image groups it already knew.
 
 #### On the v1.1.4 build
 
@@ -236,11 +241,35 @@ curl -s http://<spark-address>:8888/v1/chat/completions -H 'Content-Type: applic
 }'
 ```
 
-**Video is not served on this build.** The Flash Next CUDA engine has no video path: nothing in
-`families/flashnext/cuda_images.zig` prepares frames and `vision/qwen_cuda_media.zig` refuses a video token, so a
-`video_url` part is refused with `content parts must be text or image_url; audio and video inputs are unsupported`.
-`MAX_VIDEOS` and `TENSORFOLD_VIDEO_TOKENS` still reach the server and bind nothing here. #90 proposes the engine patch
-that adds video and the `libtfvideo` decoder it needs in the image.
+**Video is opt-in (`VIDEO=1 ./start.sh restart`).** The engine samples a clip at 2 frames a second and gives the tower
+two frames a group, each group costing tokens like an image does. Decoding runs in the server through
+`libtfvideo.so` — TensorFold's own `tf_video.c` over a static FFmpeg 9.0.2 that `scripts/prepare.sh` builds from the
+tarball whose SHA-256 it pins, configured with only the H.264, HEVC, VP8, VP9 and MPEG-4 decoders, the MP4/MOV and
+Matroska/WebM demuxers, and `--disable-network` and `--disable-programs`. The image keeps that library in
+`/opt/tensorfold/libexec/tfvideo`, off every path the server probes for it, so with the default `VIDEO=0` a
+`video_url` part is refused and nothing links FFmpeg at all; `VIDEO=1` puts that directory on the loader's path and
+passes `--vision-video-tokens`. It needs `VISION=1`, and takes OpenAI's part shape:
+
+```bash
+VID=$(base64 -w0 clip.mp4)
+curl -s http://<spark-address>:8888/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "Qwen3.8-Flash-Next",
+  "messages": [{"role": "user", "content": [
+    {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,'"$VID"'"}},
+    {"type": "text", "text": "What happens in this clip?"}]}],
+  "max_tokens": 2000
+}'
+```
+
+- **Per request:** up to `MAX_VIDEOS` clips (4) sharing `TENSORFOLD_VIDEO_TOKENS` (16,384 rows) between them, at most
+  256 frames a clip. A clip's frame groups count against the same 50-group and 16,384-row budgets as images, so with
+  everything at its defaults a request carries roughly 50 seconds of footage, its images included.
+- **Where it comes from:** the engine patch is [chai-md](https://github.com/chai-md)'s (#90), re-based onto v1.2.7 as
+  `patches/0005`; the server side (`--vision-max-videos`, `--vision-video-tokens`, the video part, the sampler in
+  `core/qwen_vl/video.zig`) is TensorFold's, and it is the same path the Triton host already runs.
+- **Not measured on a Spark yet:** the patch compiles (`zig build check-native-cuda-host`) and `zig build video` makes
+  the library, but no live video request has been served here, and `tools/visioncheck.py` covers images only. Say what
+  you see.
 
 - **Formats:** JPEG, PNG, WebP.
 - **Per request:** up to 50 images (all of a chat's turns count), 10 MB each, 64 MB in all.
@@ -259,12 +288,12 @@ start the server with --vision --vision-pdf`, so a client never gets a silently 
 By default only data URLs are accepted. `VISION_URLS=1` also lets the server fetch public `https://` URLs. Image prompts are kept for prefix reuse
 (each image matched by a hash of its bytes, built into TensorFold since v1.1.4), so a chat's next turn after an image
 prefills only its new rows, but the vision tower still runs for every image each turn. A request body
-can be up to 96 MiB. `VISION=0 ./start.sh restart` serves text only and gives the 2 GiB helper workspace back to the
+can be up to 96 MiB. `VISION=0 ./start.sh restart` serves text only and gives the 2 GiB vision workspace back to the
 KV pool.
 
 Measured on the Zig engine at TP=1 with `--vision` (warm, three reps): one image (1,217 tokens) 1.0 s to first token,
 10 images (3,035 tokens) 2.3 s. The first use of a new size is slower (a
-5,107-token image took 35 s). The helper stays at 0.84 GiB for the tower and peaked around 1–1.7 GiB. Text replies
+5,107-token image took 35 s). The Python helper those runs measured stayed at 0.84 GiB for the tower and peaked around 1–1.7 GiB. Text replies
 with vision on matched the text-only engine. Those timings are from that engine build; this recipe's own vision boot
 has not been taken while the text server is in use.
 
@@ -320,7 +349,7 @@ this build serves stops at 262,144 (below).
 reports at start (the server log line "N streams at once, 4.78 GiB each ... of 29.0 GiB left after a 9.0 GiB reserve"), measured on a Spark with vision on and
 `PARALLEL=5`: 28.0, 29.0 and 27.3 GiB on three starts. The engine counts 4.78 GiB for each stream at a 262,144-token window. Loading the weights takes about
 81 GiB of memory (the 26.8 GiB NVFP4 n-gram table is read from disk by the host through the page cache, not held on the GPU). The pool is `MemAvailable` after
-the weights load, minus `TENSORFOLD_MEMORY_RESERVE_GIB` (9 GiB), and with `VISION=1` minus 2 GiB kept for the helper (`TENSORFOLD_VISION_WORKSPACE_MIB`; the tower
+the weights load, minus `TENSORFOLD_MEMORY_RESERVE_GIB` (9 GiB), and with `VISION=1` minus 2 GiB kept for the vision path (`TENSORFOLD_VISION_WORKSPACE_MIB`; the tower
 peaks around 0.9-1.7 GiB). It follows the free memory at start (other containers on the machine shrink it), and each GiB less reserve adds a GiB to it.
 `VISION=0` returns the 2 GiB helper workspace to the pool.
 
@@ -372,10 +401,11 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `MAX_TOKENS` | `32768` | the reply budget when a request sets none |
 | `VISION` / `VISION_URLS` | `1` / `0` | images (`--vision`); `VISION_URLS=1` also accepts public `https://` URLs |
 | `PDF` | `0` | `1` passes `--vision-pdf`: PDF document parts rendered by the engine's PDFium (32 MiB, 16 pages, needs `VISION=1`) |
-| `TENSORFOLD_MAX_IMAGES` / `TENSORFOLD_IMAGE_TOKENS` | `50` / `16384` | images a request may carry, and the tokens they share (4,096 at most an image) |
-| `MAX_VIDEOS` | `4` | videos a request (`--vision-max-videos`); nothing to bind on this build, the CUDA engine refuses video |
-| `TENSORFOLD_VIDEO_TOKENS` | `16384` | a request's video token budget; nothing to bind on this build, the CUDA engine refuses video |
-| `TENSORFOLD_VISION_WORKSPACE_MIB` | `2048` | kept out of the KV budget for the helper |
+| `VIDEO` | `0` | `1` takes `video_url` parts: puts the image's `libtfvideo.so` (FFmpeg 9.0.2) on the loader's path and passes `--vision-video-tokens` (needs `VISION=1`) |
+| `TENSORFOLD_MAX_IMAGES` / `TENSORFOLD_IMAGE_TOKENS` | `50` / `16384` | image groups a request may carry, and the rows they share (4,096 at most an image); a video's frame groups count among them |
+| `MAX_VIDEOS` | `4` | videos a request (`--vision-max-videos`, 1 to 16), with `VIDEO=1` |
+| `TENSORFOLD_VIDEO_TOKENS` | `16384` | the rows a request's videos share (`--vision-video-tokens`, 64 to 262,144), with `VIDEO=1` |
+| `TENSORFOLD_VISION_WORKSPACE_MIB` | `2048` | kept out of the KV budget for the vision path (the tower and its scratch) |
 | `SERVED_NAME` | `Qwen3.8-Flash-Next` | the model id in `/v1/models` |
 | `PORT` / `HOST` | `8888` / `0.0.0.0` | where the API listens |
 | `KV_DTYPE` | `fp8` | lossy (~98.8% top-1 agreement with bf16, about 1.8x the pool). `bf16` is exact. Works with `VISION=1`. Adapted from MiaAI-Lab's GLM recipe patch `0038-glm-kv-fp8` |
@@ -454,6 +484,7 @@ Drafted replies are still checked: a drafted reply matches `"draft": false`.
 | `0001`, `0002` | the vision helper loads NVIDIA's quantized vision tower (MXFP8 attention, NVFP4 MLP and merger decoded to bf16 at load); image budget 16,384 tokens |
 | `0003` | `--kv-cache fp8` for Flash Next (one rank, contiguous caches): five full 262,144-token windows fit where bf16 fits three. The fp8 attention reader keeps the next tile in registers, and the MTP head's own cache stays bf16 while the stream fits its charge (the v1.1.4 build's 0003 and 0005, rebased onto v1.2.7's paged and lane-batched attention) |
 | `0004` | prompt passes run the MXFP8 projections 1,024 columns or wider on a 128 x 128 tile (64 x 64 for calls of 128 rows or fewer) that folds the block scales into the weights: one fp32 sum over K, 1.4-1.65x the exact kernels, prefill +7-9%. Prompt rows leave the exact kernels' bits (within their rounding bound; a row's bytes never depend on its chunk, so replies stay exact across drafting and batching); `TF_FLASHNEXT_PROMPT_MX128=0` turns it off (the v1.1.4 build's 0006 and 0015) |
+| `0005` | video parts on the CUDA engine: Flash Next offers the template's `<\|video_pad\|>` groups to the server (the sampler and patchifier are TensorFold's `core/qwen_vl/video.zig`, the same the Triton host runs) and the shared media plan reads a group of video rows beside image rows. Nothing decodes a video until `VIDEO=1` puts `libtfvideo.so` on the loader's path (chai-md's [#90](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/pull/90), re-based onto v1.2.7 by MiaAI-Lab) |
 
 The v1.1.4 build carried seventeen patches. v1.2.7 has most of the rest itself, and the recipe sets its switches for them in `scripts/config.sh`:
 
@@ -526,6 +557,9 @@ covers this repository's scripts only.
   TensorFold's own Flash Next CUDA engine (code by Ash Hart and the TensorFold contributors, under TensorFold's licenses). The list, with where each
   idea comes from, is in [`CREDITS.md`](CREDITS.md): the vision tower (0001, 0002), fp8 KV (0003; the format adapted from MiaAI-Lab's GLM recipe patch 0038)
   and the MXFP8 prompt tile (0004).
+- **Patch 0005 (video parts):** by [chai-md](https://github.com/chai-md) in
+  [#90](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/pull/90), re-based onto TensorFold v1.2.7 by MiaAI-Lab and
+  MIT License like the rest of `patches/`.
   Several of the v1.1.4 build's patches (0004 to 0017) are now part of TensorFold v1.2.7 in upstream's own form; upstream credits MiaAI-Lab for the K32
   expert staging it adapted from patch 0014.
 - **Earlier db281878 series** (on `main`): free after drain and admission reclaim (patch 0029) and image prompts in the prompt cache (patch 0030) by [tempeste](https://github.com/tempeste), now built

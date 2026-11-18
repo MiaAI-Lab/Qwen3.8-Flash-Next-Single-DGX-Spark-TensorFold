@@ -67,6 +67,19 @@ PDFium (inside libpdfium.so, PDF document parts)
   wheel's licenses/ tree into /opt/tensorfold/share/doc/tensorfold/LICENSES-pdfium. Nothing of it is modified or
   compiled here, and it is read only when the server runs with --vision --vision-pdf (PDF=1 in scripts/config.sh).
 
+FFmpeg (linked into libtfvideo.so, video input)
+  https://ffmpeg.org/ (the FFmpeg developers). GNU LGPL version 2.1 (this build enables no GPL or version3 component), from the
+  release TensorFold pins, 9.0.2, whose source tarball scripts/prepare.sh downloads and checks against the SHA-256 pinned in
+  scripts/config.sh. TensorFold's own tools/zig/build_ffmpeg.sh configures it static and PIC, --disable-programs,
+  --disable-shared, --disable-network and --disable-everything with only the H.264, HEVC, VP8, VP9 and MPEG-4 decoders and the
+  MP4/MOV and Matroska/WebM demuxers; `zig build video` then links those archives into libtfvideo.so from TensorFold's
+  zig/src/video/tf_video.c. The library is installed in /opt/tensorfold/libexec/tfvideo, off the paths the server probes for
+  it: only VIDEO=1 puts that directory on the loader's path.
+  Nothing of FFmpeg is modified here. FFmpeg's COPYING.LGPLv2.1 and LICENSE.md are in /opt/tensorfold/share/doc/ffmpeg with the
+  static archives the link used (/opt/tensorfold/share/doc/ffmpeg/objects, LGPL-2.1 section 3a/6: relinking against a modified
+  FFmpeg needs them), and the unmodified FFmpeg source and TensorFold's build script are in the TensorFold checkout's licenses
+  and tools/zig/ respectively.
+
 Model files (downloaded from Hugging Face by scripts/prepare.sh; not included in this repository or its image)
   The checkpoint this recipe serves by default, nvidia/Qwen3.8-Flash-Next-FP4-Local, is NVIDIA's quantization-aware-distilled
   FP4 export (NVIDIA Model Optimizer) of Qwen/Qwen3.8-Flash-Next by the Qwen team (Alibaba). Its use is governed by the NVIDIA Open

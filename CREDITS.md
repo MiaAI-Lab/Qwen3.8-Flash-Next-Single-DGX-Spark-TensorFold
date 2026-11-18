@@ -133,6 +133,10 @@ This recipe no longer applies those patches (the serving path is the Zig engine)
   (`zig/src/server/pdf.zig`, `pdf_worker.zig`), so the engine half is upstream's and theirs is the request and the
   design push; `PDF=1`, the pinned `libpdfium.so` in the image and the `--vision-pdf` wiring in `start.sh` are
   MiaAI-Lab's.
+- **[chai-md](https://github.com/chai-md)** wrote
+  [#90](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/pull/90), the video patch for the CUDA
+  engine: `patches/0005` is theirs, re-based onto TensorFold v1.2.7 by MiaAI-Lab (the field layout had moved and the patch
+  had to be re-split), with `VIDEO=1`, the pinned FFmpeg build and the tests MiaAI-Lab's.
 - The scripts (`start.sh`, `stop.sh`, `scripts/`) and the checks in `tools/` are MiaAI-Lab's. `client.py`,
   `needle.py`, `toolcheck.py` and `prompt_reuse.py` are adapted from MiaAI-Lab's two-Spark recipe
   [GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold);
@@ -148,12 +152,19 @@ This recipe no longer applies those patches (the serving path is the Zig engine)
   the engine replays their compiled cubins.
 - **[Hugging Face transformers](https://github.com/huggingface/transformers)** (Apache 2.0): the Qwen vision tower's
   modules and the image processor.
-- **[PyAV](https://github.com/PyAV-Org/PyAV)** (BSD-3-Clause) and **[FFmpeg](https://ffmpeg.org/)** (LGPL): video
-  decoding. **[Pillow](https://python-pillow.org/)** (MIT-CMU): image decoding.
+- **[libjpeg-turbo](https://libjpeg-turbo.org/)** (IJG/BSD-3-Clause-like) and **[libwebp](https://github.com/webmproject/libwebp)**
+  (BSD-3-Clause): the decoders the engine loads for JPEG and WebP input, both built from pinned sources into the image by
+  `scripts/prepare.sh`.
+- **[FFmpeg](https://ffmpeg.org/)** (LGPL-2.1) and **libtfvideo** (TensorFold's `zig/src/video/tf_video.c`, Apache-2.0): the
+  decoder behind `VIDEO=1`, at the release TensorFold pins and built by TensorFold's own `tools/zig/build_ffmpeg.sh`. Kept off
+  the server's probe paths, so an image built for `VIDEO=0` never links it.
 - **[PDFium](https://pdfium.googlesource.com/pdfium)** (BSD-3-Clause) as shipped by
   **[pypdfium2](https://pypdfium2.readthedocs.io/)** (pypdfium2 contributors): the `libpdfium.so` the image installs for
   `PDF=1`, pinned to pypdfium2 5.14.0's aarch64 wheel by SHA-256 in `scripts/config.sh`, with the wheel's own license
   files copied into the image. Loaded only when the server runs `--vision --vision-pdf`.
+- **[PyAV](https://github.com/PyAV-Org/PyAV)** (BSD-3-Clause), **[FFmpeg](https://ffmpeg.org/)** (LGPL) and
+  **[Pillow](https://python-pillow.org/)** (MIT-CMU): what the *Python* engine this recipe replaced decoded media with; the
+  CUDA build here runs none of them.
 - **[Hugging Face Hub](https://huggingface.co/)**: model hosting, the `hf` CLI and `huggingface_hub` (Apache 2.0), and
   the [safetensors](https://github.com/huggingface/safetensors) format (Apache 2.0) the checkpoint ships in.
 - **[Docker](https://www.docker.com/)** and the

@@ -94,9 +94,11 @@ check("start.sh validates PDF and gates --vision-pdf on it",
 
 def serve_args(pdf: str, vision: str) -> tuple[int, str]:
     """start.sh's own PDF lines with the settings it validates set; returns (exit status, the resulting SERVE_ARGS)."""
+    names = re.findall(r"for v in ([A-Z_ ]+);", validator[0])[0].split()
+    env = " ".join(f"{n}={dict(PDF=pdf, VISION=vision).get(n, '1')}" for n in names)
     script = ("die() { printf 'die: %s\\n' \"$*\" >&2; exit 3; }\n"
               "SERVE_ARGS=()\n"
-              f"THINKING=1 DRAFTS=1 VISION_URLS=0 VISION={vision} PDF={pdf}\n"
+              f"{env}\n"
               + "\n".join(validator + pdf_lines)
               + '\nprintf "%s\\n" "${SERVE_ARGS[*]}"\n')
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)

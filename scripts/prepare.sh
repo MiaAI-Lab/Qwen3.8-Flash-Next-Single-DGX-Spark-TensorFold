@@ -3,7 +3,7 @@
 #   1. preflight: docker, the GPU, disk
 #   2. the image: tensorfold-native built from TensorFold (TF_REF) plus patches/*.patch with Zig, on NVIDIA's
 #      PyTorch container (kernels are embedded in the binary), with libjpeg-turbo, libwebp's decoder and the wheel's
-#      libpdfium (PDF parts, PDF=1); pulled prebuilt when a matching tag is reachable (PULL=0 skips
+#      libpdfium (PDF parts, PDF=1) and libtfvideo (video, VIDEO=1) built over a pinned static FFmpeg; pulled prebuilt when a matching tag is reachable (PULL=0 skips
 #      that), else built locally
 #   3. the checkpoint in the Hugging Face cache (~96 GiB for the NVIDIA FP4 default, ~122 GiB for CHECKPOINT=int4), at its pinned revision
 #   4. verify it: every shard its index names is there, and it is a checkpoint format this engine serves (ModelOpt NVFP4 or GPTQ int4)
@@ -115,6 +115,7 @@ if [[ $REBUILD -eq 1 || "$built_hash" != "$PATCHES_HASH" ]]; then
     --build-arg LIBJPEG_TURBO_VERSION="$LIBJPEG_TURBO_VERSION" --build-arg LIBJPEG_TURBO_SHA256="$LIBJPEG_TURBO_SHA256" \
     --build-arg LIBWEBP_VERSION="$LIBWEBP_VERSION" --build-arg LIBWEBP_SHA256="$LIBWEBP_SHA256" \
     --build-arg PYPDFIUM2_WHEEL_URL="$PYPDFIUM2_WHEEL_URL" --build-arg PYPDFIUM2_AARCH64_SHA256="$PYPDFIUM2_AARCH64_SHA256" \
+    --build-arg FFMPEG_VERSION="$FFMPEG_VERSION" --build-arg FFMPEG_SHA256="$FFMPEG_SHA256" \
     --build-arg TF_RELEASE_VERSION="$TF_RELEASE_VERSION" --build-arg TF_RELEASE_AARCH64_SHA256="$TF_RELEASE_AARCH64_SHA256" \
     --build-arg PATCHES_HASH="$PATCHES_HASH" \
     -f - "$ctx" <<'DOCKERFILE'
@@ -177,13 +178,32 @@ RUN git init -q /tensorfold && cd /tensorfold && git remote add origin "${TF_REP
 COPY patches /opt/tf-patches
 RUN cd /tensorfold && \
     for p in /opt/tf-patches/*.patch; do [ -e "$p" ] || continue; echo "applying $p"; git apply --check "$p" && git apply "$p" || exit 1; done
-# fatbins + native only: the default install also builds tf-cuda-test, which does not compile on 1.1.4 (contract_controls.cu, w4a8_tests.zig)
-RUN cd /tensorfold && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Doptimize=fast --prefix /opt/tensorfold \
-      -j"$(nproc)" fatbins native && \
-    test -x /opt/tensorfold/native/bin/tensorfold-native
+# video input (VIDEO=1) is TensorFold's libtfvideo.so over a static FFmpeg. TensorFold's own tools/zig/build_ffmpeg.sh builds it: the five decoders and two
+# demuxers Qwen video needs, --disable-network, --disable-programs, no shared objects. The tarball is fetched and checked here with sha256sum and its source
+# dir handed to the script, which then skips its own download, so the build is gated on the SHA-256 pinned in scripts/config.sh (the same one that script carries).
+ARG FFMPEG_VERSION
+ARG FFMPEG_SHA256
+RUN mkdir -p /tmp/ffmpeg && cd /tmp/ffmpeg && \
+    curl -fsSL -o ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" && \
+    echo "${FFMPEG_SHA256}  ffmpeg.tar.xz" | sha256sum -c - && tar -xJf ffmpeg.tar.xz && \
+    /tensorfold/tools/zig/build_ffmpeg.sh /opt/ffmpeg /tmp/ffmpeg && \
+    mkdir -p /opt/ffmpeg/share/doc/ffmpeg/objects && \
+    cp "ffmpeg-${FFMPEG_VERSION}/COPYING.LGPLv2.1" "ffmpeg-${FFMPEG_VERSION}/LICENSE.md" /opt/ffmpeg/share/doc/ffmpeg/ && \
+    cp /opt/ffmpeg/lib/*.a /opt/ffmpeg/share/doc/ffmpeg/objects/ && \
+    rm -rf /tmp/ffmpeg
+# fatbins + native + video only: the default install also builds tf-cuda-test, which does not compile on 1.1.4 (contract_controls.cu, w4a8_tests.zig).
+# `video` installs libtfvideo.so to native/lib, where the server's dlopen would find it beside the binary; it moves to libexec/tfvideo, off every candidate
+# path, so only VIDEO=1 (start.sh putting that directory on LD_LIBRARY_PATH) makes a server take video at all.
+RUN cd /tensorfold && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Doptimize=fast -Dffmpeg=/opt/ffmpeg --prefix /opt/tensorfold \
+      -j"$(nproc)" fatbins native video && \
+    test -x /opt/tensorfold/native/bin/tensorfold-native && test -s /opt/tensorfold/native/lib/libtfvideo.so && \
+    mkdir -p /opt/tensorfold/libexec/tfvideo && \
+    mv /opt/tensorfold/native/lib/libtfvideo.so /opt/tensorfold/libexec/tfvideo/libtfvideo.so && \
+    test ! -e /opt/tensorfold/native/lib/libtfvideo.so
 RUN mkdir -p /opt/tensorfold/share/doc/tensorfold && cd /tensorfold && \
     for f in LICENSE LICENSE.md LICENSES NOTICE THIRD_PARTY_NOTICES.md; do \
-      if [ -e "$f" ]; then cp -a "$f" /opt/tensorfold/share/doc/tensorfold/ || exit 1; fi; done
+      if [ -e "$f" ]; then cp -a "$f" /opt/tensorfold/share/doc/tensorfold/ || exit 1; fi; done && \
+    cp -a /opt/ffmpeg/share/doc/ffmpeg /opt/tensorfold/share/doc/ffmpeg
 
 FROM ${BASE_IMAGE}
 COPY --from=build /opt/tensorfold /opt/tensorfold

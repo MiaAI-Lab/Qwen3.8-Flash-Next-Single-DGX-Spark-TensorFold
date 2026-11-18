@@ -5,6 +5,23 @@ Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:
 
 ## Unreleased
 
+**2026-11-18: `VIDEO=1` (new, off by default) serves video parts; the image builds `libtfvideo` over a pinned FFmpeg.**
+The Flash Next CUDA engine had no video path: `cuda_images.zig` prepared no frames and `vision/qwen_cuda_media.zig`
+refused a video token, while the server, the sampler (`zig/src/core/qwen_vl/video.zig`, 2 frames a second, two frames a
+group) and the Triton host already had one. `patches/0005-flashnext-cuda-video.patch` is
+[chai-md](https://github.com/chai-md)'s [#90](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/pull/90)
+re-based onto v1.2.7 by MiaAI-Lab (v1.2.7 added `prep_paged`/`pool_paged` to the tower's fields, so the patch had to be
+re-split); it offers the template's `<|video_pad|>` groups and lets the media plan read a group of video rows beside
+image rows. `prepare.sh` builds the decoder the way TensorFold does: FFmpeg 9.0.2 — the release its
+`tools/zig/build_ffmpeg.sh` pins, fetched and `sha256sum`-checked against that same hash — then `zig build video`, and
+installs `libtfvideo.so` in `/opt/tensorfold/libexec/tfvideo`, off every path the server probes, so `VIDEO=0` (the
+default) cannot reach FFmpeg at all; `VIDEO=1` puts that directory on the loader's path and passes
+`--vision-video-tokens` (it refuses `VIDEO=1` with `VISION=0`). The FFmpeg version and hash join `image_hash()`, and the
+image carries FFmpeg's LGPL-2.1 license and the static archives it was linked from. A clip's frame groups count against
+the same 50-group, 16,384-row budget as images, so the defaults hold roughly 50 seconds of footage a request. Verified
+here: the patch compiles (`zig build check-native-cuda-host`, zig 0.17.0, the real CUDA server without kernels), FFmpeg
+9.0.2 and `libtfvideo.so` build on this Spark. Not run here: `scripts/prepare.sh`'s image rebuild and a live video
+request (`tools/visioncheck.py` covers images only). Test: `tools/test_video_input.py` (offline).
 **2026-11-18: `PDF=1` (new, off by default) serves PDF document parts; the image carries a checksummed PDFium.**
 TensorFold v1.2.7 already reads PDF parts in the server (`zig/src/server/pdf.zig`, `pdf_worker.zig`): Anthropic's
 `{"type": "document"}`, OpenAI's `file` / `input_file`, and an `image_url` carrying a `data:application/pdf;base64,` URL,

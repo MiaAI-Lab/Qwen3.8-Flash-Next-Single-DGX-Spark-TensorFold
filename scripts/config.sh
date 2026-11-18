@@ -77,6 +77,12 @@ LIBWEBP_SHA256=e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564
 PYPDFIUM2_VERSION=5.14.0
 PYPDFIUM2_WHEEL_URL="https://files.pythonhosted.org/packages/92/b4/0c31aa51887cd6cd032191dfe010a6d01ed43cf03204cfbd2184ebe4b715/pypdfium2-5.14.0-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl"
 PYPDFIUM2_AARCH64_SHA256=f1b696e6901e16f114a2ec6332e5e3f8f5033a901614ead28499ab18ca6024f5
+# libtfvideo.so (video input, VIDEO=1) is TensorFold's own tf_video.c over a static FFmpeg: `zig build video -Dffmpeg=PREFIX` links it against the
+# FFmpeg that TensorFold's tools/zig/build_ffmpeg.sh builds from the release its script pins (9.0.2, PyAV 19.0.1's), so the tarball here is the one that
+# script checks its own download against. No release archive carries libtfvideo.so, so the image builds it; VIDEO=0 keeps it off the loader's path, where
+# a server would otherwise find it and take video parts. Decoders only: --disable-network, --disable-programs, H.264, HEVC, VP8, VP9, MPEG-4, MP4/MOV and WebM.
+FFMPEG_VERSION=9.0.2
+FFMPEG_SHA256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
 # libtfgrammar.so (structured output, tool_choice "required" and named functions) comes prebuilt from TensorFold's own release archive, checked against its SHA-256;
 # the archive ships it with xgrammar's Apache-2.0 notices. TF_RELEASE is the release that matches TF_REF.
 TF_RELEASE_VERSION=1.2.7
@@ -87,7 +93,7 @@ image_hash() {
   ( cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
     cat patches/*.patch 2>/dev/null
     sed -n "/<<'DOCKERFILE'/,/^DOCKERFILE\$/p" scripts/prepare.sh
-    echo "$TF_REPO $TF_REF zig-$ZIG_VERSION $ZIG_SHA256 $BASE_IMAGE jpeg-$LIBJPEG_TURBO_VERSION-$LIBJPEG_TURBO_SHA256 webp-$LIBWEBP_VERSION-$LIBWEBP_SHA256 pdfium-$PYPDFIUM2_VERSION-$PYPDFIUM2_AARCH64_SHA256 grammar-$TF_RELEASE_VERSION-$TF_RELEASE_AARCH64_SHA256"
+    echo "$TF_REPO $TF_REF zig-$ZIG_VERSION $ZIG_SHA256 $BASE_IMAGE jpeg-$LIBJPEG_TURBO_VERSION-$LIBJPEG_TURBO_SHA256 webp-$LIBWEBP_VERSION-$LIBWEBP_SHA256 pdfium-$PYPDFIUM2_VERSION-$PYPDFIUM2_AARCH64_SHA256 ffmpeg-$FFMPEG_VERSION-$FFMPEG_SHA256 grammar-$TF_RELEASE_VERSION-$TF_RELEASE_AARCH64_SHA256"
   ) | sha256sum | cut -c1-12
 }
 GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold}"
@@ -155,20 +161,25 @@ DRAFTS="${DRAFTS:-1}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-0.95}"
 TOP_K="${TOP_K:-20}"
-# Image and video. VISION=1 (default) passes --vision: rank 0 starts the Python helper (Pillow, PyAV, the 27-layer
-# tower). VISION=0 is text only and returns the 2 GiB workspace to the KV budget. VISION_URLS=1 also accepts public
-# https:// URLs; the default is data URLs only.
+# Image and video. VISION=1 (default) passes --vision: the engine decodes JPEG and WebP itself (libjpeg-turbo, libwebp's
+# decoder) through the Qwen-VL tower on rank 0. VISION=0 is text only and returns the 2 GiB workspace to the KV budget.
+# VISION_URLS=1 also accepts public https:// URLs; the default is data URLs only.
 VISION="${VISION:-1}"
 VISION_URLS="${VISION_URLS:-0}"
+# VIDEO=1 adds --vision-video-tokens and puts libtfvideo.so (FFmpeg 9.0.2, built by prepare.sh) on the loader's path, which is what
+# lets the server take a video at all: it finds that library by dlopen, so with VIDEO=0 it is off the path and a video part is refused.
+# A video is sampled at 2 frames a second and fed to the tower two frames a group; each group counts as one image against
+# TENSORFOLD_MAX_IMAGES, so 50 holds about 50 seconds of a request's footage, images included. Needs VISION=1.
+VIDEO="${VIDEO:-0}"
 # PDF=1 passes --vision-pdf: PDF document parts (Anthropic's `document`, OpenAI's `file`/`input_file`, and an
 # image_url carrying a data:application/pdf;base64 URL) are rendered to page images by the engine's own PDFium,
 # in a worker process started per document. Off by default: nothing reads a PDF until you ask for it. Needs VISION=1.
 # Caps are the engine's: 32 MiB a document, 16 pages, and the pages share the request's image budget; TENSORFOLD_MAX_PDF_PAGES lowers the page count.
 PDF="${PDF:-0}"
-export TENSORFOLD_MAX_IMAGES="${TENSORFOLD_MAX_IMAGES:-50}"
+export TENSORFOLD_MAX_IMAGES="${TENSORFOLD_MAX_IMAGES:-50}"                    # image groups a request, a video's frame pairs counted among them (the engine's own ceiling is 64)
 MAX_VIDEOS="${MAX_VIDEOS:-4}"                                          # videos a request (--vision-max-videos)
 export TENSORFOLD_IMAGE_TOKENS="${TENSORFOLD_IMAGE_TOKENS:-16384}"
-export TENSORFOLD_VIDEO_TOKENS="${TENSORFOLD_VIDEO_TOKENS:-16384}"
+export TENSORFOLD_VIDEO_TOKENS="${TENSORFOLD_VIDEO_TOKENS:-16384}"     # a request's video row budget (--vision-video-tokens, VIDEO=1)
 export TENSORFOLD_VISION_WORKSPACE_MIB="${TENSORFOLD_VISION_WORKSPACE_MIB:-2048}"
 # The engine keeps this much MemAvailable free when it sizes the KV pool. prepare.sh and start.sh refuse a Spark
 # that has less than this free.
