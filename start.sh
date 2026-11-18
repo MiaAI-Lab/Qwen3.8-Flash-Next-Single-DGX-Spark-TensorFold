@@ -36,7 +36,7 @@ for arg in "$@"; do [[ "$arg" == -h || "$arg" == --help ]] && { usage; exit 0; }
 [[ "$PARALLEL" =~ ^([1-9]|1[0-6])$ ]] || die "PARALLEL is 1 to 16, not $PARALLEL"
 [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] || die "MAX_TOKENS is a token count, not $MAX_TOKENS"
 for v in THINKING DRAFTS VISION VISION_URLS; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
-(( CONTEXT <= 262144 )) || die "CONTEXT=$CONTEXT is past 262,144: TensorFold 1.1.4's Flash Next engine has no YaRN extension"
+(( CONTEXT <= 262144 )) || die "CONTEXT=$CONTEXT is past 262,144: TensorFold 1.2.7's Flash Next engine has no YaRN extension"
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 
 SERVE_ARGS=(--context "$CONTEXT" --parallel "$PARALLEL" --max-tokens "$MAX_TOKENS"

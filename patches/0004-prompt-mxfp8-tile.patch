@@ -1,0 +1,580 @@
+diff --git a/zig/kernels/cuda/qmmf.cu b/zig/kernels/cuda/qmmf.cu
+index 25c091c1..2e70e8db 100644
+--- a/zig/kernels/cuda/qmmf.cu
++++ b/zig/kernels/cuda/qmmf.cu
+@@ -243,8 +243,148 @@ BF16_K32(true)
+ template __global__ void reduce_kernel<true>(const float* __restrict__, void* __restrict__, long long, int, float);
+ template __global__ void reduce_kernel<false>(const float* __restrict__, void* __restrict__, long long, int, float);
+ 
++// ---- MXFP8 prompt rows on a 128 x 128 tile (relaxed): the block scale rides in the B fragment, one fp32 chain over K ----
++//
++// The exact kernels above add each 32-input group's mma sum to the accumulator with one fmaf per element. Here the
++// e4m3 code times its UE8M0 scale is formed exactly in bf16 (a power-of-two multiply), so a warp issues only mma
++// instructions over the whole of K. Rows are summed in the same order whatever the chunk holds (a row's bits do not
++// depend on M or on the tile it falls in), but they are not the exact kernels' bits; callers gate it (TF_FLASHNEXT_PROMPT_MX128).
++// Two stages and two blocks an SM: one block's output stores and pipeline fill overlap the other's K loop.
++template <int BM, int BN, int WM, int WN, int STAGES, bool F32>
++__device__ __forceinline__ void prompt_mx_body(
++        const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
++        float scale, void* __restrict__ out, int M, int N, int K, int npad, int ldx, int group) {
++    using T = Tile<MXFP8, BM, BN, WM, WN, STAGES>;
++    extern __shared__ __align__(128) unsigned char buf[];
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    const int wm = warp / WN, wn = warp % WN;
++    const int KG = K / GS;
++    const int2 at = tile_of(blockIdx.x, M, N, BM, BN, group);
++    const int m0 = at.x, n0 = at.y;
++
++    auto stage = [&](int s) { return buf + s * T::STAGE; };
++    auto load = [&](int s, int g) {
++        unsigned char* p = stage(s);
++        for (int c = tid; c < BM * T::CHUNKS; c += T::THREADS) {
++            const int r = c / T::CHUNKS, ch = c % T::CHUNKS;
++            const int row = min(m0 + r, M - 1);
++            cp16z(p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16, x + static_cast<size_t>(row) * ldx + g * GS + ch * 8,
++                  m0 + r < M);
++        }
++        unsigned char* pw = p + T::X;
++        constexpr int TILE_BYTES = 64 * GS;
++        for (int c = tid; c < T::W / 16; c += T::THREADS) {
++            const int t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
++            if (n0 + t * 64 < npad) cp16(pw + c * 16, w + (static_cast<size_t>(n0 / 64 + t) * KG + g) * TILE_BYTES + off * 16);
++        }
++        unsigned char* ps = pw + T::W;
++        constexpr int PER = T::S / (BN / 64);
++        for (int c = tid; c < T::S / 16; c += T::THREADS) {
++            const int t = c / (PER / 16), off = c % (PER / 16);
++            if (n0 + t * 64 < npad) cp16(ps + c * 16, bs + (static_cast<size_t>(n0 / 64 + t) * KG + g) * PER + off * 16);
++        }
++    };
++
++    float acc[T::MT][T::NT][4];
++#pragma unroll
++    for (int i = 0; i < T::MT; ++i)
++#pragma unroll
++        for (int j = 0; j < T::NT; ++j)
++#pragma unroll
++            for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
++#pragma unroll
++    for (int s = 0; s < STAGES - 1; ++s) {
++        if (s < KG) load(s, s);
++        commit();
++    }
++    for (int g = 0; g < KG; ++g) {
++        wait<STAGES - 2>();
++        __syncthreads();
++        if (g + STAGES - 1 < KG) load((g + STAGES - 1) % STAGES, g + STAGES - 1);
++        commit();
++        const unsigned char* p = stage(g % STAGES);
++        const unsigned char* pw = p + T::X;
++        const uint8_t* ps = p + T::X + T::W;
++        uint4 wq[T::NT];
++        uint32_t sv[T::NT][2];
++#pragma unroll
++        for (int j = 0; j < T::NT; ++j) {
++            const int jj = wn * T::NT + j;
++            const int col = (jj & 7) * 8 + (lane >> 2);
++            wq[j] = reinterpret_cast<const uint4*>(pw)[jj * 32 + lane];
++            const uint32_t e2 = *reinterpret_cast<const uint16_t*>(ps + (jj >> 3) * 128 + col * 2);
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++                const uint32_t u = (((e2 >> (8 * h)) & 0xFFu) + 120u) << 7;  // 2^(e - 7), the 2^-120 of the shifted code folded in
++                sv[j][h] = u | (u << 16);
++            }
++        }
++#pragma unroll
++        for (int kt = 0; kt < GS / 16; ++kt) {
++            uint32_t a[T::MT][4];
++#pragma unroll
++            for (int i = 0; i < T::MT; ++i) {
++                const int r = wm * (BM / WM) + i * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
++                const int ch = kt * 2 + (lane >> 4);
++                ldmatrix4(a[i], p + r * T::ROW + swz<T::CHUNKS>(r, ch) * 16);
++            }
++#pragma unroll
++            for (int j = 0; j < T::NT; ++j) {
++                const uint32_t word = comp(wq[j], kt);
++                const uint32_t unit = sv[j][kt >> 1];
++                const uint32_t b0 = tf_common::fp8pair_unit(word & 0xFFFFu, unit);
++                const uint32_t b1 = tf_common::fp8pair_unit(word >> 16, unit);
++#pragma unroll
++                for (int i = 0; i < T::MT; ++i) mma(acc[i][j], a[i], b0, b1);
++            }
++        }
++    }
++    wait<0>();
++#pragma unroll
++    for (int i = 0; i < T::MT; ++i)
++#pragma unroll
++        for (int j = 0; j < T::NT; ++j) {
++            const int col = n0 + wn * (BN / WN) + j * 8 + (lane & 3) * 2;
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++                const int row = m0 + wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
++                if (row >= M) continue;
++                const float v0 = acc[i][j][2 * h] * scale, v1 = acc[i][j][2 * h + 1] * scale;
++                if (F32) {
++                    float* dst = reinterpret_cast<float*>(out) + static_cast<size_t>(row) * N + col;
++                    if (col < N) dst[0] = v0;
++                    if (col + 1 < N) dst[1] = v1;
++                } else {
++                    __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(out) + static_cast<size_t>(row) * N + col;
++                    if (col + 1 < N && (N & 1) == 0)
++                        *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v0, v1);
++                    else {
++                        if (col < N) dst[0] = __float2bfloat16_rn(v0);
++                        if (col + 1 < N) dst[1] = __float2bfloat16_rn(v1);
++                    }
++                }
++            }
++        }
+ }
+ 
++}  // namespace tf_qmmf
++
++#define TF_PROMPT_MX(NAME, BM, BN, WM, WN, ST, F32, MINB)                                                              \
++    extern "C" __global__ void __launch_bounds__(WM * WN * 32, MINB) NAME(                                             \
++        const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,     \
++        float scale, void* __restrict__ out, int M, int N, int K, int npad, int ldx, int group) {                      \
++        tf_qmmf::prompt_mx_body<BM, BN, WM, WN, ST, F32>(x, w, bs, scale, out, M, N, K, npad, ldx, group);            \
++    }
++
++// Names the Zig launcher loads (qmmf.zig Lane.prompt_mx): block rows x columns, warps, stages, bf16 or fp32 out, blocks an SM.
++TF_PROMPT_MX(tf_qmmf_prompt_mx_bf16, 128, 128, 2, 4, 2, false, 2)
++TF_PROMPT_MX(tf_qmmf_prompt_mx_f32, 128, 128, 2, 4, 2, true, 2)
++// Short calls (a few dozen rows): 64 x 64 blocks of four warps, four stages, so a call has four times the blocks. Each output's
++// mma chain over K is the 128 x 128 tile's (rows and columns are independent in the mma), so the bits are the same.
++TF_PROMPT_MX(tf_qmmf_prompt_mx64_bf16, 64, 64, 1, 4, 4, false, 2)
++TF_PROMPT_MX(tf_qmmf_prompt_mx64_f32, 64, 64, 1, 4, 4, true, 2)
++#undef TF_PROMPT_MX
++
+ #if defined(TF_NATIVE_FP_DECODE)
+ // tf-cuda-test native-fp: e2m1_pairs == fp4pair on all words, codes x e4m3 scales; out: misses, first, checks
+ extern "C" __global__ void tf_qmmf_native_fp4_check(unsigned long long* __restrict__ out) {
+diff --git a/zig/src/cuda/qmmf.zig b/zig/src/cuda/qmmf.zig
+index 559f8db0..ed4702d2 100644
+--- a/zig/src/cuda/qmmf.zig
++++ b/zig/src/cuda/qmmf.zig
+@@ -157,6 +157,12 @@ fn loadTiles(mod: Module, comptime mode: Mode, comptime wide: bool) ![7]Function
+ pub const prompt_shared: u32 = 3 * (128 + 128) * group * 2 + 128;
+ pub const prompt_rows: usize = 512;
+ pub const prompt_k32_shared: u32 = 3 * (128 + 128) * 32 * 2;
++/// The relaxed MXFP8 prompt tile's dynamic shared bytes: 2 stages of 128 input rows (16 KiB), 128 weight columns (8 KiB)
++/// and their scales; two blocks fit an SM.
++pub const prompt_mx_shared: u32 = 2 * ((128 * 128 + 128 * group + 128 * 2 + 127) / 128 * 128);
++/// Its short-call form (64 x 64 blocks, four stages; the same bits): calls of prompt_mx_small_rows rows or fewer.
++pub const prompt_mx64_shared: u32 = 4 * ((64 * 128 + 64 * group + 64 * 2 + 127) / 128 * 128);
++pub const prompt_mx_small_rows: usize = 128;
+ 
+ pub fn promptK32Symbol(comptime out: Out) [:0]const u8 {
+     return std.fmt.comptimePrint("_ZN7tf_qmmf22qmmf_prompt_k32_kernelILb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{@intFromBool(out == .f32)});
+@@ -188,6 +194,9 @@ pub const Lane = struct {
+     prompt: ?[2][2]Function = null, // Out, then plain / fused; loadPrompt() fills it on sm_12x
+     prompt_k32: ?[2]Function = null, // Out; unsplit BF16 prompt calls, loadPrompt() fills it on sm_12x
+     prompt_sms: usize = 0, // the device's SMs: the tile runs when its blocks fill more than half of them
++    prompt_mx: ?[2][2]Function = null, // Out, then 128 x 128 / 64 x 64: the relaxed MXFP8 prompt tile, loadPromptMx() fills it
++    // the narrowest MXFP8 projection that tile takes: by the weight's width alone, so a row's bits never depend on its chunk
++    prompt_mx_min: usize = 0,
+     clusters: bool, // sm_90 on: slices meet in a cluster's shared memory
+ 
+     pub fn load(d: *const Driver, capability_major: u32) !Lane {
+@@ -244,6 +253,20 @@ pub const Lane = struct {
+         l.prompt_sms = @intCast(@max(sms, 1));
+     }
+ 
++    /// The relaxed MXFP8 prompt tile (qmmf.cu prompt_mx_body) for MXFP8 weights `min_n` columns wide or more; 0: not loaded.
++    /// Only families whose prompt passes may leave the exact kernels' bits call this.
++    pub fn loadPromptMx(l: *Lane, min_n: usize) !void {
++        if (min_n == 0) return;
++        var mx: [2][2]Function = undefined;
++        const names = [2][2][:0]const u8{ .{ "tf_qmmf_prompt_mx_bf16", "tf_qmmf_prompt_mx64_bf16" }, .{ "tf_qmmf_prompt_mx_f32", "tf_qmmf_prompt_mx64_f32" } };
++        for (&mx, names) |*pair, pn| for (pair, pn, [2]u32{ prompt_mx_shared, prompt_mx64_shared }) |*f, name, bytes| {
++            f.* = try l.mod.function(name);
++            try f.allowDynamicShared(bytes);
++        };
++        l.prompt_mx = mx;
++        l.prompt_mx_min = min_n;
++    }
++
+     pub fn unload(l: *Lane) void {
+         l.mod.unload();
+     }
+@@ -273,6 +296,43 @@ pub const Lane = struct {
+             2 * promptBlocks(m, w.n) > l.prompt_sms;
+     }
+ 
++    /// Whether a prompt pass's call takes the relaxed MXFP8 tile: loaded, and an MXFP8 weight `prompt_mx_min` wide or more.
++    pub fn takesPromptMx(l: Lane, w: Weight) bool {
++        return l.prompt_mx != null and l.prompt_mx_min != 0 and w.mode == .mxfp8 and w.n >= l.prompt_mx_min;
++    }
++
++    /// y [m, n] = x times an MXFP8 weight on the 128 x 128 prompt tile whose block scales ride in the B fragment: one fp32
++    /// chain over K, no K slices, written as `out` says. Not the exact kernels' bits (takesPromptMx gates it).
++    pub fn matmulPromptMx(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out) !void {
++        return l.matmulPromptMxTile(s, x, ldx, m, w, y, out, m <= prompt_mx_small_rows);
++    }
++
++    /// matmulPromptMx on the 128 x 128 tile or (`small`) its 64 x 64 form: the same bits either way.
++    pub fn matmulPromptMxTile(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out, small: bool) !void {
++        const fns = l.prompt_mx orelse return error.PromptTileUnavailable;
++        if (w.mode != .mxfp8) return error.PromptTileUnavailable;
++        const tile: usize = if (small) 64 else 128;
++        const rows_t = (m + tile - 1) / tile;
++        const band = @max(1, @min(rows_t, (12 << 20) / (tile * w.k * 2)));
++        var args: launch_.Args = .{};
++        args.add(x);
++        args.add(w.codes);
++        args.add(w.scales);
++        args.add(w.scale);
++        args.add(y);
++        args.add(@as(i32, @intCast(m)));
++        args.add(@as(i32, @intCast(w.n)));
++        args.add(@as(i32, @intCast(w.k)));
++        args.add(@as(i32, @intCast(w.npad)));
++        args.add(@as(i32, @intCast(if (m == 1) w.k else ldx)));
++        args.add(@as(i32, @intCast(band)));
++        try launch_.launch(fns[@backingInt(out)][@intFromBool(small)], .{
++            .grid = .{ .x = @intCast(rows_t * ((w.n + tile - 1) / tile)), .y = 1, .z = 1 },
++            .block = .{ .x = if (small) 128 else 256, .y = 1, .z = 1 },
++            .shared = if (small) prompt_mx64_shared else prompt_mx_shared,
++        }, s, &args);
++    }
++
+     /// matmul() writing y as `out` says: bf16, or fp32.
+     pub fn matmulOut(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out, part: u64) !void {
+         const p = planFor(m, w, l.clusters);
+@@ -386,6 +446,12 @@ test "tile shared bytes, slices and row tiles as the Python host picks them" {
+     try std.testing.expect(r.reduce and !r.cluster);
+ }
+ 
++test "the relaxed MXFP8 prompt tile's two stages fit two blocks in an SM" {
++    try std.testing.expectEqual(@as(u32, 49664), prompt_mx_shared);
++    try std.testing.expect(2 * prompt_mx_shared <= 100 * 1024);
++    try std.testing.expectEqual(@as(u32, 49664), prompt_mx64_shared);
++}
++
+ test "instance names are qmmf.cu's" {
+     try std.testing.expectEqualStrings("_ZN7tf_qmmf11qmmf_kernelILi4ELi64ELi64ELi1ELi4ELi4ELb1ELb0ELb1EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", symbol(.bf16, 64, false, true, true));
+     try std.testing.expectEqualStrings("_ZN7tf_qmmf11qmmf_kernelILi2ELi16ELi64ELi1ELi4ELi4ELb0ELb1ELb0EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", symbol(.mxfp8, 16, true, false, false));
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index 73ed0426..9a53515d 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -129,8 +129,8 @@ pub fn Pass(comptime Tri: type) type {
+ 
+         /// qmm.cu's arithmetic over m rows into out (bf16) or part (fp32 K slices); returns the slices (1 when folded).
+         pub fn lane(self: *Self, x: u64, xs: u64, w: Q4, out: u64, part: u64, m: usize, sk: usize) !usize {
+-            if (try zs.lane(self.k, self.stream, self.s, self.zero_slices, x, w, part, m, sk)) |one| return one;
+-            return tiles.matmul(self.k, self.stream, x, xs, w, out, part, self.s.native_part, m, sk);
++            if (try zs.lane(self.k, self.stream, self.s, self.zero_slices, x, w, part, m, sk, self.hooks.prompt)) |one| return one;
++            return tiles.matmul(self.k, self.stream, x, xs, w, out, part, self.s.native_part, m, sk, self.hooks.prompt);
+         }
+         pub fn sumSlices(self: *Self, part: u64, out: u64, bf16: bool, n: usize, sk: usize) !void {
+             return ops.sumSlices(self.k, self.stream, part, out, bf16, n, sk);
+diff --git a/zig/src/families/flashnext/cuda_batch_kernels.zig b/zig/src/families/flashnext/cuda_batch_kernels.zig
+index 548a10b6..67832844 100644
+--- a/zig/src/families/flashnext/cuda_batch_kernels.zig
++++ b/zig/src/families/flashnext/cuda_batch_kernels.zig
+@@ -41,6 +41,7 @@ pub const Forms = struct {
+     in_pass: bool = true, // TF_FLASHNEXT_KEEP_INPASS
+     readout_rows: usize = 64, // TF_FLASHNEXT_READOUT_ROWS (maxInt: never)
+     fact_rows: usize = 64, // TF_FLASHNEXT_FACT_ROWS (maxInt: never)
++    mx_min_n: usize = 1024, // TF_FLASHNEXT_PROMPT_MX128 (0: the exact kernels in prompt passes too)
+ 
+     pub fn resolve() Forms {
+         return .{
+@@ -49,6 +50,7 @@ pub const Forms = struct {
+             .in_pass = @import("cuda_lanes_snap.zig").keepInPass(),
+             .readout_rows = @import("cuda_chunk.zig").readoutTileRows(),
+             .fact_rows = @import("cuda_nvfp4_tile.zig").factRows(),
++            .mx_min_n = @import("cuda_prompt_knobs.zig").mx128MinN(),
+         };
+     }
+ };
+@@ -116,6 +118,7 @@ pub const Kernels = struct {
+         k.native_lane = try cuda.qmmf.Lane.load(d, (try d.currentCapability()) / 10); // the current device: its tiles
+         errdefer k.native_lane.unload();
+         if (envOn("TF_FLASHNEXT_PROMPT_BF16")) try k.native_lane.loadPrompt(d); // the shapes qmmf-prompt-bench times
++        try k.native_lane.loadPromptMx(k.forms.mx_min_n); // prompt passes only (nativeMatmulFor)
+         var device: c_int = 0;
+         var sms: c_int = 0;
+         try d.check(d.api.cuDeviceGet(&device, 0), "cuDeviceGet");
+@@ -150,6 +153,13 @@ pub const Kernels = struct {
+         return k.native_lane.matmulOut(s, x, ldx, m, w, y, out, part);
+     }
+ 
++    /// nativeMatmul, but a prompt pass's (`prompt`) MXFP8 projections of forms.mx_min_n columns or more take the relaxed
++    /// 128 x 128 MXFP8 tile (one fp32 chain over K, no slices: `y` holds the whole sum).
++    pub fn nativeMatmulFor(k: *const Kernels, prompt: bool, s: cuda.Stream, x: u64, ldx: usize, m: usize, w: cuda.qmmf.Weight, y: u64, part: u64, out: cuda.qmmf.Out) !void {
++        if (prompt and k.native_lane.takesPromptMx(w)) return k.native_lane.matmulPromptMx(s, x, ldx, m, w, y, out);
++        return k.nativeMatmul(s, x, ldx, m, w, y, part, out);
++    }
++
+     /// TF_FLASHNEXT_PROFILE=1: each chunk's wall time (synchronized) and its host n-gram gather on stderr.
+     pub fn profile() bool {
+         const v = std.c.getenv("TF_FLASHNEXT_PROFILE") orelse return false;
+diff --git a/zig/src/families/flashnext/cuda_disk.zig b/zig/src/families/flashnext/cuda_disk.zig
+index 697bd7ba..9f3c66da 100644
+--- a/zig/src/families/flashnext/cuda_disk.zig
++++ b/zig/src/families/flashnext/cuda_disk.zig
+@@ -167,6 +167,7 @@ pub fn policyOf(c: anytype) [13]u64 {
+     grids.update(std.mem.asBytes(&k.fp8.resident));
+     if (k.expert_tile) |x| grids.update(std.mem.asBytes(&x.resident));
+     grids.update(std.mem.asBytes(&k.native_lane.prompt_sms)); // a BF16 prompt tile runs over half these SMs' worth
++    grids.update(std.mem.asBytes(&f.mx_min_n)); // TF_FLASHNEXT_PROMPT_MX128: the MXFP8 projections on the relaxed prompt tile
+     return .{
+         // TF_FLASHNEXT_CHUNK_SOLO and _CHUNK as resolved: a pass's rows alone, and beside a decoding stream
+         e.chunk,
+diff --git a/zig/src/families/flashnext/cuda_prompt_knobs.zig b/zig/src/families/flashnext/cuda_prompt_knobs.zig
+new file mode 100644
+index 00000000..672d80bf
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_prompt_knobs.zig
+@@ -0,0 +1,13 @@
++//! Prompt-pass switches read once at load (environment).
++const std = @import("std");
++
++/// TF_FLASHNEXT_PROMPT_MX128=N: MXFP8 projections N columns wide or more take the relaxed 128 x 128 MXFP8 tile in prompt
++/// passes (default 1024); 0 keeps the exact kernels everywhere. The tile's rows are not the exact kernels' bits.
++pub fn mx128MinN() usize {
++    const v = std.c.getenv("TF_FLASHNEXT_PROMPT_MX128") orelse return 1024;
++    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch 1024;
++}
++
++test "unset, the MXFP8 projections of 1,024 columns or more take the prompt tile" {
++    if (std.c.getenv("TF_FLASHNEXT_PROMPT_MX128") == null) try std.testing.expectEqual(@as(usize, 1024), mx128MinN());
++}
+diff --git a/zig/src/families/flashnext/cuda_tiles.zig b/zig/src/families/flashnext/cuda_tiles.zig
+index b62e0e79..a003ec3d 100644
+--- a/zig/src/families/flashnext/cuda_tiles.zig
++++ b/zig/src/families/flashnext/cuda_tiles.zig
+@@ -32,14 +32,15 @@ fn sweepOf(m: usize, bm: usize, k: usize) usize {
+ }
+ 
+ /// x [m, k] times w: the native lane, the 16-row lane tile, or from 64 rows the prompt tile (folded with K slices).
+-pub fn matmul(k: *const Kernels, stream: cuda.Stream, x: u64, xs: u64, w: Q4, out: u64, part: u64, native_part: u64, m: usize, sk: usize) !usize {
++/// `prompt`: a prompt pass's rows, which may take the relaxed MXFP8 tile (Kernels.nativeMatmulFor).
++pub fn matmul(k: *const Kernels, stream: cuda.Stream, x: u64, xs: u64, w: Q4, out: u64, part: u64, native_part: u64, m: usize, sk: usize, prompt: bool) !usize {
+     if (w.native) |native| {
+         if (sk == 1) {
+-            try k.nativeMatmul(stream, x, w.k, m, native, out, native_part, .bf16);
++            try k.nativeMatmulFor(prompt, stream, x, w.k, m, native, out, native_part, .bf16);
+             return 1;
+         }
+         // the native lane has reduced its own slices: that slice and one zero slice give the old sums' bits (-0 to +0)
+-        try k.nativeMatmul(stream, x, w.k, m, native, part, native_part, .f32);
++        try k.nativeMatmulFor(prompt, stream, x, w.k, m, native, part, native_part, .f32);
+         const bytes = m * w.n * 4;
+         try stream.d.check(stream.d.api.cuMemsetD8Async(part + bytes, 0, bytes, stream.handle), "cuMemsetD8Async");
+         return 2;
+diff --git a/zig/src/families/flashnext/cuda_zero_slice.zig b/zig/src/families/flashnext/cuda_zero_slice.zig
+index 17e91dc6..f19841cb 100644
+--- a/zig/src/families/flashnext/cuda_zero_slice.zig
++++ b/zig/src/families/flashnext/cuda_zero_slice.zig
+@@ -11,12 +11,12 @@ pub fn spends(native: bool, sk: usize, m: usize, n: usize, cap: usize) bool {
+ }
+ 
+ /// Pass.lane into s.part: spends the zero slice as it must; `zero` and native: one slice, no clears (1), else null.
+-pub fn lane(k: *const parts.Kernels, stream: cuda.Stream, s: *parts.Scratch, zero: bool, x: u64, w: wt.Q4, part: u64, m: usize, sk: usize) !?usize {
++pub fn lane(k: *const parts.Kernels, stream: cuda.Stream, s: *parts.Scratch, zero: bool, x: u64, w: wt.Q4, part: u64, m: usize, sk: usize, prompt: bool) !?usize {
+     if (part != s.part) return null;
+     if (spends(w.native != null, sk, m, w.n, s.cap)) s.part_zero = false;
+     const native = w.native orelse return null;
+     if (!zero or sk == 1) return null;
+-    try k.nativeMatmul(stream, x, w.k, m, native, part, s.native_part, .f32);
++    try k.nativeMatmulFor(prompt, stream, x, w.k, m, native, part, s.native_part, .f32);
+     return 1;
+ }
+ 
+diff --git a/zig/src/native/cuda_disk_policy_test.zig b/zig/src/native/cuda_disk_policy_test.zig
+index bfb77eb7..3d5dcfe9 100644
+--- a/zig/src/native/cuda_disk_policy_test.zig
++++ b/zig/src/native/cuda_disk_policy_test.zig
+@@ -176,6 +176,9 @@ test "disk identity: Flash Next CUDA resolved prompt rows, kernel forms and expe
+         try changed.append(t.allocator, try flashKey(&x, &c));
+         @field(k.forms, field) = 64;
+     }
++    k.forms.mx_min_n = 0; // TF_FLASHNEXT_PROMPT_MX128=0: the MXFP8 projections on the exact kernels
++    try changed.append(t.allocator, try flashKey(&x, &c));
++    k.forms.mx_min_n = 1024;
+     k.expert_tile = .{ .mod = undefined, .fns = undefined, .resident = .{ 64, 64 }, .selection = .up };
+     const up = try flashKey(&x, &c);
+     k.expert_tile.?.selection = .both; // the same grids: the selection alone moves the key
+@@ -216,7 +219,7 @@ test "disk identity: Flash Next CUDA prompt forms take each setting's value at l
+     const env = @import("sys").env;
+     const Engine = @typeInfo(@FieldType(flash.Cuda, "engine")).pointer.child;
+     const Forms = @FieldType(@FieldType(Engine, "batch_k"), "forms");
+-    const names = [_][:0]const u8{ "TF_FLASHNEXT_GDN_FUSED", "TF_FLASHNEXT_HC_FUSE", "TF_FLASHNEXT_KEEP_INPASS", "TF_FLASHNEXT_READOUT_ROWS", "TF_FLASHNEXT_FACT_ROWS" };
++    const names = [_][:0]const u8{ "TF_FLASHNEXT_GDN_FUSED", "TF_FLASHNEXT_HC_FUSE", "TF_FLASHNEXT_KEEP_INPASS", "TF_FLASHNEXT_READOUT_ROWS", "TF_FLASHNEXT_FACT_ROWS", "TF_FLASHNEXT_PROMPT_MX128" };
+     for (names) |n| _ = env.unsetenv(n);
+     defer for (names) |n| {
+         _ = env.unsetenv(n);
+@@ -224,7 +227,7 @@ test "disk identity: Flash Next CUDA prompt forms take each setting's value at l
+     try t.expectEqualDeep(Forms{}, Forms.resolve());
+     for (names) |n| _ = env.setenv(n, "0", 1);
+     const never = std.math.maxInt(usize);
+-    try t.expectEqualDeep(Forms{ .gdn_fused = false, .hc_fuse = false, .in_pass = false, .readout_rows = never, .fact_rows = never }, Forms.resolve());
++    try t.expectEqualDeep(Forms{ .gdn_fused = false, .hc_fuse = false, .in_pass = false, .readout_rows = never, .fact_rows = never, .mx_min_n = 0 }, Forms.resolve());
+     _ = env.setenv("TF_FLASHNEXT_READOUT_ROWS", "128", 1);
+     _ = env.setenv("TF_FLASHNEXT_FACT_ROWS", "32", 1);
+     try t.expectEqual(@as(usize, 128), Forms.resolve().readout_rows);
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index d5762d4f..bd935a5a 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -260,6 +260,7 @@ const usage =
+     \\  qmmf-prompt-contract     K64 and K32 replacement gates with both new output controls
+     \\  qmmf-prompt-repro        isolate M=65 N=8240 K=2560 SK=4 BF16 without clusters
+     \\  qmmf-prompt-bench        rank0 normal-main weighted A-B-A timings, plus separate MTP hidden timings
++    \\  qmmf-prompt-mx           relaxed MXFP8 prompt tile: FP64 bound, row bytes independent of the call's rows, timed against the lane
+     \\  qmm-prefill-many-bench    same-process A-B-A screening for the GB10 launch fusion
+     \\  mtp-rows                  tf_q36m_attn_rows: gates 1-4 (byte-equal to tf_q36m_attn a segment) and float64 alone
+     \\  qwen-pages                qwen35.cu's attention cache through a page table: paged == contiguous, float64, red controls
+@@ -388,6 +389,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "nvfp4-b32")) return nvfp4_b32_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "qmmf-prompt")) return @import("qmmf_prompt_tests.zig").run(gpu);
+     if (std.mem.eql(u8, cmd, "qmmf-prompt-contract")) return @import("contract_qmmf_prompt.zig").run(gpu);
++    if (std.mem.eql(u8, cmd, "qmmf-prompt-mx")) return @import("qmmf_prompt_mx_tests.zig").run(gpu);
+     if (std.mem.eql(u8, cmd, "qmmf-prompt-repro")) return @import("qmmf_prompt_tests.zig").repro(gpu);
+     if (std.mem.eql(u8, cmd, "qmmf-prompt-bench")) return @import("qmmf_prompt_tests.zig").bench(gpu);
+     if (std.mem.eql(u8, cmd, "lane-half")) return lane_half_tests.run(gpu);
+diff --git a/zig/tests/cuda/qmmf_prompt_mx_tests.zig b/zig/tests/cuda/qmmf_prompt_mx_tests.zig
+new file mode 100644
+index 00000000..b21c3700
+--- /dev/null
++++ b/zig/tests/cuda/qmmf_prompt_mx_tests.zig
+@@ -0,0 +1,134 @@
++//! The relaxed MXFP8 prompt tile (qmmf.cu prompt_mx_body, TF_FLASHNEXT_PROMPT_MX128) at Flash Next's MXFP8 shapes: FP64-bounded,
++//! each row's bytes the same whatever rows share its call or the tile it falls in, bf16 out the rounded fp32 sum, then timed
++//! against the exact lane.
++const std = @import("std");
++const cuda = @import("cuda");
++const check = @import("check.zig");
++const rig = @import("flashnext_rig.zig");
++
++const Shape = struct { name: []const u8, n: usize, k: usize };
++
++/// The MXFP8 projections a Flash Next prompt pass puts on the tile (1,024 columns or more), and an edge of a partial tile.
++const shapes = [_]Shape{
++    .{ .name = "DeltaNet input", .n = 16480, .k = 2560 },
++    .{ .name = "attention input", .n = 13952, .k = 2560 },
++    .{ .name = "mixer output", .n = 2560, .k = 6144 },
++    .{ .name = "partial tile", .n = 1088, .k = 640 },
++};
++const full_rows: usize = 3072;
++const cuts = [_]usize{ 1, 77, 128, 300 };
++const shift: usize = 5;
++
++/// A random MXFP8 weight packed for the lane, and its exact float64 values [n][k].
++fn build(r: *rig.Rig, a: std.mem.Allocator, rng: std.Random, sh: Shape) !struct { w: cuda.qmmf.Weight, deq: []f64 } {
++    const codes = try a.alloc(u8, sh.n * sh.k);
++    for (codes) |*c| c.* = rng.int(u8) & 0xF7; // no e4m3 NaN (0x7F, 0xFF)
++    const scales = try a.alloc(u8, sh.n * sh.k / 32);
++    for (scales) |*s| s.* = 120 + rng.uintLessThan(u8, 8);
++    const deq = try a.alloc(f64, sh.n * sh.k);
++    for (deq, 0..) |*o, i| o.* = @import("core").quant.fp8.e4m3(codes[i]) * std.math.pow(f64, 2, @as(f64, @floatFromInt(@as(i32, scales[i / 32]) - 127)));
++    const pc = try a.alloc(u8, cuda.mxfp8.padded(sh.n) * sh.k);
++    cuda.mxfp8.packCodes(pc, codes, sh.n, sh.k);
++    const ps = try a.alloc(u8, cuda.mxfp8.padded(sh.n) * (sh.k / 32));
++    cuda.mxfp8.packScales(ps, scales, sh.n, sh.k);
++    return .{ .w = cuda.mxfp8.weight(try r.dev(pc), try r.dev(ps), sh.n, sh.k), .deq = deq };
++}
++
++pub fn run(gpu: check.Gpu) !void {
++    var arena = std.heap.ArenaAllocator.init(gpu.gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var prng = std.Random.DefaultPrng.init(0x3128_0a);
++    var r = try rig.Rig.init(gpu, a, prng.random());
++    defer r.deinit();
++    var lane = try cuda.qmmf.Lane.load(gpu.d, @intCast(try gpu.ctx.capability() / 10));
++    defer lane.unload();
++    try lane.loadPromptMx(1024);
++    for (shapes) |sh| {
++        const built = try build(&r, a, prng.random(), sh);
++        const w = built.w;
++        try check.expect(lane.takesPromptMx(w), "{s}: the tile takes an MXFP8 weight of {d} columns", .{ sh.name, sh.n });
++        const ldx = sh.k + 64; // rows apart, as a pass's views are
++        const xs = r.bfs((full_rows + shift) * ldx, 1.0);
++        const x = try r.dev(std.mem.sliceAsBytes(xs));
++        const f32_bytes = full_rows * sh.n * 4;
++        const full = try r.out(f32_bytes);
++        try lane.matmulPromptMx(r.s, x, ldx, full_rows, w, full, .f32);
++        try r.s.synchronize();
++        const want = try r.back(f32, full, full_rows * sh.n);
++        // fewer rows, and rows shifted off the 128-row tiles: each row's bytes the full call's
++        for (cuts) |m| {
++            const y = try r.out(m * sh.n * 4);
++            try lane.matmulPromptMx(r.s, x, if (m == 1) sh.k else ldx, m, w, y, .f32);
++            try r.s.synchronize();
++            try check.sameBytes("prompt tile rows at fewer rows", std.mem.sliceAsBytes(try r.back(f32, y, m * sh.n)), std.mem.sliceAsBytes(want[0 .. m * sh.n]));
++        }
++        // the 64 x 64 form on many rows, the 128 x 128 one on a few: each row's bytes the same
++        for ([_]usize{ 300, 40 }, [_]bool{ true, false }) |m, small| {
++            const y = try r.out(m * sh.n * 4);
++            try lane.matmulPromptMxTile(r.s, x, ldx, m, w, y, .f32, small);
++            try r.s.synchronize();
++            try check.sameBytes("prompt tile forms' rows", std.mem.sliceAsBytes(try r.back(f32, y, m * sh.n)), std.mem.sliceAsBytes(want[0 .. m * sh.n]));
++        }
++        const moved = try r.out((full_rows - shift) * sh.n * 4);
++        try lane.matmulPromptMx(r.s, x + shift * ldx * 2, ldx, full_rows - shift, w, moved, .f32);
++        try r.s.synchronize();
++        try check.sameBytes("prompt tile rows on other tiles", std.mem.sliceAsBytes(try r.back(f32, moved, (full_rows - shift) * sh.n)), std.mem.sliceAsBytes(want[shift * sh.n ..]));
++        // bf16 out: the fp32 sum rounded once
++        const yb = try r.out(full_rows * sh.n * 2);
++        try lane.matmulPromptMx(r.s, x, ldx, full_rows, w, yb, .bf16);
++        try r.s.synchronize();
++        const got_b = try r.back(u16, yb, full_rows * sh.n);
++        for (got_b, want) |g, f| try check.expect(g == rig.bf16(f), "{s}: bf16 out is the fp32 sum rounded ({x} vs {x})", .{ sh.name, g, rig.bf16(f) });
++        // FP64 bound on sampled rows, and against the exact lane's fp32 rows
++        const part = try r.out(@max(16, lane.partBytes(full_rows, w)));
++        const exact = try r.out(f32_bytes);
++        try lane.matmulOut(r.s, x, ldx, full_rows, w, exact, .f32, part);
++        try r.s.synchronize();
++        const lane_rows = try r.back(f32, exact, full_rows * sh.n);
++        var worst: f64 = 0;
++        for ([_]usize{ 0, 1, 129, 1500, full_rows - 1 }) |row| for (0..sh.n) |j| {
++            var sum: f64 = 0;
++            var mag: f64 = 0;
++            for (0..sh.k) |i| {
++                const t = rig.bf(xs[row * ldx + i]) * built.deq[j * sh.k + i];
++                sum += t;
++                mag += @abs(t);
++            }
++            const tol = rig.sumTol(mag, sh.k) + 1e-6;
++            try r.within("prompt tile fp32 vs FP64", want[row * sh.n + j], sum, tol);
++            try r.within("exact lane fp32 vs FP64", lane_rows[row * sh.n + j], sum, tol);
++            worst = @max(worst, @abs(@as(f64, want[row * sh.n + j]) - lane_rows[row * sh.n + j]) / tol);
++        };
++        // time both on the chunk's rows
++        var us: [2]f64 = undefined;
++        for (0..2) |which| {
++            const reps = 20;
++            const t0 = check.now(gpu.io);
++            for (0..reps) |_| {
++                if (which == 0) try lane.matmulOut(r.s, x, ldx, full_rows, w, exact, .f32, part) else try lane.matmulPromptMx(r.s, x, ldx, full_rows, w, full, .f32);
++            }
++            try r.s.synchronize();
++            us[which] = @as(f64, @floatFromInt(check.now(gpu.io) - t0)) / 1e3 / reps;
++        }
++        // short calls (a turn's new rows): the exact lane, the 128 x 128 tile and its 64 x 64 form
++        for ([_]usize{ 16, 40, 64, 128 }) |m| {
++            var t: [3]f64 = undefined;
++            for (0..3) |which| {
++                const reps = 200;
++                const t0 = check.now(gpu.io);
++                for (0..reps) |_| switch (which) {
++                    0 => try lane.matmulOut(r.s, x, ldx, m, w, exact, .f32, part),
++                    1 => try lane.matmulPromptMxTile(r.s, x, ldx, m, w, full, .f32, false),
++                    else => try lane.matmulPromptMxTile(r.s, x, ldx, m, w, full, .f32, true),
++                };
++                try r.s.synchronize();
++                t[which] = @as(f64, @floatFromInt(check.now(gpu.io) - t0)) / 1e3 / reps;
++            }
++            std.debug.print("qmmf-prompt-mx {s} m={d}: exact lane {d:.1} us, 128 tile {d:.1} us, 64 tile {d:.1} us\n", .{ sh.name, m, t[0], t[1], t[2] });
++        }
++        const flops = 2.0 * @as(f64, @floatFromInt(full_rows * sh.n * sh.k));
++        std.debug.print("qmmf-prompt-mx {s} m={d} n={d} k={d}: exact lane {d:.0} us ({d:.1} TF), prompt tile {d:.0} us ({d:.1} TF), worst |tile - lane| {d:.3} of the bound\n", .{ sh.name, full_rows, sh.n, sh.k, us[0], flops / us[0] / 1e6, us[1], flops / us[1] / 1e6, worst });
++    }
++    r.report("relaxed MXFP8 prompt tile: FP64-bounded, row bytes independent of the call's rows and tiles, bf16 the rounded fp32");
++}

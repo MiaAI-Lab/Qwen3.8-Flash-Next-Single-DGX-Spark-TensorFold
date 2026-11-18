@@ -60,11 +60,11 @@ if [[ "$ABLIT" == 1 ]]; then
 fi
 unset _pin
 
-# The engine: TensorFold's Zig engine (tensorfold-native), built from TF_REPO at TF_REF (the v1.1.4 release) with patches/*.patch
+# The engine: TensorFold's Zig engine (tensorfold-native), built from TF_REPO at TF_REF (the v1.2.7 release) with patches/*.patch
 # applied (git apply in the checkout's root), with Zig ZIG_VERSION. Only the Zig build goes into the image, plus the two
 # image decoders the engine wants (libjpeg-turbo for JPEG, libwebp's decoder for WebP), built from pinned sources.
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
-TF_REF="${TF_REF:-eab8582819688325e371907e4706e1c602b8a273}"   # v1.1.4
+TF_REF="${TF_REF:-93a2e93ecebff8aa52b88e58c5dd222516e69c5f}"   # v1.2.7
 ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
 ZIG_SHA256="${ZIG_SHA256:-9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
@@ -74,9 +74,9 @@ LIBWEBP_VERSION=1.6.0
 LIBWEBP_SHA256=e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564
 # libtfgrammar.so (structured output, tool_choice "required" and named functions) comes prebuilt from TensorFold's own release archive, checked against its SHA-256;
 # the archive ships it with xgrammar's Apache-2.0 notices. TF_RELEASE is the release that matches TF_REF.
-TF_RELEASE_VERSION=1.1.4
-TF_RELEASE_AARCH64_SHA256=2c77ff0179dbfb9ae1c6ac647f85210194c151243f49eb93f0e34a8d53d7a4ec
-TF_TAG="v1.1.4-${TF_REF:0:7}"
+TF_RELEASE_VERSION=1.2.7
+TF_RELEASE_AARCH64_SHA256=250b7cd3d1aa2685cbf011f501c4f10bbff44c6ccd876dc63a7a4bbf337ed01b
+TF_TAG="v1.2.7-${TF_REF:0:7}"
 IMAGE="${IMAGE:-tensorfold-qwen38:${TF_TAG}}"
 image_hash() {
   ( cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
@@ -86,9 +86,11 @@ image_hash() {
   ) | sha256sum | cut -c1-12
 }
 GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold}"
-# The published image of the current patch set (scripts/publish-image.sh, 2026-10-30): prepare.sh pulls it by digest while the patch hash matches IMAGE_TAG.
-IMAGE_TAG="${IMAGE_TAG:-v1.1.4-eab8582-4baf16137ecd}"
-IMAGE_DIGEST="${IMAGE_DIGEST:-sha256:5c6c42b9747318c1cd8b6cb85cb69493fff2e82cb23b61e49b9cf54cd09ac28e}"
+# The published image of the current patch set (scripts/publish-image.sh): prepare.sh pulls it by digest while the patch hash matches IMAGE_TAG.
+# None is published for the v1.2.7 patch set yet, so prepare.sh tries $GHCR_IMAGE:<tag> and otherwise builds locally.
+# The v1.1.4 image stays in the registry: v1.1.4-eab8582-4baf16137ecd, sha256:5c6c42b9747318c1cd8b6cb85cb69493fff2e82cb23b61e49b9cf54cd09ac28e.
+IMAGE_TAG="${IMAGE_TAG:-}"
+IMAGE_DIGEST="${IMAGE_DIGEST:-}"
 prebuilt_image() {
   local tag="${TF_TAG}-$(image_hash)"
   if [[ "$tag" == "$IMAGE_TAG" && -n "$IMAGE_DIGEST" ]]; then echo "$GHCR_IMAGE@$IMAGE_DIGEST"; else echo "$GHCR_IMAGE:$tag"; fi
@@ -98,7 +100,7 @@ CONTAINER_NAME="${CONTAINER_NAME:-qwen38-flash-next-tf}"
 SERVED_NAME="${SERVED_NAME:-Qwen3.8-Flash-Next}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
-# Native window 262,144; the Flash Next CUDA engine of TensorFold 1.1.4 has no YaRN extension, so this is also the maximum.
+# Native window 262,144; the Flash Next CUDA engine of TensorFold 1.2.7 has no YaRN extension (it refuses a legacy rope_scaling), so this is also the maximum.
 CONTEXT="${CONTEXT:-262144}"
 # Requests decoded together. The engine admits each one inside its own budget (MemAvailable after load, less
 # TENSORFOLD_MEMORY_RESERVE_GIB, and with VISION=1 less another 2 GiB kept for the vision helper) and refuses one
@@ -107,41 +109,37 @@ CONTEXT="${CONTEXT:-262144}"
 # engine reports a 24.3 GiB sequence pool after load, one full 262,144 window is 4.4 GiB, so 5 streams x 262,144 fit
 # (21.9 GiB); 8 streams at full windows do not (35 GiB), they share the pool. 5 is the default for that reason.
 PARALLEL="${PARALLEL:-5}"
+# Prompt rows a pass (v1.2.7's default is 1,536; the v1.1.4 build's patch 0006 used 3,072). 3,072 prefills about 4% faster on a Spark
+# (bench_streams.py, 4k to 126k tokens) for 0.8 GiB of the prompt cache; a stream decoding beside a prompt waits up to one pass for its token.
+export TF_FLASHNEXT_CHUNK="${TF_FLASHNEXT_CHUNK:-3072}"
 # MTP: up to this many drafts a round (the engine's default is 6; drafts are checked, so replies match serial decoding).
 export TF_FLASHNEXT_DRAFTS="${TF_FLASHNEXT_DRAFTS:-6}"
-# Sampled requests (temperature > 0, what chat clients send) in the batched draft pass, with the top candidates picked on the GPU
-# (patches 0007, 0008, 0011), all lanes' n-gram rows gathered in one pass (0010) and the host draws run on worker threads (0011).
-# None of them changes a reply's tokens (tools/exact.py, pDS-sampled-exact: drafted == serial == concurrent). 0 turns each off.
+# v1.2.7 carries most of what patches 0004 and 0006 to 0017 of the v1.1.4 series did; these are its settings for them. None of them
+# changes a reply's tokens. Already the engine's default (listed so a .env can turn them off): sampled streams in the batched draft
+# pass (was 0007), the GPU top-k candidates of a sampled draw (0008, TF_FLASHNEXT_GPU_TOPK), pending DeltaNet rows (0012), the shared
+# expert on a side stream and the lanes' DeltaNet steps in one launch (0016). The n-gram table is read with pread on Linux by default
+# (0013's reader, TF_FLASHNEXT_PLE_IO).
 export TF_FLASHNEXT_SAMPLED_HEADS="${TF_FLASHNEXT_SAMPLED_HEADS:-1}"
-export TF_FLASHNEXT_SAMPLE_CAND="${TF_FLASHNEXT_SAMPLE_CAND:-1}"
-export TF_FLASHNEXT_GATHER_EARLY="${TF_FLASHNEXT_GATHER_EARLY:-1}"
-export TF_FLASHNEXT_HOST_DRAW_THREADS="${TF_FLASHNEXT_HOST_DRAW_THREADS:-7}"
-# A partly rejected draft window no longer replays the DeltaNet state: the kept rows wait in a log and the next verify pass applies them (patch 0012).
 export TF_FLASHNEXT_KEEP_LATE="${TF_FLASHNEXT_KEEP_LATE:-1}"
-# The n-gram table is read with pread by a thread pool and read ahead (draft tokens' rows during the head step, the next prompt chunk's rows during
-# the current one) instead of through an mmap that page-faults (patch 0013). The last two prompt chunks are evened out when the last would be under 512 rows.
-export TF_FLASHNEXT_GATHER_READ="${TF_FLASHNEXT_GATHER_READ:-pread}"
-export TF_FLASHNEXT_DRAFT_AHEAD="${TF_FLASHNEXT_DRAFT_AHEAD:-1}"
-export TF_FLASHNEXT_WARM_AHEAD="${TF_FLASHNEXT_WARM_AHEAD:-1}"
-export TF_FLASHNEXT_PREFILL_TAIL="${TF_FLASHNEXT_PREFILL_TAIL:-512}"
-# Prompt passes: the hyper-connection normalize, down GEMM, up GEMM and mix run as fused kernels, the shared expert's rows go straight into the y slot,
-# the routed experts use the shared-memory row tiles from 256 rows, and the MTP head takes prompt pieces of 1536 rows (patch 0014; bit-identical to the
-# unfused path: tf-cuda-test hc-fuse, exact.py, pDS-sampled-exact).
-export TF_FLASHNEXT_PROMPT_HC2="${TF_FLASHNEXT_PROMPT_HC2:-1}"
-export TF_FLASHNEXT_PROMPT_SHARED_DIRECT="${TF_FLASHNEXT_PROMPT_SHARED_DIRECT:-1}"
-export TF_FLASHNEXT_PROMPT_EXPERT_TILE_ROWS="${TF_FLASHNEXT_PROMPT_EXPERT_TILE_ROWS:-256}"
-export TF_FLASHNEXT_HEAD_PIECE="${TF_FLASHNEXT_HEAD_PIECE:-1536}"
-# The MX128 prompt tile with two pipeline stages and two blocks an SM (patch 0015): the same arithmetic and bits as the one-stage tile, 15-25% faster per call.
-export TF_FLASHNEXT_PROMPT_GEMM2="${TF_FLASHNEXT_PROMPT_GEMM2:-1}"
-# Decode rounds (patch 0016): the shared expert runs on a second stream beside the routed experts (decode rounds, windows and head passes only), and a shared
-# round takes every lane's DeltaNet rows in three launches a layer instead of five a lane (needs KEEP_LATE=1). Both bit-identical (exact.py, pDS-sampled-exact).
 export TF_FLASHNEXT_SHARED_SIDE="${TF_FLASHNEXT_SHARED_SIDE:-1}"
 export TF_FLASHNEXT_GDN_LANES="${TF_FLASHNEXT_GDN_LANES:-1}"
-# The draft chain stops on the running product of its draft probabilities (keep draft j while p1*...*pj >= 0.4; the db281878 build's rule) up to 5 streams
-# drafting together, the per-draft floor 0.5 above (patch 0017). v1.1.4's default is the per-draft floor 0.6. Only the number of draft rows changes, never a reply:
-# greedy code +4% at 5 streams, +10% at 3, +14% at 1; prose and sampled flat. TF_FLASHNEXT_CONFIDENCE=0.6 restores the stock rule.
+# Opt-in upstream, on here: the next prompt chunk's n-gram rows hinted to the page cache during the current one (0013), and the
+# NVFP4 prompt experts on the shared-memory K32 tiles adapted from our patch 0014 (2: gate/up and down; 1 gate/up only; 0 off).
+export TF_FLASHNEXT_WARM_AHEAD="${TF_FLASHNEXT_WARM_AHEAD:-1}"
+export TF_FLASHNEXT_PROMPT_EXPERT_TILE="${TF_FLASHNEXT_PROMPT_EXPERT_TILE:-2}"
+# Prefill (patch 0004, the v1.1.4 series' 0006 and 0015 ported): prompt passes run the MXFP8 projections 1,024 columns or wider on a
+# 128 x 128 tile with the block scales folded into the weights (one fp32 sum over K; 1.4-1.65x the exact lane at a 3,072-row chunk,
+# +7-9% prefill; calls of 128 rows or fewer take its 64 x 64 form, same bits, so short prompts are not slower). Unlike the switches above it changes a prompt's numbers (within the exact kernels' rounding bound; each row's bits
+# do not depend on its chunk, so replies stay independent of drafting and batching); 0 keeps the exact kernels.
+export TF_FLASHNEXT_PROMPT_MX128="${TF_FLASHNEXT_PROMPT_MX128:-1024}"
+# The draft chain stops on the running product of its draft probabilities: keep draft j while p1*...*pj >= 0.4 (v1.2.7's default
+# TF_FLASHNEXT_CONFIDENCE, the rule patch 0017 restored). Beside other open streams v1.2.7 switches greedy chains to a 0.6 floor a
+# draft; TF_FLASHNEXT_SHARED_DRAFTS=0 keeps the product rule there too, as patch 0017 did up to 5 streams. Only draft rows change.
 export TF_FLASHNEXT_CONFIDENCE="${TF_FLASHNEXT_CONFIDENCE:--0.4}"
-export TF_FLASHNEXT_PRODUCT_STREAMS="${TF_FLASHNEXT_PRODUCT_STREAMS:-5}"
+export TF_FLASHNEXT_SHARED_DRAFTS="${TF_FLASHNEXT_SHARED_DRAFTS:-0}"
+# The MTP draft head's rows in 4 bits (a fourth of the bytes a chained draft reads; v1.1.4's patch 0005 made it the default,
+# v1.2.7 keeps bf16 by default). Drafts are only proposals, so replies are the target's either way. bf16 for the exact head.
+export TF_FLASHNEXT_DRAFT_HEAD="${TF_FLASHNEXT_DRAFT_HEAD:-affine4}"
 # KV cache (--kv-cache). fp8 is the default (patch 0003): about 1.84x the pool of bf16, and lossy (~98.8% top-1 agreement with a
 # bf16 cache, so a free-running reply can differ). bf16 is exact: KV_DTYPE=bf16. FP8 works together with --vision.
 KV_DTYPE="${KV_DTYPE:-fp8}"
@@ -164,8 +162,8 @@ export TENSORFOLD_VIDEO_TOKENS="${TENSORFOLD_VIDEO_TOKENS:-16384}"
 export TENSORFOLD_VISION_WORKSPACE_MIB="${TENSORFOLD_VISION_WORKSPACE_MIB:-2048}"
 # The engine keeps this much MemAvailable free when it sizes the KV pool. prepare.sh and start.sh refuse a Spark
 # that has less than this free.
-# 9 GiB since patch 0014: the prompt scratch of the fused hyper-connection path takes ~0.55 GiB more of the pool, and five full 262,144-token windows
-# need 23.9 GiB; with a 10 GiB reserve and the 2 GiB vision workspace the pool left 23.8 GiB. Keep nothing else big running on the Spark.
+# 9 GiB since v1.1.4's patch 0014 (five full 262,144-token windows need 23.9 GiB; a 10 GiB reserve with the 2 GiB vision workspace left 23.8).
+# Keep nothing else big running on the Spark.
 export TENSORFOLD_MEMORY_RESERVE_GIB="${TENSORFOLD_MEMORY_RESERVE_GIB:-9}"
 export TENSORFOLD_NO_UPDATE_CHECK="${TENSORFOLD_NO_UPDATE_CHECK:-1}"
 

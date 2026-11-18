@@ -1,9 +1,71 @@
 # Changelog
 
-Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:zig-db28187`, built by
-`scripts/prepare.sh` from TensorFold `db281878` plus `patches/`.
+Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:v1.2.7-93a2e93`, built by
+`scripts/prepare.sh` from TensorFold v1.2.7 (`93a2e93e`) plus `patches/` (0001 to 0004).
 
 ## Unreleased
+
+**2026-11-13: patch `0004`, the MXFP8 prompt tile, ported to v1.2.7: prefill +7 to +9%, a 200k prompt in 95.7 s.**
+
+- `0004-prompt-mxfp8-tile` brings back the v1.1.4 series' relaxed MXFP8 prompt tile (`0006`, with `0015`'s two stages and two blocks an SM): in prompt
+  passes, the MXFP8 projections 1,024 columns or wider (DeltaNet and attention inputs, the attention and DeltaNet outputs) run on a 128 x 128 tile that
+  folds each 32-input block scale into the weights in bf16 (exact: a power-of-two multiply), so one fp32 mma chain covers K. Calls of 128 rows or fewer
+  take a 64 x 64 form of it (new here: the 128 x 128 tile cost 4 to 17 ms of first-token time on short prompts); each output's chain is the same in both,
+  so the bytes are. Decode rounds, verify windows and the MTP head keep the exact kernels. `TF_FLASHNEXT_PROMPT_MX128=0` turns it off; the setting is
+  part of the disk tier's key.
+- Prompt rows are no longer the exact kernels' bits, but within their rounding bound, and a row's bytes do not depend on its chunk, its tile or the
+  other rows of its call, so replies stay independent of drafting and of what else runs (`exact.py` passes).
+- Not ported from `0006`, `0014`, `0015`: v1.2.7 already has the rest in its own form (the writeback and normalize in one launch, `fn_hc_normalize_cols`,
+  `fn_hc_dense_mix8`, the shared expert's down projection straight into its slot, no `y` clear on one rank), and the fused HC2 read-out would save
+  about 1%. The drain between prompt chunks and 768-row head pieces were ported and measured at +0.5%, then dropped (the head pieces needed a
+  scratch cap they did not have: 1,536-row pieces overran `part` and failed the stream).
+- Checked: `tf-cuda-test qmmf-prompt-mx` (new) on the GB10: at the DeltaNet input, attention input, mixer output and a partial-tile shape, the tile's
+  fp32 rows are within the FP64 bound (2% of it used), each row's bytes are equal at 1 / 40 / 77 / 128 / 300 / 3,072 rows, five rows off the tile grid,
+  and in both forms; bf16 out is the fp32 sum rounded once. At 3,072 rows: 80 to 81 TF against the exact lane's 49 to 59 (1.4x to 1.65x); at 16 to 128
+  rows the 64 x 64 form runs as fast as the exact lane. `zig build test-cuda-host` passes (with the disk-key and form tests extended); the image builds;
+  served with the defaults: `exact.py --pad 3000` (551 drafts accepted) and `exact.py` (557), `toolcheck.py` 3/3, `visioncheck.py`, `prompt_reuse.py
+  30000` (worst 99.3%), `context_boundary.py --context 262144` (16 checks), a 199,730-token needle (prefill 95.7 s against 110.9 s without the patch and
+  100.7 s on the v1.1.4 build).
+- A/B with `tools/bench_streams.py` (same image, `TF_FLASHNEXT_PROMPT_MX128=0` against the default): prefill at 4k / 31k / 126k tokens 2,151 / 2,266 /
+  2,151 against 2,303 / 2,443 / 2,293 tok/s (+7% / +8% / +7%; the three-patch build measured 2,143 / 2,252 / 2,140). Against the v1.1.4 build
+  (2,329 / 2,566 / 2,397) prefill is now 1% / 5% / 4% behind. Decode and first-token time are unchanged (5 streams: prose 224.1 / 229.5 tok/s, code
+  201.6 / 199.5, TTFT 183 / 184 ms).
+
+**2026-11-12: TensorFold v1.1.4 to v1.2.7 (`93a2e93e`, 3,452 commits). Three patches instead of seventeen.**
+
+- Triage of the v1.1.4 series against v1.2.7: on v1.2.7 only `0001` and `0002` applied; `0003` to `0017` did not. Most of what they did is now
+  TensorFold's own code, so they are retired, and `scripts/config.sh` sets v1.2.7's switches for them instead:
+  - in v1.2.7 and on by default: sampled streams in the batched head (`0007`, `TF_FLASHNEXT_SAMPLED_HEADS`), GPU top-k candidates of a sampled draw
+    (`0008`, `TF_FLASHNEXT_GPU_TOPK`), the n-gram rows of a shared pass's lanes gathered on a thread (`0010`), pending DeltaNet rows (`0012`,
+    `TF_FLASHNEXT_KEEP_LATE`), the `pread` n-gram reader (`0013`, `TF_FLASHNEXT_PLE_IO`), the shared expert on a side stream and lane-batched DeltaNet
+    (`0016`, `TF_FLASHNEXT_SHARED_SIDE`, `TF_FLASHNEXT_GDN_LANES`) and the running-product stop rule (`0017`, `TF_FLASHNEXT_CONFIDENCE=-0.4`);
+  - in v1.2.7 as opt-ins, turned on here: the K32 prompt expert staging TensorFold adapted from our `0014` (`TF_FLASHNEXT_PROMPT_EXPERT_TILE=2`), the
+    next chunk's n-gram read-ahead (`TF_FLASHNEXT_WARM_AHEAD=1`), the product rule beside other streams (`TF_FLASHNEXT_SHARED_DRAFTS=0`, which `0017`
+    did up to 5 streams), and the 4-bit draft head that `0005` made the default (`TF_FLASHNEXT_DRAFT_HEAD=affine4`);
+  - not carried: the round-cost model (`0009`, it was off), the host draw threads (`0011`), the draft-token read-ahead and chunk tail rule (`0013`), and
+    the MX128 MXFP8 prompt tile and fused HC2 prompt path (`0006`, `0014`, `0015`; v1.2.7 has its own prompt work). Whether any of these still matters is
+    for the v1.2.7 measurement below to show.
+- `0003` (`--kv-cache fp8`) rebased onto v1.2.7, with the old `0005` folded in (the fp8 reader's register prefetch and the bf16 MTP head cache). v1.2.7's
+  attention gained page tables (`TF_FLASHNEXT_KV_PAGES`), per-rank heads and one-launch lane attention; fp8 rows stay contiguous and one-rank, so
+  `--kv-cache fp8` is refused with `--tp`, `--slide`, a captured kernel set or `TF_FLASHNEXT_KV_PAGES`, shared rounds attend lane by lane under it, the
+  reused lane buffers (`TF_FLASHNEXT_LANE_PARTS`) and in-pass prompt-cache marks size their rows by the format, and fp8 states stay off the disk tier
+  (`--learn-conversations` keeps bf16 states only). `0001` and `0002` are unchanged.
+- `libtfgrammar.so` comes from the v1.2.7 release archive (SHA-256 `250b7cd3…`, the release's own `.sha256`). No image of this patch set is published yet,
+  so `scripts/prepare.sh` builds it; the v1.1.4 image stays in the registry.
+- `TF_FLASHNEXT_CHUNK=3072` is now set in `config.sh` (v1.2.7's default is 1,536; the v1.1.4 build's patch 0006 used 3,072): about 4% faster prefill.
+- **API change from v1.2.7:** a nonzero `presence_penalty` or `frequency_penalty` is refused with HTTP 400 for Flash Next (v1.1.4 accepted and ignored them).
+- Checked: the three patches apply to v1.2.7 and give the tested tree; `zig build test-cuda-host` passes on it as on stock v1.2.7 (new host tests for the fp8
+  state, draft and stream sizes, format refusals on restore and the head-cache rule); the image builds; on the GB10 `tf-cuda-test flashnext-kv8`,
+  `flashnext-attn`, `flashnext-pages` and `flashnext-attn-lanes` pass (fp8 reads byte-equal to the bf16 kernels on the dequantized rows; the paged and
+  one-launch bf16 paths unchanged). Served, with the defaults (5 x 262,144, fp8 KV, vision on; the engine admits 5 streams of 4.83 GiB): `exact.py --pad 3000`
+  (552 drafts accepted), `toolcheck.py` 3/3, `visioncheck.py`, `prompt_reuse.py 30000` (worst 99.3%), a 199,730-token needle (prefill 110.9 s against 100.7 s
+  on the v1.1.4 build), `context_boundary.py --context 262144` (16 checks), required / named / Anthropic `any` tool calls and a JSON schema. Not re-run: the
+  sampled-exactness check, sparkDash.
+- A/B with `tools/bench_streams.py` on the same Spark (greedy, 256 tokens, median of 3), v1.1.4 build against v1.2.7 build at 1,536-row passes: decode prose
+  57.8 / 133.4 / 167.9 against 58.5 / 156.1 / 230.1 tok/s at 1 / 3 / 5 streams (+1% / +17% / +37%), code 48.2 / 104.0 / 141.3 against 51.9 / 138.8 / 206.8
+  (+8% / +33% / +46%), TTFT at 5 streams 440 / 372 ms against 177 / 173 ms; prefill at 4k / 31k / 126k tokens 2,329 / 2,566 / 2,397 against 2,108 / 2,166 /
+  2,047 tok/s (-9% / -16% / -15%). With 3,072-row passes v1.2.7 prefills 2,143 / 2,252 / 2,140 (8-12% behind). `TF_FLASHNEXT_PROMPT_EXPERT_TILE=2` against 0:
+  +1% on prefill (noise level). The prefill gap is the v1.1.4 build's MXFP8 prompt kernels (0006, 0014, 0015), not ported.
 
 **2026-10-30: `ABLIT` (new, off by default).** `ABLIT=1` serves NVIDIA's FP4 checkpoint with drowzeys's Keys house-qsa abliteration overlay
 (`drowzeys/keys-Qwen3.8-Flash-Next-NVFP4-FP4-QAD-house-qsa-L3-47` @ `c44f5b92`): `self_attn.o_proj` of the 12 attention (QSA) layers (L3 to L47), from a
