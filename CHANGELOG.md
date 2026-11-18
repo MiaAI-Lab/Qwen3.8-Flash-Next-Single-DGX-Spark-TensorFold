@@ -5,6 +5,23 @@ Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:
 
 ## Unreleased
 
+**2026-11-18: the README says what this build serves: the window and video (#89).** The Configuration table and the
+`KV and memory` section still offered `CONTEXT=1048576` with "YaRN factor 4", which `start.sh:39` refuses: the Flash
+Next CUDA family of v1.2.7 refuses a scaled rope (`families/flashnext/cuda_config.zig:189`), so 262,144 is the
+maximum window here, not a default. The `start.sh` usage header's `CONTEXT=1048576` example is replaced by a shorter
+window, and the 1,048,576-token figures stay as the memory arithmetic they are. Reported by [hwstealer](https://github.com/hwstealer) (#89).
+
+The vision section also promised what the CUDA engine does not do. It listed MP4, WebM, MOV and MKV "anything FFmpeg
+decodes", up to 4 videos a request and an hour of footage, and quoted a 30-second video timing; the Flash Next family
+has no video path (`families/flashnext/cuda_images.zig` prepares no frames, `vision/qwen_cuda_media.zig` refuses a
+video token), so a `video_url` part is refused with `content parts must be text or image_url; audio and video inputs
+are unsupported`, and no `libtfvideo` is built into the image (`scripts/prepare.sh` builds `fatbins native`). The
+section now says that, keeps `MAX_VIDEOS` and `TENSORFOLD_VIDEO_TOKENS` as settings that bind nothing here, and points
+at #90 for the patch that would add video. The same paragraph described image decoding as a Python helper with Pillow
+and PyAV; on this engine the decode is in the binary, over the pinned libjpeg-turbo and libwebp. Test:
+`tools/test_readme_claims.py`, which reads the cap out of `start.sh` and fails when the docs offer a window above it,
+promise a YaRN this engine lacks, or describe video input this build refuses.
+
 **2026-11-13: patch `0004`, the MXFP8 prompt tile, ported to v1.2.7: prefill +7 to +9%, a 200k prompt in 95.7 s.**
 
 - `0004-prompt-mxfp8-tile` brings back the v1.1.4 series' relaxed MXFP8 prompt tile (`0006`, with `0015`'s two stages and two blocks an SM): in prompt

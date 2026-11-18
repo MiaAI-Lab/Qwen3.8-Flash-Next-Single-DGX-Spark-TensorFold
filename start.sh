@@ -7,7 +7,7 @@
 #   ./start.sh                         # up to 5 requests at once, a 262,144-token window, fp8 KV, image and video, MTP drafts
 #   ./start.sh restart                 # stop, then start again; the new arguments are checked before stopping
 #   ./start.sh restart --parallel 2 --context 131072
-#   CONTEXT=1048576 ./start.sh restart # YaRN factor 4; a full 1M prompt does not leave 10 GiB free on one Spark
+#   CONTEXT=131072 ./start.sh restart  # a shorter window leaves more of the KV pool to the other streams
 #   DRAFTS=0 ./start.sh restart        # no MTP drafts (--no-drafts)
 #   DRY_RUN=1 ./start.sh               # print the docker command and exit
 # Extra arguments go to tensorfold-native serve after the defaults, so they win.

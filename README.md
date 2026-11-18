@@ -16,7 +16,7 @@
 Serve **Qwen3.8 Flash Next** from a single NVIDIA DGX Spark (GB10, 128 GB) through an OpenAI-compatible API. It runs
 [TensorFold](https://github.com/ashhart/TensorFold)'s Zig engine, `tensorfold-native` (release
 [v1.2.7](https://github.com/ashhart/TensorFold/releases/tag/v1.2.7), commit `93a2e93e`, with this recipe's patches on top), in NVIDIA's PyTorch container. One GPU,
-with image and video input (`VISION=1`). `VISION=0` serves text only.
+with image input (`VISION=1`; this build serves no video, see [Images and video](#images-and-video)). `VISION=0` serves text only.
 
 The default checkpoint is NVIDIA's FP4 QAD export: routed experts in NVFP4 (group size 16, CSF-compressed scale factors),
 attention and shared-expert linears in MXFP8, the MTP experts and the vision tower quantized too (MXFP8 attention, W4A16
@@ -29,7 +29,7 @@ is unchanged.
 - Checkpoint (not supported on this branch; the db281878 recipe on `main` serves it): [`azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound`](https://huggingface.co/azampatti/Qwen3.8-Flash-Next-125B-A5B-INT4-AutoRound)
   at revision `1464274120d36a4d8fcaa934552334a7d83ce0fd` (~122 GiB). Routed experts are GPTQ int4 (group size 128), the
   n-gram table is FP8 and lives in `ple-table/`, and it is loaded with the weights. There is no SSD n-gram reader and
-  no int8 KV cache. KV is FP8 by default (lossy, ~98.8% top-1 agreement with bf16); `KV_DTYPE=bf16` is exact. FP8 works with image and video input.
+  no int8 KV cache. KV is FP8 by default (lossy, ~98.8% top-1 agreement with bf16); `KV_DTYPE=bf16` is exact. FP8 works with image input.
 - API model id: `Qwen3.8-Flash-Next`
 - Context: **262,144 tokens** a request (the native window). Up to 5 requests at once (`PARALLEL`). A full
   262,144-token window takes 4.78 GiB a stream with the fp8 cache, and a `PARALLEL` whose windows do not all fit is refused when the server starts
@@ -221,9 +221,9 @@ checks in this repository compare a build against itself, not `ABLIT=1` against 
 
 ## Images and video
 
-The model's own vision tower (27 layers, 0.84 GiB, from the same checkpoint) turns images and video frames into
-tokens. A Python helper in the image decodes them (Pillow, PyAV) and runs the tower. Send them as OpenAI-style
-content parts in a user message:
+The model's own vision tower (27 layers, 0.84 GiB, from the same checkpoint) turns images into tokens. The engine
+decodes them itself (libjpeg-turbo for JPEG, libwebp's decoder for WebP, both built into the image) and runs the tower
+on the GPU. Send them as OpenAI-style content parts in a user message:
 
 ```bash
 IMG=$(base64 -w0 photo.jpg)
@@ -236,22 +236,24 @@ curl -s http://<spark-address>:8888/v1/chat/completions -H 'Content-Type: applic
 }'
 ```
 
-A video is a `video_url` part (`{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,..."}}`).
+**Video is not served on this build.** The Flash Next CUDA engine has no video path: nothing in
+`families/flashnext/cuda_images.zig` prepares frames and `vision/qwen_cuda_media.zig` refuses a video token, so a
+`video_url` part is refused with `content parts must be text or image_url; audio and video inputs are unsupported`.
+`MAX_VIDEOS` and `TENSORFOLD_VIDEO_TOKENS` still reach the server and bind nothing here. #90 proposes the engine patch
+that adds video and the `libtfvideo` decoder it needs in the image.
 
-| | Images | Videos |
-| --- | --- | --- |
-| Formats | JPEG, PNG, WebP | MP4, WebM, MOV, MKV (anything FFmpeg decodes) |
-| Per request | up to 50 (all of a chat's turns count), 10 MB each, 64 MB in all | up to 4 (`MAX_VIDEOS`), 64 MB each, 96 MB in all, up to an hour of footage |
-| Tokens | up to 16,384 for all images, at most 4,096 an image (`"detail": "low"`: 256 an image) | 2 frames a second (at most 256 frames), up to 16,384 tokens a request (`TENSORFOLD_VIDEO_TOKENS`) |
+- **Formats:** JPEG, PNG, WebP.
+- **Per request:** up to 50 images (all of a chat's turns count), 10 MB each, 64 MB in all.
+- **Tokens:** up to 16,384 for all images, at most 4,096 an image (`"detail": "low"`: 256 an image).
 
 By default only data URLs are accepted. `VISION_URLS=1` also lets the server fetch public `https://` URLs. Image prompts are kept for prefix reuse
 (each image matched by a hash of its bytes, built into TensorFold since v1.1.4), so a chat's next turn after an image
-prefills only its new rows, but the vision tower still runs for every image each turn. Video prompts are not kept. A request body
+prefills only its new rows, but the vision tower still runs for every image each turn. A request body
 can be up to 96 MiB. `VISION=0 ./start.sh restart` serves text only and gives the 2 GiB helper workspace back to the
 KV pool.
 
 Measured on the Zig engine at TP=1 with `--vision` (warm, three reps): one image (1,217 tokens) 1.0 s to first token,
-10 images (3,035 tokens) 2.3 s, a 30-second video (6,875 tokens) 5.2–5.6 s. The first use of a new size is slower (a
+10 images (3,035 tokens) 2.3 s. The first use of a new size is slower (a
 5,107-token image took 35 s). The helper stays at 0.84 GiB for the tower and peaked around 1–1.7 GiB. Text replies
 with vision on matched the text-only engine. Those timings are from that engine build; this recipe's own vision boot
 has not been taken while the text server is in use.
@@ -290,7 +292,7 @@ PREPARE=1 ./start.sh restart
 ## KV and memory
 
 KV is FP8 by default (`KV_DTYPE=fp8`). It is lossy: about 98.8% top-1 agreement with a bf16 cache, so a free-running
-reply can differ from the bf16 one. `KV_DTYPE=bf16` is the exact cache. FP8 works together with image and video input.
+reply can differ from the bf16 one. `KV_DTYPE=bf16` is the exact cache. FP8 works together with image input.
 The format is adapted from MiaAI-Lab's GLM recipe patch `0038-glm-kv-fp8`.
 
 One token's cache at TP=1, 13 layers (12 attention plus the MTP head):
@@ -301,7 +303,8 @@ One token's cache at TP=1, 13 layers (12 attention plus the MTP head):
 | fp8 | 17,888 | 4.37 GiB |
 
 FP8 stores keys with both scales and values as codes. The indexer key (256 bytes) and pooled blocks (64 bytes) stay
-bf16. A 1,048,576-token fp8 sequence is 17.46 GiB; the same window in bf16 is 30.06 GiB.
+bf16. For scale, a 1,048,576-token sequence would take 17.46 GiB of fp8 cache and 30.06 GiB of bf16; the window
+this build serves stops at 262,144 (below).
 
 **Total available KV cache with the default checkpoint (NVIDIA FP4): about 27 to 29 GiB, roughly 1.4 to 1.6 million fp8 tokens.** That is the pool the engine
 reports at start (the server log line "N streams at once, 4.78 GiB each ... of 29.0 GiB left after a 9.0 GiB reserve"), measured on a Spark with vision on and
@@ -326,9 +329,10 @@ reserve"), `tools/exact.py`, `toolcheck.py` and `visioncheck.py` passed and deco
 `tools/prompt_reuse.py 30000` failed (a 32k-token follow-up resumed 4.7% of its prompt and prefilled again, 13.8 s). Multi-turn use then re-reads its history on
 every turn, so we left the default at 5. Each GiB the reserve gives up is a GiB of page cache the n-gram table loses, so it is not free. For more streams, lower `CONTEXT` instead: eight streams at 163,840 tokens need about 24 GiB (calculated from the sizes above, not run).
 
-A 1,048,576-token window (`CONTEXT=1048576`, YaRN factor 4) is one 17.46 GiB fp8 cache on top of the weights. A prompt
-that fills that window also needs prefill scratch, which the engine's budget does not reserve. It is not the default.
-`start.sh` allows it when `MemAvailable` covers weights, one cache, a small scratch slack and the floor.
+**262,144 is the maximum window on this build.** The Flash Next CUDA engine of TensorFold v1.2.7 has no YaRN
+extension: the family refuses a scaled rope (`families/flashnext/cuda_config.zig`), so the 1,048,576-token window the
+older recipes offered is not reachable here, and `start.sh` stops any larger setting. Restoring it needs engine
+support and a re-measurement (#89).
 
 `prepare.sh` and `start.sh` refuse to run when `MemAvailable` is under 9 GiB (`MEM_FLOOR_GIB`). Keep at least 9 GiB
 free under load. On this machine, exhausting unified memory freezes it.
@@ -351,15 +355,15 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `PARALLEL` | `5` | requests decoded together. One that would not fit (prompt plus `max_tokens`) is refused |
-| `CONTEXT` | `262144` | prompt + reply window. `1048576` turns on YaRN factor 4 |
+| `CONTEXT` | `262144` | prompt + reply window; 262,144 is the maximum (this engine has no YaRN extension) |
 | `DRAFTS` | `1` | MTP drafts; `0` passes `--no-drafts` |
 | `TEMPERATURE` / `TOP_P` / `TOP_K` | `1.0` / `0.95` / `20` | default sampling; a request's own values win |
 | `THINKING` | `1` | think before answering; `0` passes `--no-thinking` |
 | `MAX_TOKENS` | `32768` | the reply budget when a request sets none |
-| `VISION` / `VISION_URLS` | `1` / `0` | image and video (`--vision`); `VISION_URLS=1` also accepts public `https://` URLs |
+| `VISION` / `VISION_URLS` | `1` / `0` | images (`--vision`); `VISION_URLS=1` also accepts public `https://` URLs |
 | `TENSORFOLD_MAX_IMAGES` / `TENSORFOLD_IMAGE_TOKENS` | `50` / `16384` | images a request may carry, and the tokens they share (4,096 at most an image) |
-| `MAX_VIDEOS` | `4` | videos a request (`--vision-max-videos`) |
-| `TENSORFOLD_VIDEO_TOKENS` | `16384` | a request's video token budget |
+| `MAX_VIDEOS` | `4` | videos a request (`--vision-max-videos`); nothing to bind on this build, the CUDA engine refuses video |
+| `TENSORFOLD_VIDEO_TOKENS` | `16384` | a request's video token budget; nothing to bind on this build, the CUDA engine refuses video |
 | `TENSORFOLD_VISION_WORKSPACE_MIB` | `2048` | kept out of the KV budget for the helper |
 | `SERVED_NAME` | `Qwen3.8-Flash-Next` | the model id in `/v1/models` |
 | `PORT` / `HOST` | `8888` / `0.0.0.0` | where the API listens |
@@ -419,8 +423,7 @@ the model was still thinking.
 - `"draft": false` serves the request without drafts, the serial reference.
 - Tool calls work, including `tool_choice: "required"`, a named function and Anthropic's `{"type": "any"}`: the reply then always opens a tool call.
 - A conversation's next turn resumes from the kept state of its earlier turns, with images too (built into TensorFold since v1.1.4: a changed
-  image resumes only up to its first row). Video prompts are not
-  kept.
+  image resumes only up to its first row).
 - Structured outputs (`response_format` with a JSON schema, the `guided_*` fields) are enforced with `libtfgrammar.so`; a reply follows the schema. Without the library (a hand-run
   `tensorfold-native` that lacks it) the server answers HTTP 400.
 - When the KV pool is full, a new request is refused. Admission reserves the prompt plus `max_tokens`; the request is
