@@ -246,6 +246,16 @@ that adds video and the `libtfvideo` decoder it needs in the image.
 - **Per request:** up to 50 images (all of a chat's turns count), 10 MB each, 64 MB in all.
 - **Tokens:** up to 16,384 for all images, at most 4,096 an image (`"detail": "low"`: 256 an image).
 
+**PDF document parts are opt-in (`PDF=1 ./start.sh restart`).** With it the server takes `--vision-pdf` and reads Anthropic's
+`{"type": "document"}` part, OpenAI's `file` / `input_file` part and an `image_url` carrying a `data:application/pdf;base64,`
+URL: the engine renders each page to an image with its own PDFium (`libpdfium.so`, from the pinned pypdfium2 wheel in the
+image) and the request continues as an image prompt. Upstream's caps apply: 32 MiB a document, 16 pages
+(`TENSORFOLD_MAX_PDF_PAGES` lowers the count) and the pages share the request's image budget; the document's bytes are
+checked before anything parses them, and rendering runs in a `tensorfold-native --pdf-render-worker` child started per
+document and killed at its deadline. Inline data only: a `document.source.url` is refused rather than fetched, and
+`VISION_URLS` does not change that. Without `PDF=1` these parts are refused with `PDF inputs are off on this server;
+start the server with --vision --vision-pdf`, so a client never gets a silently different treatment than it asked for.
+
 By default only data URLs are accepted. `VISION_URLS=1` also lets the server fetch public `https://` URLs. Image prompts are kept for prefix reuse
 (each image matched by a hash of its bytes, built into TensorFold since v1.1.4), so a chat's next turn after an image
 prefills only its new rows, but the vision tower still runs for every image each turn. A request body
@@ -361,6 +371,7 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `THINKING` | `1` | think before answering; `0` passes `--no-thinking` |
 | `MAX_TOKENS` | `32768` | the reply budget when a request sets none |
 | `VISION` / `VISION_URLS` | `1` / `0` | images (`--vision`); `VISION_URLS=1` also accepts public `https://` URLs |
+| `PDF` | `0` | `1` passes `--vision-pdf`: PDF document parts rendered by the engine's PDFium (32 MiB, 16 pages, needs `VISION=1`) |
 | `TENSORFOLD_MAX_IMAGES` / `TENSORFOLD_IMAGE_TOKENS` | `50` / `16384` | images a request may carry, and the tokens they share (4,096 at most an image) |
 | `MAX_VIDEOS` | `4` | videos a request (`--vision-max-videos`); nothing to bind on this build, the CUDA engine refuses video |
 | `TENSORFOLD_VIDEO_TOKENS` | `16384` | a request's video token budget; nothing to bind on this build, the CUDA engine refuses video |

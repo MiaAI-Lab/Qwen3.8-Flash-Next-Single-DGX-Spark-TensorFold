@@ -127,6 +127,12 @@ This recipe no longer applies those patches (the serving path is the Zig engine)
   window against `--context`, so a prompt plus `max_tokens` equal to the window was refused. The engine already keeps
   those rows beyond the window. The admission change in the engine patches and `tools/context_boundary.py` are theirs.
 - **[sparkDash](https://github.com/MiaAI-Lab/sparkDash)** by MiaAI-Lab: the Decode and Prefill benchmarks the README's performance numbers were measured with.
+- **[joernchen](https://github.com/joernchen)** asked for PDF document input in
+  [#88](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/pull/88), with a patch that rendered
+  pages over PDFium with `libturbojpeg`. TensorFold v1.2.7 took the feature into its own server
+  (`zig/src/server/pdf.zig`, `pdf_worker.zig`), so the engine half is upstream's and theirs is the request and the
+  design push; `PDF=1`, the pinned `libpdfium.so` in the image and the `--vision-pdf` wiring in `start.sh` are
+  MiaAI-Lab's.
 - The scripts (`start.sh`, `stop.sh`, `scripts/`) and the checks in `tools/` are MiaAI-Lab's. `client.py`,
   `needle.py`, `toolcheck.py` and `prompt_reuse.py` are adapted from MiaAI-Lab's two-Spark recipe
   [GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold);
@@ -144,6 +150,10 @@ This recipe no longer applies those patches (the serving path is the Zig engine)
   modules and the image processor.
 - **[PyAV](https://github.com/PyAV-Org/PyAV)** (BSD-3-Clause) and **[FFmpeg](https://ffmpeg.org/)** (LGPL): video
   decoding. **[Pillow](https://python-pillow.org/)** (MIT-CMU): image decoding.
+- **[PDFium](https://pdfium.googlesource.com/pdfium)** (BSD-3-Clause) as shipped by
+  **[pypdfium2](https://pypdfium2.readthedocs.io/)** (pypdfium2 contributors): the `libpdfium.so` the image installs for
+  `PDF=1`, pinned to pypdfium2 5.14.0's aarch64 wheel by SHA-256 in `scripts/config.sh`, with the wheel's own license
+  files copied into the image. Loaded only when the server runs `--vision --vision-pdf`.
 - **[Hugging Face Hub](https://huggingface.co/)**: model hosting, the `hf` CLI and `huggingface_hub` (Apache 2.0), and
   the [safetensors](https://github.com/huggingface/safetensors) format (Apache 2.0) the checkpoint ships in.
 - **[Docker](https://www.docker.com/)** and the

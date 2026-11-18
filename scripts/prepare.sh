@@ -2,7 +2,8 @@
 # Prepare this Spark to serve Qwen3.8-Flash-Next ($QUANT_LABEL; see CHECKPOINT in scripts/config.sh) with TensorFold's Zig engine (tensorfold-native, one GPU):
 #   1. preflight: docker, the GPU, disk
 #   2. the image: tensorfold-native built from TensorFold (TF_REF) plus patches/*.patch with Zig, on NVIDIA's
-#      PyTorch container (kernels are embedded in the binary), with libjpeg-turbo and libwebp's decoder; pulled prebuilt when a matching tag is reachable (PULL=0 skips
+#      PyTorch container (kernels are embedded in the binary), with libjpeg-turbo, libwebp's decoder and the wheel's
+#      libpdfium (PDF parts, PDF=1); pulled prebuilt when a matching tag is reachable (PULL=0 skips
 #      that), else built locally
 #   3. the checkpoint in the Hugging Face cache (~96 GiB for the NVIDIA FP4 default, ~122 GiB for CHECKPOINT=int4), at its pinned revision
 #   4. verify it: every shard its index names is there, and it is a checkpoint format this engine serves (ModelOpt NVFP4 or GPTQ int4)
@@ -113,6 +114,7 @@ if [[ $REBUILD -eq 1 || "$built_hash" != "$PATCHES_HASH" ]]; then
     --build-arg ZIG_VERSION="$ZIG_VERSION" --build-arg ZIG_SHA256="$ZIG_SHA256" \
     --build-arg LIBJPEG_TURBO_VERSION="$LIBJPEG_TURBO_VERSION" --build-arg LIBJPEG_TURBO_SHA256="$LIBJPEG_TURBO_SHA256" \
     --build-arg LIBWEBP_VERSION="$LIBWEBP_VERSION" --build-arg LIBWEBP_SHA256="$LIBWEBP_SHA256" \
+    --build-arg PYPDFIUM2_WHEEL_URL="$PYPDFIUM2_WHEEL_URL" --build-arg PYPDFIUM2_AARCH64_SHA256="$PYPDFIUM2_AARCH64_SHA256" \
     --build-arg TF_RELEASE_VERSION="$TF_RELEASE_VERSION" --build-arg TF_RELEASE_AARCH64_SHA256="$TF_RELEASE_AARCH64_SHA256" \
     --build-arg PATCHES_HASH="$PATCHES_HASH" \
     -f - "$ctx" <<'DOCKERFILE'
@@ -122,6 +124,8 @@ ARG LIBJPEG_TURBO_VERSION
 ARG LIBJPEG_TURBO_SHA256
 ARG LIBWEBP_VERSION
 ARG LIBWEBP_SHA256
+ARG PYPDFIUM2_WHEEL_URL
+ARG PYPDFIUM2_AARCH64_SHA256
 RUN mkdir -p /src /opt/codecs && cd /src && \
     curl -fsSL -o jt.tar.gz "https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/${LIBJPEG_TURBO_VERSION}/libjpeg-turbo-${LIBJPEG_TURBO_VERSION}.tar.gz" && \
     echo "${LIBJPEG_TURBO_SHA256}  jt.tar.gz" | sha256sum -c - && \
@@ -136,6 +140,14 @@ RUN cd /src && \
     ./configure --prefix=/opt/codecs/webp --enable-libwebpdecoder --disable-static --disable-gl --disable-sdl --disable-png --disable-jpeg --disable-tiff --disable-gif --disable-wic && \
     make -j"$(nproc)" && make install && \
     test -e /opt/codecs/webp/lib/libwebpdecoder.so.3
+# PDFium (PDF document parts, --vision-pdf) comes out of the pinned pypdfium2 aarch64 wheel: the library and the license
+# files the wheel ships with it (BSD-3-Clause and the BUILD_LICENSES of what PDFium was built from) are what we take
+RUN mkdir -p /opt/codecs/pdfium/lib /opt/codecs/pdfium/licenses && cd /src && \
+    curl -fsSL -o pypdfium2.whl "${PYPDFIUM2_WHEEL_URL}" && \
+    echo "${PYPDFIUM2_AARCH64_SHA256}  pypdfium2.whl" | sha256sum -c - && \
+    python3 -c 'import os, zipfile; z = zipfile.ZipFile("pypdfium2.whl"); open("/opt/codecs/pdfium/lib/libpdfium.so", "wb").write(z.read("pypdfium2_raw/libpdfium.so")); [[os.makedirs(os.path.dirname(p) or ".", exist_ok=True), open(p, "wb").write(z.read(n))] for n in z.namelist() if "/licenses/" in n for p in [os.path.join("/opt/codecs/pdfium/licenses", n.split("/licenses/", 1)[1])]]' && \
+    test -s /opt/codecs/pdfium/lib/libpdfium.so && \
+    test -s /opt/codecs/pdfium/licenses/LICENSES/BSD-3-Clause.txt
 
 FROM ${BASE_IMAGE} AS grammar
 ARG TF_RELEASE_VERSION
@@ -177,6 +189,8 @@ FROM ${BASE_IMAGE}
 COPY --from=build /opt/tensorfold /opt/tensorfold
 COPY --from=codecs /opt/codecs/jpeg/lib/libturbojpeg.so* /opt/tensorfold/lib/
 COPY --from=codecs /opt/codecs/webp/lib/libwebpdecoder.so* /opt/tensorfold/lib/
+COPY --from=codecs /opt/codecs/pdfium/lib/libpdfium.so /opt/tensorfold/lib/libpdfium.so
+COPY --from=codecs /opt/codecs/pdfium/licenses /opt/tensorfold/share/doc/tensorfold/LICENSES-pdfium
 # the engine looks for libtfgrammar.so in <binary dir>/../lib, i.e. next to native/bin
 COPY --from=grammar /opt/tfrel/lib/libtfgrammar.so /opt/tensorfold/native/lib/libtfgrammar.so
 COPY --from=grammar /opt/tfrel/LICENSES /opt/tensorfold/share/doc/tensorfold/LICENSES-grammar
@@ -184,7 +198,8 @@ RUN ln -s /opt/tensorfold/native/bin/tensorfold-native /usr/local/bin/tensorfold
 ARG PATCHES_HASH
 LABEL tf.patches=${PATCHES_HASH} tf.kernels=embedded
 ENV HF_HOME=/root/.cache/huggingface CUDA_CACHE_PATH=/cache/nv \
-    TENSORFOLD_LIBTURBOJPEG=/opt/tensorfold/lib/libturbojpeg.so.0 TENSORFOLD_LIBWEBP=/opt/tensorfold/lib/libwebpdecoder.so.3
+    TENSORFOLD_LIBTURBOJPEG=/opt/tensorfold/lib/libturbojpeg.so.0 TENSORFOLD_LIBWEBP=/opt/tensorfold/lib/libwebpdecoder.so.3 \
+    TENSORFOLD_LIBPDFIUM=/opt/tensorfold/lib/libpdfium.so
 WORKDIR /workspace
 DOCKERFILE
   rm -rf -- "$ctx"; trap - EXIT

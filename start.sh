@@ -14,6 +14,7 @@
 # Settings, from the environment or ./.env (scripts/config.sh):
 #   serving  CONTEXT, PARALLEL, MAX_TOKENS, THINKING, DRAFTS, TEMPERATURE, TOP_P, TOP_K, SERVED_NAME, HOST, PORT
 #   files    CHECKPOINT (nvfp4 | int4), MODEL_ID, MODEL_REVISION, HF_CACHE, KERNEL_CACHE, STATE_DIR
+#   vision   VISION (0|1), VISION_URLS (0|1, public https media), PDF (0|1, PDF document parts through the engine's PDFium)
 #   ablit    ABLIT=1 serves NVIDIA's FP4 with the Keys house-qsa abliteration overlay (gated; needs an HF token); 0 is stock (default)
 #   image    IMAGE, TF_REPO, TF_REF, ZIG_VERSION, BASE_IMAGE, GHCR_IMAGE, CONTAINER_NAME
 #   setup    PREPARE (auto | 1 | 0), PULL, FOREGROUND=1, WAIT_TIMEOUT, DRY_RUN=1, MEM_NEED_GIB, MEM_CHECK=0
@@ -35,7 +36,8 @@ for arg in "$@"; do [[ "$arg" == -h || "$arg" == --help ]] && { usage; exit 0; }
 [[ "$CONTEXT" =~ ^[1-9][0-9]*$ && "$CONTEXT" -le 1048576 ]] || die "CONTEXT is a token count up to 1048576, not $CONTEXT"
 [[ "$PARALLEL" =~ ^([1-9]|1[0-6])$ ]] || die "PARALLEL is 1 to 16, not $PARALLEL"
 [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] || die "MAX_TOKENS is a token count, not $MAX_TOKENS"
-for v in THINKING DRAFTS VISION VISION_URLS; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
+for v in THINKING DRAFTS VISION VISION_URLS PDF; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
+[[ "$PDF" != 1 || "$VISION" == 1 ]] || die "PDF=1 renders pages through the vision path: start it with VISION=1 (the default)"
 (( CONTEXT <= 262144 )) || die "CONTEXT=$CONTEXT is past 262,144: TensorFold 1.2.7's Flash Next engine has no YaRN extension"
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 
@@ -50,6 +52,7 @@ if [[ "$VISION" == 1 ]]; then
   SERVE_ARGS+=(--vision --vision-max-images "$TENSORFOLD_MAX_IMAGES" --vision-max-videos "$MAX_VIDEOS"
                --vision-image-tokens "$TENSORFOLD_IMAGE_TOKENS")
   [[ "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)
+  [[ "$PDF" == 1 ]] && SERVE_ARGS+=(--vision-pdf)
 fi
 USER_ARGS=("$@")
 arg_value() {

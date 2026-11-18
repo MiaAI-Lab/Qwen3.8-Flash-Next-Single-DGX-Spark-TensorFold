@@ -5,6 +5,18 @@ Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:
 
 ## Unreleased
 
+**2026-11-18: `PDF=1` (new, off by default) serves PDF document parts; the image carries a checksummed PDFium.**
+TensorFold v1.2.7 already reads PDF parts in the server (`zig/src/server/pdf.zig`, `pdf_worker.zig`): Anthropic's
+`{"type": "document"}`, OpenAI's `file` / `input_file`, and an `image_url` carrying a `data:application/pdf;base64,` URL,
+refused unless the server was started with `--vision --vision-pdf`. Two pieces were missing on the recipe side, so
+`prepare.sh` now takes `libpdfium.so` out of the pinned pypdfium2 aarch64 wheel (5.14.0, SHA-256 `f1b696e6…`, checked
+with `sha256sum -c` before anything reads the wheel, ~8 MB in the image), sets `TENSORFOLD_LIBPDFIUM` to it, and
+`start.sh` passes `--vision-pdf` when `PDF=1` (it refuses `PDF=1` with `VISION=0`, which the engine would refuse too).
+The pin is part of `image_hash()`, so changing the wheel builds a new image tag; nothing about `PDF=0` reads PDFium, and
+the engine's own caps stay in force (32 MiB a document, 16 pages, `TENSORFOLD_MAX_PDF_PAGES` to lower the count, the
+pages sharing the request's image budget). Asked for by [joernchen](https://github.com/joernchen) (#88), whose engine
+patch v1.2.7 supersedes. Test: `tools/test_pdf_input.py` (offline; runs `start.sh`'s own PDF lines against a stub `die`).
+Not run here: `scripts/prepare.sh` (no image rebuild on this box) and a live PDF request.
 **2026-11-18: the README says what this build serves: the window and video (#89).** The Configuration table and the
 `KV and memory` section still offered `CONTEXT=1048576` with "YaRN factor 4", which `start.sh:39` refuses: the Flash
 Next CUDA family of v1.2.7 refuses a scaled rope (`families/flashnext/cuda_config.zig:189`), so 262,144 is the

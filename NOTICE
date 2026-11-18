@@ -58,6 +58,15 @@ xgrammar and dlpack (inside libtfgrammar.so)
   /opt/tensorfold/share/doc/tensorfold/LICENSES-grammar. The library serves structured output and required tool calls; nothing of it is
   modified or compiled here.
 
+PDFium (inside libpdfium.so, PDF document parts)
+  https://pdfium.googlesource.com/pdfium (PDFium authors) and https://pypdfium2.readthedocs.io (pypdfium2, pypdfium2
+  contributors). BSD-3-Clause, with the licenses of the third-party code the build was made from (freetype, lcms,
+  libjpeg-turbo, libpng, agg23, icu, abseil-cpp, fast_float, simdutf, zlib, llvm-libc and others) beside it.
+  scripts/prepare.sh downloads the pinned pypdfium2 aarch64 wheel (checked against the SHA-256 in scripts/config.sh),
+  copies pypdfium2_raw/libpdfium.so into /opt/tensorfold/lib (the server loads it through TENSORFOLD_LIBPDFIUM) and the
+  wheel's licenses/ tree into /opt/tensorfold/share/doc/tensorfold/LICENSES-pdfium. Nothing of it is modified or
+  compiled here, and it is read only when the server runs with --vision --vision-pdf (PDF=1 in scripts/config.sh).
+
 Model files (downloaded from Hugging Face by scripts/prepare.sh; not included in this repository or its image)
   The checkpoint this recipe serves by default, nvidia/Qwen3.8-Flash-Next-FP4-Local, is NVIDIA's quantization-aware-distilled
   FP4 export (NVIDIA Model Optimizer) of Qwen/Qwen3.8-Flash-Next by the Qwen team (Alibaba). Its use is governed by the NVIDIA Open
