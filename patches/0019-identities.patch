@@ -1,0 +1,586 @@
+diff --git a/zig/kernels/cuda/flashnext_batch.cu b/zig/kernels/cuda/flashnext_batch.cu
+index 21ee3aea..e3e0cb13 100644
+--- a/zig/kernels/cuda/flashnext_batch.cu
++++ b/zig/kernels/cuda/flashnext_batch.cu
+@@ -527,17 +527,23 @@ extern "C" __global__ void __launch_bounds__(256) fn_gdn_chain_tpr(const float*
+ // The prompt GDN block in one kernel a value head (front, chain, gated norm; their bits), no fp32 rows through memory.
+ #include "flashnext_gdn_fused.cuh"
+ 
+-// Run-time abliteration of a residual-stream writer's rows (cuda_ablate.zig): y[0][r] -= mask[r] * sum_j lam[j] (R_j . y[r]) R_j
+-// where y[r] is the sum of the `slices` fp32 slices' row r (`slice_stride` apart, rows `row_stride` apart) and the
+-// correction lands in slice 0; R [k, d] fp32 orthonormal rows, k <= 4. One block of 256 threads a row; the dot products are
+-// reduced in a fixed order (each thread's columns, the warp tree, then the warps in order), so a row's result never depends
+-// on the batch. A row whose mask is 0 is neither read nor written.
++// Run-time abliteration of a residual-stream writer's rows (cuda_ablate.zig): y[0][r] -= sum_j lam[j] (R_j . y[r]) R_j
++// with R and lam the identity row r names, where y[r] is the sum of the `slices` fp32 slices' row r (`slice_stride`
++// apart, rows `row_stride` apart) and the correction lands in slice 0. `who` [rows] holds each row's identity (0: left
++// alone, neither read nor written); `table` holds each identity's [k * d directions | k lam_attn | k lam_shared], `stride`
++// floats apart, R orthonormal rows, k <= 4; `meta` its k and first layer (below it the row is left alone); `kind` 0 reads
++// lam_attn, 1 lam_shared. One block of 256 threads a row; the dot products are reduced in a fixed order (each thread's
++// columns, the warp tree, then the warps in order), so a row's result never depends on the batch.
+ extern "C" __global__ void __launch_bounds__(256) fn_ablate_rows(float* __restrict__ y, long long row_stride,
+                                                                  long long slice_stride, int slices,
+-                                                                 const float* __restrict__ mask, const float* __restrict__ R,
+-                                                                 const float* __restrict__ lam, int d, int k) {
+-    const float m = mask[blockIdx.x];
+-    if (m == 0.0f) return;
++                                                                 const float* __restrict__ who, const float* __restrict__ table,
++                                                                 const int* __restrict__ meta, int stride, int kind, int layer, int d) {
++    const int id = static_cast<int>(who[blockIdx.x]);
++    if (id == 0) return;
++    const int k = meta[2 * (id - 1)];
++    if (layer < meta[2 * (id - 1) + 1]) return;
++    const float* __restrict__ R = table + static_cast<long long>(id - 1) * stride;
++    const float* __restrict__ lam = R + k * d + kind * k;
+     float* row = y + static_cast<long long>(blockIdx.x) * row_stride;
+     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+     for (int i = threadIdx.x; i < d; i += blockDim.x) {
+@@ -556,7 +562,7 @@ extern "C" __global__ void __launch_bounds__(256) fn_ablate_rows(float* __restri
+     if (threadIdx.x < static_cast<unsigned>(k)) {
+         float s = 0.0f;
+         for (unsigned w = 0; w < blockDim.x / 32; ++w) s = __fadd_rn(s, part[threadIdx.x][w]);
+-        coef[threadIdx.x] = __fmul_rn(__fmul_rn(s, lam[threadIdx.x]), m);
++        coef[threadIdx.x] = __fmul_rn(s, lam[threadIdx.x]);
+     }
+     __syncthreads();
+     for (int i = threadIdx.x; i < d; i += blockDim.x) {
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 876a74a5..f9c2c2f0 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -101,8 +101,8 @@ pub const Request = struct {
+     images: []const Image = &.{},
+     /// The prompt as the prompt cache matches it (each image's placeholders by its content); empty: ``prompt``.
+     cache_key: []const u32 = &.{},
+-    /// The request named TENSORFOLD_ABLATE_MODEL (``Info.ablate`` engines only): its rows get the abliteration.
+-    ablate: bool = false,
++    /// The identity the request named, 1..n in TENSORFOLD_IDENTITIES' order (``Info.ablate`` engines only); 0: the stock model.
++    ablate: u8 = 0,
+ 
+     /// The prompt as the prompt cache matches it: an image request's placeholders stand for their images.
+     pub fn cacheKey(r: *const Request) []const u32 {
+@@ -222,7 +222,7 @@ pub const Info = struct {
+     slide_conversations: bool = false,
+     /// Whether a request's caches fit beside the running streams' now (null: a free lane does); else it waits in order.
+     admit: ?Admit = null,
+-    /// The engine loaded TENSORFOLD_ABLATE and takes ``Request.ablate``.
++    /// The engine loaded TENSORFOLD_IDENTITIES and takes ``Request.ablate``.
+     ablate: bool = false,
+ 
+     /// What a lane engine's streams enforce themselves (core/lanes/stream.zig): loop guards and answer limits.
+diff --git a/zig/src/core/lane_host_reuse_test.zig b/zig/src/core/lane_host_reuse_test.zig
+index 65982e73..51971a32 100644
+--- a/zig/src/core/lane_host_reuse_test.zig
++++ b/zig/src/core/lane_host_reuse_test.zig
+@@ -570,7 +570,7 @@ test "an ablated request keeps and resumes its own states: never a stock one's,
+     // the same tokens ablated: no resume from the stock state, a state of its own kept beside it
+     var a1: Box = .{};
+     defer a1.tokens.deinit(gpa);
+-    const ra1: Request = .{ .prompt = &t1, .max_tokens = 6, .history_len = 8, .ablate = true };
++    const ra1: Request = .{ .prompt = &t1, .max_tokens = 6, .history_len = 8, .ablate = 1 };
+     try e.submit(2, &ra1, .{ .ctx = &a1, .event = Box.event });
+     try std.testing.expectEqual(Reason.length, a1.wait());
+     try std.testing.expectEqual(@as(?u32, 0), a1.cached);
+@@ -584,7 +584,7 @@ test "an ablated request keeps and resumes its own states: never a stock one's,
+     try t2.appendSlice(gpa, &.{ 7, 7, 5, 3 });
+     var a2: Box = .{};
+     defer a2.tokens.deinit(gpa);
+-    const ra2: Request = .{ .prompt = t2.items, .max_tokens = 12, .history_len = @intCast(t2.items.len - 2), .ablate = true };
++    const ra2: Request = .{ .prompt = t2.items, .max_tokens = 12, .history_len = @intCast(t2.items.len - 2), .ablate = 1 };
+     try e.submit(3, &ra2, .{ .ctx = &a2, .event = Box.event });
+     try std.testing.expectEqual(Reason.length, a2.wait());
+     try std.testing.expectEqual(@as(?u32, 8), a2.cached);
+@@ -598,4 +598,13 @@ test "an ablated request keeps and resumes its own states: never a stock one's,
+     try std.testing.expectEqual(@as(u64, 2), store.counts.hits);
+     // the fake's replies read the whole history: a resume from the wrong state would change them
+     try std.testing.expectEqualSlices(u32, s2.tokens.items, a2.tokens.items);
++    // a second identity on the same tokens: neither the stock state nor the first identity's resumes it
++    var b1: Box = .{};
++    defer b1.tokens.deinit(gpa);
++    const rb1: Request = .{ .prompt = t2.items, .max_tokens = 12, .history_len = @intCast(t2.items.len - 2), .ablate = 2 };
++    try e.submit(5, &rb1, .{ .ctx = &b1, .event = Box.event });
++    try std.testing.expectEqual(Reason.length, b1.wait());
++    try std.testing.expectEqual(@as(?u32, 0), b1.cached);
++    try std.testing.expectEqual(@as(u64, 2), store.counts.hits);
++    try std.testing.expectEqualSlices(u32, s2.tokens.items, b1.tokens.items);
+ }
+diff --git a/zig/src/core/lane_stream.zig b/zig/src/core/lane_stream.zig
+index b463ee4d..b80afc77 100644
+--- a/zig/src/core/lane_stream.zig
++++ b/zig/src/core/lane_stream.zig
+@@ -24,10 +24,11 @@ pub fn open(h: *LaneHost, job: *Job) bool {
+             job.key[0] = 0x8000_0000 | @as(u32, @truncate(std.hash.Wyhash.hash(f, std.mem.asBytes(&job.key[0])) & 0x7fff_ffff));
+         }
+     };
+-    // an ablated request's states never meet a stock one's: its key's first word is marked apart (after the frame's mark)
+-    if (r.ablate and h.cache != null and r.cacheKey().len > 0) {
++    // an identity's states never meet a stock one's nor another identity's: its key's first word is marked apart by
++    // the identity (after the frame's mark)
++    if (r.ablate != 0 and h.cache != null and r.cacheKey().len > 0) {
+         if (job.key.len == 0) job.key = h.gpa.dupe(u32, r.cacheKey()) catch return !h.drop(job, "out of memory");
+-        job.key[0] = 0x8000_0000 | @as(u32, @truncate(std.hash.Wyhash.hash(0x61626c6174, std.mem.asBytes(&job.key[0])) & 0x7fff_ffff));
++        job.key[0] = 0x8000_0000 | @as(u32, @truncate(std.hash.Wyhash.hash(0x61626c6174 + @as(u64, r.ablate), std.mem.asBytes(&job.key[0])) & 0x7fff_ffff));
+     }
+     if (h.cache) |store| if (r.embedding == null and r.prompt_logprobs == null and !r.untaught) if (store.lookupRewind(h.gpa, job.cacheKey(), r.bornLen(), r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
+         job.entry = l.entry;
+diff --git a/zig/src/core/lanes/identities.zig b/zig/src/core/lanes/identities.zig
+new file mode 100644
+index 00000000..7c727946
+--- /dev/null
++++ b/zig/src/core/lanes/identities.zig
+@@ -0,0 +1,64 @@
++//! The identities a server offers beside the stock model: a model id each, with the directions file its requests get
++//! (families/flashnext/cuda_ablate.zig). TENSORFOLD_IDENTITIES lists them as `id=path` entries separated by commas or
++//! newlines, in the order the engine numbers them (1..n; 0 is the stock model). TENSORFOLD_ABLATE with
++//! TENSORFOLD_ABLATE_MODEL names one the old way and stays the whole list while TENSORFOLD_IDENTITIES is unset.
++const std = @import("std");
++
++pub const max = 32;
++
++pub const Identity = struct { id: []const u8, path: []const u8 };
++
++pub const Error = error{ TooMany, Malformed, Duplicate };
++
++/// The listed identities in order, in `out`; `legacy_path` and `legacy_id` are TENSORFOLD_ABLATE and TENSORFOLD_ABLATE_MODEL.
++pub fn list(spec: ?[]const u8, legacy_path: ?[]const u8, legacy_id: ?[]const u8, out: *[max]Identity) Error![]Identity {
++    var n: usize = 0;
++    if (spec) |s| {
++        var it = std.mem.tokenizeAny(u8, s, ",\n");
++        while (it.next()) |raw| {
++            const entry = std.mem.trim(u8, raw, " \t\r");
++            if (entry.len == 0) continue;
++            const eq = std.mem.indexOfScalar(u8, entry, '=') orelse return error.Malformed;
++            const id = std.mem.trim(u8, entry[0..eq], " \t");
++            const path = std.mem.trim(u8, entry[eq + 1 ..], " \t");
++            if (id.len == 0 or path.len == 0) return error.Malformed;
++            for (out[0..n]) |seen| if (std.mem.eql(u8, seen.id, id)) return error.Duplicate;
++            if (n == max) return error.TooMany;
++            out[n] = .{ .id = id, .path = path };
++            n += 1;
++        }
++    } else if (legacy_path) |p| if (legacy_id) |id| {
++        const path = std.mem.trim(u8, p, " \t\r\n");
++        const name = std.mem.trim(u8, id, " \t\r\n");
++        if (path.len > 0 and name.len > 0) {
++            out[0] = .{ .id = name, .path = path };
++            n = 1;
++        }
++    };
++    return out[0..n];
++}
++
++test "identities: the list in order, the legacy pair, the errors" {
++    var out: [max]Identity = undefined;
++    const two = try list(" skuld = /a/skuld.safetensors ,\nmuse=/b/muse.safetensors,", null, null, &out);
++    try std.testing.expectEqual(@as(usize, 2), two.len);
++    try std.testing.expectEqualStrings("skuld", two[0].id);
++    try std.testing.expectEqualStrings("/a/skuld.safetensors", two[0].path);
++    try std.testing.expectEqualStrings("muse", two[1].id);
++    try std.testing.expectEqualStrings("/b/muse.safetensors", two[1].path);
++
++    const legacy = try list(null, "/a/skuld.safetensors", "abliterated", &out);
++    try std.testing.expectEqual(@as(usize, 1), legacy.len);
++    try std.testing.expectEqualStrings("abliterated", legacy[0].id);
++    try std.testing.expectEqual(@as(usize, 0), (try list(null, "/a/skuld.safetensors", null, &out)).len);
++    // the list set, the legacy pair is ignored
++    try std.testing.expectEqual(@as(usize, 0), (try list("", "/a/skuld.safetensors", "abliterated", &out)).len);
++
++    try std.testing.expectError(error.Malformed, list("skuld", null, null, &out));
++    try std.testing.expectError(error.Malformed, list("=/a", null, null, &out));
++    try std.testing.expectError(error.Duplicate, list("a=/1,a=/2", null, null, &out));
++    var long: [(max + 1) * 12]u8 = undefined;
++    var at: usize = 0;
++    for (0..max + 1) |i| at += (try std.fmt.bufPrint(long[at..], "i{d}=/p{d},", .{ i, i })).len;
++    try std.testing.expectError(error.TooMany, list(long[0..at], null, null, &out));
++}
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index 4883a8fc..b53c455b 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -2,6 +2,8 @@
+ const std = @import("std");
+ 
+ pub const proposal_score = @import("proposal_score.zig");
++/// The identities a server offers beside the stock model (the server and the engines both read the list).
++pub const identities = @import("identities.zig");
+ pub const proposal_head = @import("proposal_head.zig");
+ pub const table = @import("table.zig");
+ pub const allocate = @import("allocate.zig");
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index 7f54cb98..406f97a8 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -135,7 +135,7 @@ pub const Spec = struct {
+     reuse: Reuse = .{},
+     decide: ?u32 = null, // the prompt row where living lessons decide whether they act on the reply
+     untaught: bool = false, // no learned neuron acts on its rows: the model as shipped (Request.untaught)
+-    ablate: bool = false, // the request asked for the abliteration (the backend's sequence carries it)
++    ablate: u8 = 0, // the identity the request named, 0 none (the backend's sequence carries it)
+     logprobs: ?u8 = null, // the target's log probabilities for each committed token, with this many best tokens
+     prompt_logprobs: ?u8 = null, // and for each prompt token after the first, with ranks (the prompt pass starts at 0)
+     grammar: ?*grammar.Constraint = null, // structured output: the reply stays in it (the creator frees it)
+@@ -179,7 +179,7 @@ pub const Stream = struct {
+     decode_spans: []const [2]u32 = &.{},
+     decide: ?u32 = null,
+     untaught: bool = false,
+-    ablate: bool = false,
++    ablate: u8 = 0,
+     images: []const Image = &.{},
+     key: []const u32 = &.{},
+     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
+diff --git a/zig/src/families/flashnext/cuda_ablate.zig b/zig/src/families/flashnext/cuda_ablate.zig
+index 8654ade7..60c76234 100644
+--- a/zig/src/families/flashnext/cuda_ablate.zig
++++ b/zig/src/families/flashnext/cuda_ablate.zig
+@@ -1,34 +1,76 @@
+-//! Per-request abliteration: an abliterated build edits the residual-stream writers, W' = W - R diag(lam) R^T W, so its
+-//! output is y - R diag(lam) (R^T y). The engine applies that correction to the writers' outputs at run time, for the rows
+-//! whose request named TENSORFOLD_ABLATE_MODEL, before the hyper-connection write-back: the token mixers' output
+-//! projections (linear_attn.out_proj, self_attn.o_proj; their fp32 K slices in the batched pass) with lam_attn and the
+-//! shared expert's down projection (its own slot of the MoE output) with lam_shared, from `first_layer` up. The MTP head
+-//! is untouched (the main forward verifies its drafts).
++//! Per-request abliteration, an identity a model id: an abliterated build edits the residual-stream writers,
++//! W' = W - R diag(lam) R^T W, so its output is y - R diag(lam) (R^T y). The engine applies that correction to the
++//! writers' outputs at run time, for the rows whose request named an identity (1..n in the list's order; 0 is the
++//! stock model), before the hyper-connection write-back: the token mixers' output projections (linear_attn.out_proj,
++//! self_attn.o_proj; their fp32 K slices in the batched pass) with lam_attn and the shared expert's down projection
++//! (its own slot of the MoE output) with lam_shared, from the identity's `first_layer` up. The MTP head is untouched
++//! (the main forward verifies its drafts).
+ //!
+-//! TENSORFOLD_ABLATE names a safetensors file: `directions` [k, d] fp32 (orthonormal rows), `lam_attn` [k] and
+-//! `lam_shared` [k] fp32, `first_layer` [1] int64. TENSORFOLD_ABLATE_SCALE multiplies both strengths (default 1).
+-//! With TENSORFOLD_ABLATE unset nothing here runs and the forward is unchanged.
++//! TENSORFOLD_IDENTITIES lists the identities (core/lanes/identities.zig), each a safetensors file: `directions` [k, d] fp32
++//! (orthonormal rows), `lam_attn` [k] and `lam_shared` [k] fp32, `first_layer` [1] int64. TENSORFOLD_ABLATE_SCALE
++//! multiplies every strength (default 1). With no identity listed nothing here runs and the forward is unchanged.
+ 
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const core = @import("core");
++const identities = @import("lanes").identities;
+ 
+ pub const max_k = 4;
+ 
++/// Floats an identity takes in the table: max_k directions, then max_k lam_attn and max_k lam_shared (k of each used).
++fn strideOf(d: usize) usize {
++    return max_k * d + 2 * max_k;
++}
++
+ pub const Ablation = struct {
+-    /// [k * d directions | k lam_attn | k lam_shared] fp32
+-    dev: cuda.DeviceBuffer,
+-    k: usize,
++    /// [n * stride] fp32: each identity's [k * d directions | k lam_attn | k lam_shared], packed from its block's start
++    table: cuda.DeviceBuffer,
++    /// [n * 2] i32: each identity's k and first layer
++    meta: cuda.DeviceBuffer,
++    n: usize,
+     d: usize,
++    /// The lowest first layer of them: the launch is skipped below it.
+     first: usize,
+ 
+-    pub const Kind = enum { attn, shared };
++    pub const Kind = enum(u8) { attn = 0, shared = 1 };
+ 
+-    /// The directions file TENSORFOLD_ABLATE names, on the device; null when it is unset.
++    /// The listed identities' files on the device; null when none is listed.
+     pub fn fromEnv(gpa: std.mem.Allocator, io: std.Io, drv: *const cuda.Driver, hidden: usize, world: usize) !?Ablation {
+-        const path = env("TENSORFOLD_ABLATE") orelse return null;
++        var names: [identities.max]identities.Identity = undefined;
++        const listed = try identities.list(env("TENSORFOLD_IDENTITIES"), env("TENSORFOLD_ABLATE"), env("TENSORFOLD_ABLATE_MODEL"), &names);
++        if (listed.len == 0) return null;
+         if (world != 1) return error.AblateNeedsOneRank;
+         const scale: f32 = if (env("TENSORFOLD_ABLATE_SCALE")) |v| std.fmt.parseFloat(f32, v) catch return error.BadAblateScale else 1;
++        const stride = strideOf(hidden);
++
++        const host = try gpa.alloc(f32, listed.len * stride);
++        defer gpa.free(host);
++        @memset(host, 0);
++        const meta = try gpa.alloc(i32, listed.len * 2);
++        defer gpa.free(meta);
++        var first: usize = std.math.maxInt(usize);
++        for (listed, 0..) |ident, i| {
++            const loaded = try load(gpa, io, ident.path, hidden, scale, host[i * stride ..][0..stride]);
++            meta[2 * i] = @intCast(loaded.k);
++            meta[2 * i + 1] = @intCast(loaded.first);
++            first = @min(first, loaded.first);
++            const block = host[i * stride ..];
++            std.log.info("identity {d} {s}: {s}, {d} directions from layer {d}, lam_attn {any}, lam_shared {any} (scale {d})", .{ i + 1, ident.id, ident.path, loaded.k, loaded.first, block[loaded.k * hidden ..][0..loaded.k], block[loaded.k * hidden + loaded.k ..][0..loaded.k], scale });
++        }
++
++        var table = try cuda.DeviceBuffer.alloc(drv, host.len * 4);
++        errdefer table.free();
++        try table.upload(0, std.mem.sliceAsBytes(host));
++        var meta_dev = try cuda.DeviceBuffer.alloc(drv, meta.len * 4);
++        errdefer meta_dev.free();
++        try meta_dev.upload(0, std.mem.sliceAsBytes(meta));
++        return .{ .table = table, .meta = meta_dev, .n = listed.len, .d = hidden, .first = first };
++    }
++
++    const Loaded = struct { k: usize, first: usize };
++
++    /// One identity's file into its block: directions, then lam_attn and lam_shared times `scale`.
++    fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, hidden: usize, scale: f32, block: []f32) !Loaded {
+         var file = try core.safetensors.File.open(gpa, io, path);
+         defer file.close(io);
+         const dirs = file.get("directions") orelse return error.AblateFileMissesDirections;
+@@ -43,52 +85,44 @@ pub const Ablation = struct {
+         const first = std.mem.readInt(i64, first_t.bytes[0..8], .little);
+         if (first < 0) return error.AblateFirstLayerShape;
+ 
+-        const host = try gpa.alloc(f32, k * hidden + 2 * k);
+-        defer gpa.free(host);
+         // the mapped bytes may be unaligned: copied out before they are read as floats
+-        @memcpy(std.mem.sliceAsBytes(host[0 .. k * hidden]), dirs.bytes);
+-        @memcpy(std.mem.sliceAsBytes(host[k * hidden ..][0..k]), lam_attn.bytes);
+-        @memcpy(std.mem.sliceAsBytes(host[k * hidden + k ..][0..k]), lam_shared.bytes);
++        @memcpy(std.mem.sliceAsBytes(block[0 .. k * hidden]), dirs.bytes);
++        @memcpy(std.mem.sliceAsBytes(block[k * hidden ..][0..k]), lam_attn.bytes);
++        @memcpy(std.mem.sliceAsBytes(block[k * hidden + k ..][0..k]), lam_shared.bytes);
+         for (0..k) |a| for (0..k) |b| {
+             var dot: f64 = 0;
+-            for (host[a * hidden ..][0..hidden], host[b * hidden ..][0..hidden]) |x, y| dot += @as(f64, x) * y;
++            for (block[a * hidden ..][0..hidden], block[b * hidden ..][0..hidden]) |x, y| dot += @as(f64, x) * y;
+             const want: f64 = if (a == b) 1 else 0;
+             if (@abs(dot - want) > 1e-3) return error.AblateDirectionsNotOrthonormal;
+         };
+-        for (host[k * hidden ..]) |*l| l.* *= scale;
+-
+-        var dev = try cuda.DeviceBuffer.alloc(drv, host.len * 4);
+-        errdefer dev.free();
+-        try dev.upload(0, std.mem.sliceAsBytes(host));
+-        const la = host[k * hidden ..][0..k];
+-        const ls = host[k * hidden + k ..][0..k];
+-        std.log.info("ablation: {s}, {d} directions from layer {d}, lam_attn {any}, lam_shared {any} (scale {d})", .{ path, k, first, la, ls, scale });
+-        return .{ .dev = dev, .k = k, .d = hidden, .first = @intCast(first) };
++        for (block[k * hidden ..][0 .. 2 * k]) |*l| l.* *= scale;
++        return .{ .k = k, .first = @intCast(first) };
+     }
+ 
+     pub fn deinit(a: *Ablation) void {
+-        a.dev.free();
++        a.table.free();
++        a.meta.free();
+         a.* = undefined;
+     }
+ 
+     /// The correction on one writer's output: `rows` fp32 rows `row_stride` elements apart, in `slices` slices
+-    /// `slice_stride` apart (their sum is the output; slice 0 takes the correction), for the rows `mask` [rows] fp32 flags.
+-    /// Layers before `first` are left as they are.
+-    pub fn apply(a: *const Ablation, f: cuda.Function, stream: cuda.Stream, layer: usize, kind: Kind, y: u64, row_stride: usize, slice_stride: usize, slices: usize, mask: u64, rows: usize) !void {
++    /// `slice_stride` apart (their sum is the output; slice 0 takes the correction), each row's identity in `who`
++    /// [rows] fp32 (0: left alone). Layers before every identity's first are left as they are.
++    pub fn apply(a: *const Ablation, f: cuda.Function, stream: cuda.Stream, layer: usize, kind: Kind, y: u64, row_stride: usize, slice_stride: usize, slices: usize, who: u64, rows: usize) !void {
+         if (layer < a.first or rows == 0) return;
+         if (rows > 65535 or slices < 1 or row_stride < a.d) return error.AblateRows;
+-        const dirs = a.dev.ptr;
+-        const lam = dirs + (a.k * a.d + @as(usize, if (kind == .attn) 0 else a.k)) * 4;
+         var args: cuda.Args = .{};
+         args.add(y);
+         args.add(@as(c_longlong, @intCast(row_stride)));
+         args.add(@as(c_longlong, @intCast(slice_stride)));
+         args.add(@as(c_int, @intCast(slices)));
+-        args.add(mask);
+-        args.add(dirs);
+-        args.add(lam);
++        args.add(who);
++        args.add(a.table.ptr);
++        args.add(a.meta.ptr);
++        args.add(@as(c_int, @intCast(strideOf(a.d))));
++        args.add(@as(c_int, @intFromEnum(kind)));
++        args.add(@as(c_int, @intCast(layer)));
+         args.add(@as(c_int, @intCast(a.d)));
+-        args.add(@as(c_int, @intCast(a.k)));
+         try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &args);
+     }
+ };
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index 1c8505ca..bf4d81af 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -659,15 +659,15 @@ pub fn Pass(comptime Tri: type) type {
+             for (0..blocks) |b| pos[4 * b] = @intCast(if (self.lanes.len > 0) self.lanes[b].pos else self.pos0 + b * att_rows);
+             try self.upload(s.pos, std.mem.sliceAsBytes(pos));
+             if (self.m.abl != null) {
+-                // each row's abliteration flag: its lane's request asked for it, or the lone sequence's did
++                // each row's identity: its lane's request named it, or the lone sequence's did
+                 const mask = s.hostMask(n);
+                 if (self.lanes.len > 0) {
+                     var at: usize = 0;
+                     for (self.lanes) |l| {
+-                        @memset(mask[at..][0..l.rows], if (l.seq.ablate) 1 else 0);
++                        @memset(mask[at..][0..l.rows], @as(f32, @floatFromInt(l.seq.ablate)));
+                         at += l.rows;
+                     }
+-                } else @memset(mask, if (self.seq.ablate) 1 else 0);
++                } else @memset(mask, @as(f32, @floatFromInt(self.seq.ablate)));
+                 try self.upload(s.ablate, std.mem.sliceAsBytes(mask));
+             }
+             if (!self.prepared) try s.uploaded();
+diff --git a/zig/src/families/flashnext/cuda_batch_state.zig b/zig/src/families/flashnext/cuda_batch_state.zig
+index 84a32177..5385d22a 100644
+--- a/zig/src/families/flashnext/cuda_batch_state.zig
++++ b/zig/src/families/flashnext/cuda_batch_state.zig
+@@ -370,7 +370,7 @@ pub const Scratch = struct {
+     head_local: u64 = 0,
+     inv: u64 = 0,
+     dummy: u64 = 0,
+-    /// Each row's abliteration flag [cap] fp32 (1: its request asked for it), when the model carries directions.
++    /// Each row's identity [cap] fp32 (0: none), when the model carries directions.
+     ablate: u64 = 0,
+     /// Pinned host copies of what a pass uploads (ids, positions, n-gram rows and sums), owned until the copies land.
+     host: ?cuda.HostBuffer = null,
+@@ -569,8 +569,8 @@ pub const SeqState = struct {
+     scores: u64,
+     /// The format of kc and vc (cuda_kv.zig): bf16 rows, or --kv-cache fp8's codes and scales.
+     kv: @import("cuda_kv.zig").Kv = .bf16,
+-    /// The request named TENSORFOLD_ABLATE_MODEL: its rows get the writers' correction (cuda_ablate.zig).
+-    ablate: bool = false,
++    /// The identity the request named, 0 none: its rows get that identity's correction (cuda_ablate.zig).
++    ablate: u8 = 0,
+ };
+ 
+ /// The block scores' row stride for a cache of `cap` tokens: its blocks rounded up to 16 (the captured _scores').
+@@ -599,7 +599,7 @@ pub const Model = struct {
+     ngram: *const ple.Ngram,
+     /// The engine's own adds to the MoE outputs: a taught folder's pockets (null: none).
+     pocket: ?MoeAdd = null,
+-    /// TENSORFOLD_ABLATE's directions (the engine owns them); null: no writer is corrected.
++    /// TENSORFOLD_IDENTITIES' directions (the engine owns them); null: no writer is corrected.
+     abl: ?*const @import("cuda_ablate.zig").Ablation = null,
+ };
+ 
+diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
+index 0a8e1fe9..5c1bbf6a 100644
+--- a/zig/src/families/flashnext/cuda_lanes.zig
++++ b/zig/src/families/flashnext/cuda_lanes.zig
+@@ -94,7 +94,7 @@ pub fn Namespace(comptime Tri: type) type {
+             /// Whether our own glue runs (no captured set given, or one without this family's entry points).
+             own_glue: bool = true,
+             follow: ?*const fn (*anyopaque) anyerror!void = null,
+-            /// The engine loaded TENSORFOLD_ABLATE: requests may ask for the abliteration.
++            /// The engine loaded TENSORFOLD_IDENTITIES: requests may name one.
+             ablate: bool = false,
+         };
+ 
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+index 24ea4953..2d616884 100644
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -158,7 +158,7 @@ pub const Engine = struct {
+     taught_rows: u64 = 0,
+     /// The attention caches' format of every sequence this engine makes (--kv-cache); set before the first newSeq.
+     kv: kv_format.Kv = .bf16,
+-    /// TENSORFOLD_ABLATE's directions, applied to the rows of sequences that ask (cuda_ablate.zig); null: unset.
++    /// TENSORFOLD_IDENTITIES' directions, applied to the rows of sequences that name one (cuda_ablate.zig); null: none.
+     abl: ?ablate.Ablation = null,
+ 
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, model_dir: []const u8) !*Engine {
+@@ -489,8 +489,8 @@ pub const Seq = struct {
+     cap: usize,
+     /// The model as shipped: no learned neuron acts on its rows (a lesson writer's and its judge's reads).
+     untaught: bool = false,
+-    /// The request named TENSORFOLD_ABLATE_MODEL: its rows get the abliteration (cuda_ablate.zig).
+-    ablate: bool = false,
++    /// The identity the request named, 0 none: its rows get that abliteration (cuda_ablate.zig).
++    ablate: u8 = 0,
+     /// The format of kc and vc (the engine's --kv-cache).
+     kv: kv_format.Kv = .bf16,
+ 
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index f637ac6c..4a037684 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -34,8 +34,8 @@ pub const Input = struct {
+     logprobs: ?u8 = null,
+     /// ``/v1/completions``' ``prompt_logprobs``: rows for the prompt with this many alternatives; null: not asked.
+     prompt_logprobs: ?u8 = null,
+-    /// The request named the server's TENSORFOLD_ABLATE_MODEL.
+-    ablate: bool = false,
++    /// The identity the request's model id names, 1..n of Config.identities; 0: none.
++    ablate: u8 = 0,
+ };
+ 
+ /// A streamed piece: content text (a string) or a delta object (reasoning or tool calls).
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index 17b53365..ce62aa5e 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -133,8 +133,8 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
+     const logprobs = if (is_chat) try fields.probabilityOptions(cx, body, exact_bytes) else try fields.legacyLogprobs(cx, body, exact_bytes);
+     if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
+     var input: chat.Input = .{ .fields = undefined };
+-    if (srv.config.ablate_model) |id| if (body.get("model")) |m| {
+-        input.ablate = m == .string and std.mem.eql(u8, m.string, id);
++    if (body.get("model")) |m| if (m == .string) for (srv.config.identities, 1..) |id, i| if (std.mem.eql(u8, m.string, id)) {
++        input.ablate = @intCast(i);
+     };
+     if (is_chat) {
+         input.messages = try messages.normalizeWith(cx, body.get("messages"), "system", srv.needs_user_after_tool, .of(srv.info.vision));
+diff --git a/zig/src/server/serve.zig b/zig/src/server/serve.zig
+index 5414572b..f83302ea 100644
+--- a/zig/src/server/serve.zig
++++ b/zig/src/server/serve.zig
+@@ -2,6 +2,7 @@
+ const std = @import("std");
+ const platform = @import("sys");
+ const api = @import("engine_api");
++const identities = @import("lanes").identities;
+ const json = @import("json");
+ const auth = @import("auth.zig");
+ const cli = @import("cli.zig");
+@@ -132,8 +133,14 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+     defer store.deinit();
+     if (!store.enabled() and !auth.loopback(args.host)) log.line("warning: non-loopback server has no API key; requests are open", .{});
+     var ids: std.ArrayList([]const u8) = .empty;
+-    const ablate_model = if (env(s, "TENSORFOLD_ABLATE_MODEL")) |m| std.mem.trim(u8, m, " \t\r\n") else "";
+-    for ([_][]const []const u8{ &.{s.served}, args.alias, &.{ablate_model} }) |group| for (group) |raw| {
++    var names: [identities.max]identities.Identity = undefined;
++    const listed = identities.list(env(s, "TENSORFOLD_IDENTITIES"), env(s, "TENSORFOLD_ABLATE"), env(s, "TENSORFOLD_ABLATE_MODEL"), &names) catch |e| {
++        std.debug.print("tensorfold: TENSORFOLD_IDENTITIES: {s} (id=path entries separated by commas, at most {d})\n", .{ @errorName(e), identities.max });
++        return 1;
++    };
++    var identity_ids: [identities.max][]const u8 = undefined;
++    for (listed, 0..) |ident, i| identity_ids[i] = ident.id;
++    for ([_][]const []const u8{ &.{s.served}, args.alias, identity_ids[0..listed.len] }) |group| for (group) |raw| {
+         const id = std.mem.trim(u8, raw, " \t\r\n");
+         if (id.len == 0) continue;
+         for (ids.items) |seen| {
+@@ -178,7 +185,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+         .prompt_seed = args.prompt_seed,
+         .sse_keepalive_s = keepalive_s,
+         .request_log = env(s, "TENSORFOLD_REQUEST_LOG"),
+-        .ablate_model = if (ablate_model.len > 0) ablate_model else null,
++        .identities = identity_ids[0..listed.len],
+         .dashboard = args.dashboard,
+         .compact_at = if (args.compact_auto) .{ .auto = {} } else if (args.compact_fraction) |f| .{ .fraction = f } else null,
+         .compact_keep = args.compact_keep,
+@@ -210,10 +217,10 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
+         std.debug.print("tensorfold: --loop-guard is not supported by this native engine\n", .{});
+         return 2;
+     }
+-    if (config.ablate_model) |m| if (!srv.info.ablate) {
+-        std.debug.print("tensorfold: TENSORFOLD_ABLATE_MODEL={s} needs TENSORFOLD_ABLATE and an engine that applies it\n", .{m});
++    if (config.identities.len > 0 and !srv.info.ablate) {
++        std.debug.print("tensorfold: TENSORFOLD_IDENTITIES needs an engine that loads and applies them\n", .{});
+         return 2;
+-    };
++    }
+     if (raiseOpenFileLimit()) |r| log.line("open-file limit raised: soft {d} -> {d}", .{ r[0], r[1] });
+     const address = resolve(io, args.host, args.port) orelse {
+         std.debug.print("tensorfold: cannot resolve --host {s}\n", .{args.host});
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index a16f8f93..e17bded7 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -71,8 +71,8 @@ pub const Config = struct {
+     prompt_seed: bool = false,
+     /// TENSORFOLD_REQUEST_LOG: where chat and completion bodies are appended; null: nowhere.
+     request_log: ?[]const u8 = null,
+-    /// TENSORFOLD_ABLATE_MODEL: the model id whose requests get the abliteration; null: none do.
+-    ablate_model: ?[]const u8 = null,
++    /// TENSORFOLD_IDENTITIES' model ids in order: a request naming the i-th gets identity i + 1; empty: none do.
++    identities: []const []const u8 = &.{},
+     /// Null keeps every reply identical to a server that has no compaction.
+     compact_at: ?CompactAt = null,
+     /// Tokens of the recent tail kept whole. Null uses min(20000, a quarter of the window).

@@ -14,7 +14,8 @@
 # Settings, from the environment or ./.env (scripts/config.sh):
 #   serving  CONTEXT, PARALLEL, MAX_TOKENS, THINKING, DRAFTS, TEMPERATURE, TOP_P, TOP_K, SERVED_NAME, HOST, PORT
 #   files    CHECKPOINT (nvfp4 | int4), MODEL_ID, MODEL_REVISION, HF_CACHE, KERNEL_CACHE, STATE_DIR
-#   ablit    ABLIT=1 serves NVIDIA's FP4 with the Keys house-qsa abliteration overlay (gated; needs an HF token); 0 is stock (default)
+#   ablit    ABLIT=1 serves NVIDIA's FP4 with the Keys house-qsa abliteration overlay (gated; needs an HF token); 0 is stock (default);
+#            2 serves stock and SERVED_NAME-abliterated (the same abliteration) side by side, per request
 #   image    IMAGE, TF_REPO, TF_REF, ZIG_VERSION, BASE_IMAGE, GHCR_IMAGE, CONTAINER_NAME
 #   setup    PREPARE (auto | 1 | 0), PULL, FOREGROUND=1, WAIT_TIMEOUT, DRY_RUN=1, MEM_NEED_GIB, MEM_CHECK=0
 #   engine   every TENSORFOLD_* and TF_FLASHNEXT_* variable goes into the container
@@ -79,7 +80,7 @@ source ./scripts/banner.sh
 echo
 banner
 printf '\n%s  Mia'"'"'s TensorFold Start Script%s\n' "$M" "$R"
-printf '%s  %s · %s at once · %s-token window · %s KV · vision %s · drafts %s · port %s%s\n\n' "$D" "$MODEL_ID$( [[ "$ABLIT" == 1 ]] && echo ' + ablit')" \
+printf '%s  %s · %s at once · %s-token window · %s KV · vision %s · drafts %s · port %s%s\n\n' "$D" "$MODEL_ID$( [[ "$ABLIT" == 1 ]] && echo ' + ablit'; [[ "$ABLIT" == 2 ]] && echo " + $SERVED_NAME-abliterated")" \
   "$(arg_value --parallel)" "$(arg_value --context)" "$KV_DTYPE" \
   "$( [[ "$VISION" == 1 ]] && echo on || echo off)" \
   "$( [[ "$DRAFTS" == 1 ]] && echo MTP || echo off)" "$PORT" "$R"
@@ -166,6 +167,10 @@ if (( PARALLEL * full + WEIGHTS_GIB + TENSORFOLD_MEMORY_RESERVE_GIB > 121 )); th
   warn "$PARALLEL full windows are ~$((PARALLEL * full)) GiB of $KV_DTYPE cache beside ~$WEIGHTS_GIB GiB of weights: the engine keeps $TENSORFOLD_MEMORY_RESERVE_GIB GiB free and refuses a request that would not fit"
 fi
 
+if [[ -n "$(hf_identities)" ]]; then
+  if resolved=$(identities_resolved); then export TENSORFOLD_IDENTITIES="$resolved"
+  else missing "TENSORFOLD_IDENTITIES names a Hugging Face file that is not downloaded: $why download it"; fi
+fi
 ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}")
 while IFS='=' read -r name _; do
   [[ "$name" == TENSORFOLD_API_KEY ]] && continue
