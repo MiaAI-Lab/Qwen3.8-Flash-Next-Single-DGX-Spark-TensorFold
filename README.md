@@ -314,7 +314,8 @@ the docker command and changes nothing.
 
 1. Preflight: Docker, disk.
 2. The image `tensorfold-qwen38:v1.2.7-93a2e93`: TensorFold v1.2.7 (`TF_REF`) with every `patches/*.patch` applied, Zig 0.17.0, libjpeg-turbo and libwebp's decoder
-   (built from checksummed sources), on `nvcr.io/nvidia/pytorch:26.07-py3`; the build runs `fatbins native` only. `libtfgrammar.so` is copied out of TensorFold's v1.2.7 release archive
+   (built from checksummed sources), FFmpeg 9.0.2 and `libtfvideo.so` (`zig build video`, off the paths the server probes) and
+   the wheel's `libpdfium.so`, on `nvcr.io/nvidia/pytorch:26.07-py3`; the build runs `fatbins native video`. `libtfgrammar.so` is copied out of TensorFold's v1.2.7 release archive
    (SHA-256 pinned in `config.sh`, the same as the release's own `.sha256`). It tries a matching prebuilt image from GitHub
    Container Registry first (`PULL=0` builds locally). No image of the v1.2.7 patch set is published yet, so the first run builds it; the v1.1.4 image
    (`v1.1.4-eab8582-4baf16137ecd`) stays in the registry.
@@ -327,6 +328,36 @@ scripts/prepare.sh
 scripts/prepare.sh --rebuild
 PREPARE=1 ./start.sh restart
 ```
+
+### Hardening the image (opt-in)
+
+`scripts/harden.sh` (new) cuts the parts of NVIDIA's NGC base this recipe never runs, as a layer of its own: `linux-libc-dev`
+(the container shares the host's kernel), the Nsight profilers, and Debian's `python3-pip`/`python3-setuptools` with their
+vendored `urllib3` and `msgpack` copies, then reinstalls `python3-yaml`, which `apt-get autoremove` otherwise takes and which
+the container-side checkpoint download imports. It never touches `$IMAGE`: it tags
+`tensorfold-qwen38:<tag>-hardened-<hash>` beside it, and you serve that one with
+`IMAGE=tensorfold-qwen38:<tag>-hardened-<hash> ./start.sh restart`. Nothing in `prepare.sh` or `start.sh` runs it, so the
+default image and its published tag are unchanged.
+
+Two knobs, both off by default because both trade reproducibility for CVE counts: `APT_UPGRADE=1` (an `apt-get upgrade`, so
+distro fixes the scanner wants) and `PIP_UPGRADE="urllib3==2.8.0 pillow==13.0.0"` (pip versions by name; nothing is pinned or
+upgraded unless you name it). `PIP_UNINSTALL="wandb jupyterlab notebook nbconvert jupyter_server flash_attn"` covers a base
+that still carries them — the pinned `26.07-py3` does not, so it is empty here.
+
+The script calls no scanner (nothing here is installed to run one) and promises no CVE count: [issue #77](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/issues/77)
+reports 28 CRITICAL and 628 HIGH falling to 0 and 0, measured on the older `zig-db28187` image, and no scan has been run
+against this one. What it does promise is a gate you can trust without a scanner: the new tag is kept only if
+`tensorfold-native --help` and `tensorfold-native serve --help` still run, the decoders are still where the engine looks, and
+`yaml, requests, filelock, fsspec, packaging, huggingface_hub` plus the `hf` CLI are still there for the download path —
+otherwise it removes the tag and leaves `$IMAGE` alone. Run it and the check yourself:
+
+```bash
+scripts/harden.sh                                    # ~1 min on a cached base
+trivy image --severity CRITICAL,HIGH tensorfold-qwen38:v1.2.7-93a2e93-hardened-<hash>   # your scanner, your counts
+```
+
+One expectation to set: the image does not get smaller. The purged files go into a later layer as whiteouts, so the base's
+layers still hold their bytes; what changes is the filesystem the server — and a scanner that reads the merged rootfs — sees.
 
 ## KV and memory
 
@@ -522,7 +553,7 @@ Whether the pieces that were not ported still matter is a measurement of the v1.
 ```
 start.sh      set up (first run) and start the server
 stop.sh       stop it
-scripts/      prepare.sh, config.sh, publish-image.sh, banner.sh, ablit_view.py
+scripts/      prepare.sh, config.sh, harden.sh, publish-image.sh, banner.sh, ablit_view.py
 patches/      this recipe's changes, applied onto TensorFold v1.2.7 at TF_REF
 tools/        checks
 .github/      issue and pull request templates, GitHub Sponsors

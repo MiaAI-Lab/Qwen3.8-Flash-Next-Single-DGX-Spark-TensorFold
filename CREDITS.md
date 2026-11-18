@@ -133,6 +133,11 @@ This recipe no longer applies those patches (the serving path is the Zig engine)
   (`zig/src/server/pdf.zig`, `pdf_worker.zig`), so the engine half is upstream's and theirs is the request and the
   design push; `PDF=1`, the pinned `libpdfium.so` in the image and the `--vision-pdf` wiring in `start.sh` are
   MiaAI-Lab's.
+- **[MimiTechAi](https://github.com/MimiTechAi)** brought
+  [#77](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/issues/77): the scan of the NGC base,
+  the list of what can go from it and the `python3-yaml` gotcha that `apt-get autoremove` exposes. `scripts/harden.sh`
+  takes those cuts; the opt-in shape, the boot gate and the choice to leave `apt-get upgrade` and every pip version to
+  the operator are MiaAI-Lab's.
 - **[chai-md](https://github.com/chai-md)** wrote
   [#90](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/pull/90), the video patch for the CUDA
   engine: `patches/0005` is theirs, re-based onto TensorFold v1.2.7 by MiaAI-Lab (the field layout had moved and the patch

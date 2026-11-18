@@ -5,6 +5,24 @@ Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:
 
 ## Unreleased
 
+**2026-11-18: `scripts/harden.sh` (new) cuts the NGC base's unused ballast into its own image tag, opt-in.**
+[issue #77](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/issues/77) by
+[MimiTechAi](https://github.com/MimiTechAi) reported 28 CRITICAL and 628 HIGH from a scan of the image and brought a
+hardening layer. `scripts/harden.sh` takes their cuts that hold on the current image — `linux-libc-dev`, the Nsight
+profilers (dpkg packages and the copies under `/usr/local/cuda-*`), Debian's `python3-pip` and `python3-setuptools` with
+their vendored `urllib3`/`msgpack` — and their `python3-yaml` restoration, which `apt-get autoremove` otherwise takes and
+the container-side checkpoint download needs. It is a separate tag
+(`tensorfold-qwen38:<tag>-hardened-<hash>`) built over `$IMAGE`: `prepare.sh`, `start.sh`, `image_hash()` and the
+published tag are untouched, and you opt in by pointing `IMAGE` at it. Two of their steps stay off by default because
+both trade reproducibility for CVE counts: `APT_UPGRADE=1` runs the `apt-get upgrade`, and `PIP_UPGRADE="urllib3==2.8.0
+..."` installs only versions you name — the script pins no versions of its own, and the `26.07-py3` base already carries
+none of the jupyter/wandb/flash_attn ballast they purged. `pip` stays in the image (only Debian's copies go; the NGC
+`/usr/local/bin/pip` remains). No scanner is installed here, so the counts are the reporter's and unverified against
+`v1.2.7-93a2e93`; what the script guarantees instead is a gate — the tag survives only if `tensorfold-native --help` and
+`serve --help` still run, the decoders are still where the engine looks, and `yaml, requests, filelock, fsspec, packaging,
+huggingface_hub` and `hf` still import for the download path. Run here: the hardened tag built over
+`tensorfold-qwen38:v1.2.7-93a2e93` and passed that gate; the image does not shrink (whiteouts, not smaller layers).
+Test: `tools/test_harden_recipe.py` (offline).
 **2026-11-18: `VIDEO=1` (new, off by default) serves video parts; the image builds `libtfvideo` over a pinned FFmpeg.**
 The Flash Next CUDA engine had no video path: `cuda_images.zig` prepared no frames and `vision/qwen_cuda_media.zig`
 refused a video token, while the server, the sampler (`zig/src/core/qwen_vl/video.zig`, 2 frames a second, two frames a
