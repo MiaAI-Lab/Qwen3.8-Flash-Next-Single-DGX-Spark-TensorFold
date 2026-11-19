@@ -505,6 +505,19 @@ the model was still thinking.
   ([issue #1](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/issues/1),
   [PR #2](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/pull/2)).
 
+### Client and host notes
+
+- **One tool call per step under the `ptc` preset.** A step that emits several top-level tool calls settles only the
+  first: the remaining ones come back as raw `<tool_call>` text marked as failed. Emit one call per step and fan out
+  inside it (`Promise.all`), or run the `standard` preset, where every top-level call of a step is settled. Checked on
+  the DeepSeek Harness 0.2.2-rc.5 (`ptc` and `standard` presets), against this build
+  ([issue #92](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/issues/92)).
+- **The Tencent Lemon menu-bar widgets (network, CPU, GPU, memory) can vanish on their own.** Four causes, in the order
+  they are usually hit: after a wake or a resolution change the `NSStatusItem` entries are not rebuilt; a module's own
+  switch in the Lemon preferences is off; a second `open` stops the first instance under the single-instance policy;
+  and on a notched display the later items collapse into the `«` overflow. Toggling the window or restarting Lemon
+  brings the items back.
+
 ## What the patches are
 
 `patches/*.patch` are this recipe's changes to TensorFold v1.2.7 (commit `93a2e93e`), applied with `git apply` in the checkout root by `scripts/prepare.sh`.
