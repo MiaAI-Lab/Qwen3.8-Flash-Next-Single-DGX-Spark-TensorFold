@@ -1,5 +1,5 @@
 diff --git a/docs/vision.md b/docs/vision.md
-index 8ff61c7..ca207cc 100644
+index bd0056096..497a6e3d7 100644
 --- a/docs/vision.md
 +++ b/docs/vision.md
 @@ -30,7 +30,7 @@ tensorfold serve TensorFold/Qwen3.8-27B-MLX-4bit --vision
@@ -13,7 +13,7 @@ index 8ff61c7..ca207cc 100644
  MLX also reads per-module quantized tower weights when the checkpoint declares their format.
 diff --git a/zig/src/vision/qwen_cuda_dequant.zig b/zig/src/vision/qwen_cuda_dequant.zig
 new file mode 100644
-index 0000000..40bebd8
+index 000000000..40bebd8e9
 --- /dev/null
 +++ b/zig/src/vision/qwen_cuda_dequant.zig
 @@ -0,0 +1,143 @@
@@ -161,7 +161,7 @@ index 0000000..40bebd8
 +    try std.testing.expectEqual(@as(u16, 0x0040), out[33]);
 +}
 diff --git a/zig/src/vision/qwen_cuda_weights.zig b/zig/src/vision/qwen_cuda_weights.zig
-index 7fdd005..2b6bd5d 100644
+index 264d02e86..a08ed0a9b 100644
 --- a/zig/src/vision/qwen_cuda_weights.zig
 +++ b/zig/src/vision/qwen_cuda_weights.zig
 @@ -1,6 +1,7 @@
@@ -242,7 +242,7 @@ index 7fdd005..2b6bd5d 100644
          if (r.ck.unused() != 0) return error.UnusedVisionTensors;
      }
 diff --git a/zig/src/vision/qwen_cuda_weights_logs.zig b/zig/src/vision/qwen_cuda_weights_logs.zig
-index 58a7a65..c52155e 100644
+index 58a7a6519..c52155e76 100644
 --- a/zig/src/vision/qwen_cuda_weights_logs.zig
 +++ b/zig/src/vision/qwen_cuda_weights_logs.zig
 @@ -8,7 +8,8 @@ pub fn log(comptime level: std.log.Level, comptime scope: @EnumLiteral(), compti
@@ -257,7 +257,7 @@ index 58a7a65..c52155e 100644
      std.debug.print(format ++ "\n", args);
 diff --git a/zig/src/vision/qwen_cuda_weights_quant_test.zig b/zig/src/vision/qwen_cuda_weights_quant_test.zig
 new file mode 100644
-index 0000000..17fdd49
+index 000000000..17fdd494f
 --- /dev/null
 +++ b/zig/src/vision/qwen_cuda_weights_quant_test.zig
 @@ -0,0 +1,233 @@
@@ -495,7 +495,7 @@ index 0000000..17fdd49
 +    }
 +}
 diff --git a/zig/src/vision/qwen_cuda_weights_test.zig b/zig/src/vision/qwen_cuda_weights_test.zig
-index 8d92c93..9952e61 100644
+index 8d92c939c..9952e61fd 100644
 --- a/zig/src/vision/qwen_cuda_weights_test.zig
 +++ b/zig/src/vision/qwen_cuda_weights_test.zig
 @@ -4,6 +4,11 @@ const weights = @import("qwen_cuda_weights.zig");

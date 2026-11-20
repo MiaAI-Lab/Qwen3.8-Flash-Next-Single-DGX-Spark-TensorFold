@@ -1,5 +1,5 @@
 diff --git a/zig/src/vision/qwen_cuda_media.zig b/zig/src/vision/qwen_cuda_media.zig
-index 87248f7..5cd9548 100644
+index 87248f79a..5cd954852 100644
 --- a/zig/src/vision/qwen_cuda_media.zig
 +++ b/zig/src/vision/qwen_cuda_media.zig
 @@ -3,9 +3,11 @@ const std = @import("std");
