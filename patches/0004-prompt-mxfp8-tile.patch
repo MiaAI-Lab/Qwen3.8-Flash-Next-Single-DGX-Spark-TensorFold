@@ -1,5 +1,5 @@
 diff --git a/zig/kernels/cuda/qmmf.cu b/zig/kernels/cuda/qmmf.cu
-index 25c091c1..2e70e8db 100644
+index 25c091c17..2e70e8db5 100644
 --- a/zig/kernels/cuda/qmmf.cu
 +++ b/zig/kernels/cuda/qmmf.cu
 @@ -243,8 +243,148 @@ BF16_K32(true)
@@ -152,7 +152,7 @@ index 25c091c1..2e70e8db 100644
  // tf-cuda-test native-fp: e2m1_pairs == fp4pair on all words, codes x e4m3 scales; out: misses, first, checks
  extern "C" __global__ void tf_qmmf_native_fp4_check(unsigned long long* __restrict__ out) {
 diff --git a/zig/src/cuda/qmmf.zig b/zig/src/cuda/qmmf.zig
-index 559f8db0..ed4702d2 100644
+index 559f8db09..ed4702d21 100644
 --- a/zig/src/cuda/qmmf.zig
 +++ b/zig/src/cuda/qmmf.zig
 @@ -157,6 +157,12 @@ fn loadTiles(mod: Module, comptime mode: Mode, comptime wide: bool) ![7]Function
@@ -257,7 +257,7 @@ index 559f8db0..ed4702d2 100644
      try std.testing.expectEqualStrings("_ZN7tf_qmmf11qmmf_kernelILi4ELi64ELi64ELi1ELi4ELi4ELb1ELb0ELb1EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", symbol(.bf16, 64, false, true, true));
      try std.testing.expectEqualStrings("_ZN7tf_qmmf11qmmf_kernelILi2ELi16ELi64ELi1ELi4ELi4ELb0ELb1ELb0EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", symbol(.mxfp8, 16, true, false, false));
 diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
-index 73ed0426..9a53515d 100644
+index 73ed04265..9a53515db 100644
 --- a/zig/src/families/flashnext/cuda_batch.zig
 +++ b/zig/src/families/flashnext/cuda_batch.zig
 @@ -129,8 +129,8 @@ pub fn Pass(comptime Tri: type) type {
@@ -272,7 +272,7 @@ index 73ed0426..9a53515d 100644
          pub fn sumSlices(self: *Self, part: u64, out: u64, bf16: bool, n: usize, sk: usize) !void {
              return ops.sumSlices(self.k, self.stream, part, out, bf16, n, sk);
 diff --git a/zig/src/families/flashnext/cuda_batch_kernels.zig b/zig/src/families/flashnext/cuda_batch_kernels.zig
-index 548a10b6..67832844 100644
+index 3a401d18f..e3abc8413 100644
 --- a/zig/src/families/flashnext/cuda_batch_kernels.zig
 +++ b/zig/src/families/flashnext/cuda_batch_kernels.zig
 @@ -41,6 +41,7 @@ pub const Forms = struct {
@@ -291,15 +291,15 @@ index 548a10b6..67832844 100644
          };
      }
  };
-@@ -116,6 +118,7 @@ pub const Kernels = struct {
-         k.native_lane = try cuda.qmmf.Lane.load(d, (try d.currentCapability()) / 10); // the current device: its tiles
+@@ -117,6 +119,7 @@ pub const Kernels = struct {
          errdefer k.native_lane.unload();
-         if (envOn("TF_FLASHNEXT_PROMPT_BF16")) try k.native_lane.loadPrompt(d); // the shapes qmmf-prompt-bench times
+         const bf16 = try @import("sys").environment.read(bool, "TF_FLASHNEXT_PROMPT_BF16", true);
+         if (bf16) try k.native_lane.loadPrompt(d); // the shapes qmmf-prompt-bench times
 +        try k.native_lane.loadPromptMx(k.forms.mx_min_n); // prompt passes only (nativeMatmulFor)
          var device: c_int = 0;
          var sms: c_int = 0;
          try d.check(d.api.cuDeviceGet(&device, 0), "cuDeviceGet");
-@@ -150,6 +153,13 @@ pub const Kernels = struct {
+@@ -151,6 +154,13 @@ pub const Kernels = struct {
          return k.native_lane.matmulOut(s, x, ldx, m, w, y, out, part);
      }
  
@@ -312,12 +312,12 @@ index 548a10b6..67832844 100644
 +
      /// TF_FLASHNEXT_PROFILE=1: each chunk's wall time (synchronized) and its host n-gram gather on stderr.
      pub fn profile() bool {
-         const v = std.c.getenv("TF_FLASHNEXT_PROFILE") orelse return false;
+         // the startup check refused every malformed value already, so a plain default stands here
 diff --git a/zig/src/families/flashnext/cuda_disk.zig b/zig/src/families/flashnext/cuda_disk.zig
-index 697bd7ba..9f3c66da 100644
+index ed4c0a6cb..9d7d0a8c2 100644
 --- a/zig/src/families/flashnext/cuda_disk.zig
 +++ b/zig/src/families/flashnext/cuda_disk.zig
-@@ -167,6 +167,7 @@ pub fn policyOf(c: anytype) [13]u64 {
+@@ -125,6 +125,7 @@ pub fn policyOf(c: anytype) [13]u64 {
      grids.update(std.mem.asBytes(&k.fp8.resident));
      if (k.expert_tile) |x| grids.update(std.mem.asBytes(&x.resident));
      grids.update(std.mem.asBytes(&k.native_lane.prompt_sms)); // a BF16 prompt tile runs over half these SMs' worth
@@ -327,7 +327,7 @@ index 697bd7ba..9f3c66da 100644
          e.chunk,
 diff --git a/zig/src/families/flashnext/cuda_prompt_knobs.zig b/zig/src/families/flashnext/cuda_prompt_knobs.zig
 new file mode 100644
-index 00000000..672d80bf
+index 000000000..672d80bf4
 --- /dev/null
 +++ b/zig/src/families/flashnext/cuda_prompt_knobs.zig
 @@ -0,0 +1,13 @@
@@ -345,7 +345,7 @@ index 00000000..672d80bf
 +    if (std.c.getenv("TF_FLASHNEXT_PROMPT_MX128") == null) try std.testing.expectEqual(@as(usize, 1024), mx128MinN());
 +}
 diff --git a/zig/src/families/flashnext/cuda_tiles.zig b/zig/src/families/flashnext/cuda_tiles.zig
-index b62e0e79..a003ec3d 100644
+index b62e0e79f..a003ec3d3 100644
 --- a/zig/src/families/flashnext/cuda_tiles.zig
 +++ b/zig/src/families/flashnext/cuda_tiles.zig
 @@ -32,14 +32,15 @@ fn sweepOf(m: usize, bm: usize, k: usize) usize {
@@ -368,7 +368,7 @@ index b62e0e79..a003ec3d 100644
          try stream.d.check(stream.d.api.cuMemsetD8Async(part + bytes, 0, bytes, stream.handle), "cuMemsetD8Async");
          return 2;
 diff --git a/zig/src/families/flashnext/cuda_zero_slice.zig b/zig/src/families/flashnext/cuda_zero_slice.zig
-index 17e91dc6..f19841cb 100644
+index 17e91dc66..f19841cbf 100644
 --- a/zig/src/families/flashnext/cuda_zero_slice.zig
 +++ b/zig/src/families/flashnext/cuda_zero_slice.zig
 @@ -11,12 +11,12 @@ pub fn spends(native: bool, sk: usize, m: usize, n: usize, cap: usize) bool {
@@ -387,7 +387,7 @@ index 17e91dc6..f19841cb 100644
  }
  
 diff --git a/zig/src/native/cuda_disk_policy_test.zig b/zig/src/native/cuda_disk_policy_test.zig
-index bfb77eb7..3d5dcfe9 100644
+index 7e4092840..6cfede3aa 100644
 --- a/zig/src/native/cuda_disk_policy_test.zig
 +++ b/zig/src/native/cuda_disk_policy_test.zig
 @@ -176,6 +176,9 @@ test "disk identity: Flash Next CUDA resolved prompt rows, kernel forms and expe
@@ -419,28 +419,32 @@ index bfb77eb7..3d5dcfe9 100644
      _ = env.setenv("TF_FLASHNEXT_FACT_ROWS", "32", 1);
      try t.expectEqual(@as(usize, 128), Forms.resolve().readout_rows);
 diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
-index d5762d4f..bd935a5a 100644
+index f65202933..68412b7ad 100644
 --- a/zig/tests/cuda/main.zig
 +++ b/zig/tests/cuda/main.zig
-@@ -260,6 +260,7 @@ const usage =
-     \\  qmmf-prompt-contract     K64 and K32 replacement gates with both new output controls
-     \\  qmmf-prompt-repro        isolate M=65 N=8240 K=2560 SK=4 BF16 without clusters
-     \\  qmmf-prompt-bench        rank0 normal-main weighted A-B-A timings, plus separate MTP hidden timings
-+    \\  qmmf-prompt-mx           relaxed MXFP8 prompt tile: FP64 bound, row bytes independent of the call's rows, timed against the lane
-     \\  qmm-prefill-many-bench    same-process A-B-A screening for the GB10 launch fusion
-     \\  mtp-rows                  tf_q36m_attn_rows: gates 1-4 (byte-equal to tf_q36m_attn a segment) and float64 alone
-     \\  qwen-pages                qwen35.cu's attention cache through a page table: paged == contiguous, float64, red controls
-@@ -388,6 +389,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
-     if (std.mem.eql(u8, cmd, "nvfp4-b32")) return nvfp4_b32_tests.run(gpu);
+@@ -193,6 +193,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "nvfp4-nz5")) return @import("nvfp4_nz5_tests.zig").run(gpu);
      if (std.mem.eql(u8, cmd, "qmmf-prompt")) return @import("qmmf_prompt_tests.zig").run(gpu);
      if (std.mem.eql(u8, cmd, "qmmf-prompt-contract")) return @import("contract_qmmf_prompt.zig").run(gpu);
 +    if (std.mem.eql(u8, cmd, "qmmf-prompt-mx")) return @import("qmmf_prompt_mx_tests.zig").run(gpu);
      if (std.mem.eql(u8, cmd, "qmmf-prompt-repro")) return @import("qmmf_prompt_tests.zig").repro(gpu);
      if (std.mem.eql(u8, cmd, "qmmf-prompt-bench")) return @import("qmmf_prompt_tests.zig").bench(gpu);
      if (std.mem.eql(u8, cmd, "lane-half")) return lane_half_tests.run(gpu);
+diff --git a/zig/tests/cuda/main_usage.zig b/zig/tests/cuda/main_usage.zig
+index 14133ad0c..e245e9e8f 100644
+--- a/zig/tests/cuda/main_usage.zig
++++ b/zig/tests/cuda/main_usage.zig
+@@ -137,6 +137,7 @@ pub const usage =
+     \\  qmmf-prompt-contract     K64 and K32 replacement gates with both new output controls
+     \\  qmmf-prompt-repro        isolate M=65 N=8240 K=2560 SK=4 BF16 without clusters
+     \\  qmmf-prompt-bench        rank0 normal-main weighted A-B-A timings, plus separate MTP hidden timings
++    \\  qmmf-prompt-mx           relaxed MXFP8 prompt tile: FP64 bound, row bytes independent of the call's rows, timed against the lane
+     \\  qmm-prefill-many-bench    same-process A-B-A screening for the GB10 launch fusion
+     \\  prompt-swiglu-contract    the lean gate/up SwiGLU pair against two products and the act kernel, controls red
+     \\  prompt-swiglu-bench       same-process A-B-A: the lean SwiGLU pair against two products and the act kernel
 diff --git a/zig/tests/cuda/qmmf_prompt_mx_tests.zig b/zig/tests/cuda/qmmf_prompt_mx_tests.zig
 new file mode 100644
-index 00000000..b21c3700
+index 000000000..b21c37000
 --- /dev/null
 +++ b/zig/tests/cuda/qmmf_prompt_mx_tests.zig
 @@ -0,0 +1,134 @@
