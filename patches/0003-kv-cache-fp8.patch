@@ -1,8 +1,8 @@
 diff --git a/docs/recipes/flash-next-cuda.md b/docs/recipes/flash-next-cuda.md
-index f365550ba..7b7045172 100644
+index b0ee2602f..1afbc6a29 100644
 --- a/docs/recipes/flash-next-cuda.md
 +++ b/docs/recipes/flash-next-cuda.md
-@@ -92,6 +92,15 @@ its path.
+@@ -94,6 +94,15 @@ its path.
    layer reads 512 blocks of 4 keys a row, chosen by the model's block indexer, as the Python engine does.
  - `--parallel N` admits N streams. Each stream's caches are its own: about 110 MiB of DeltaNet state and the n-gram
    tail, plus 28 KiB a token of keys, values and indexer keys, and with drafts its MTP head's cache.
@@ -374,10 +374,10 @@ index da5f01f2e..b71e6c670 100644
          try p.shiftWindow(dst, p.s.ple_nrow, wt.wide, cut, wt.ple_tail_n, wt.wide);
      };
 diff --git a/zig/src/families/flashnext/cuda_batch_state.zig b/zig/src/families/flashnext/cuda_batch_state.zig
-index 80d3d073b..dc9168f6a 100644
+index 30f047ff1..def247c74 100644
 --- a/zig/src/families/flashnext/cuda_batch_state.zig
 +++ b/zig/src/families/flashnext/cuda_batch_state.zig
-@@ -530,6 +530,8 @@ pub const SeqState = struct {
+@@ -531,6 +531,8 @@ pub const SeqState = struct {
      scores: u64,
      /// The attention caches' pages (pt 0: kc, vc, ikc and pooled are contiguous rows).
      pg: @import("cuda_glue.zig").Pg = .{},
@@ -506,7 +506,7 @@ index 9a1b01c41..ecd079651 100644
          var a: cuda.Args = .{};
          ptrs(&a, &.{ po, pm, pl, pos, out, nk, sparse });
 diff --git a/zig/src/families/flashnext/cuda_images.zig b/zig/src/families/flashnext/cuda_images.zig
-index 0e2997552..68f717d9f 100644
+index f7a105265..266c63ce5 100644
 --- a/zig/src/families/flashnext/cuda_images.zig
 +++ b/zig/src/families/flashnext/cuda_images.zig
 @@ -22,6 +22,8 @@ pub const Vision = struct {
@@ -521,9 +521,9 @@ index 0e2997552..68f717d9f 100644
 @@ -70,11 +72,11 @@ pub const Vision = struct {
          return .{ .pixels = p.pixels, .gh = p.gh, .gw = p.gw, .tokens = p.tokens, .hash = p.hash };
      }
-     pub fn state(v: *Vision, ids: []const u32, images: []const @import("lanes").stream.Image) !media.State {
--        return .{ .image = try shared.media.Media.init(v.a, v.encoder, ids, images, v.limits), .prep = v.prep, .pool = v.pool, .prep_paged = v.prep_paged, .pool_paged = v.pool_paged };
-+        return .{ .image = try shared.media.Media.init(v.a, v.encoder, ids, images, v.limits), .prep = v.prep, .pool = v.pool, .prep_paged = v.prep_paged, .pool_paged = v.pool_paged, .prep8 = v.prep8 };
+     pub fn state(v: *Vision, ids: []const u32, images: []const @import("lanes").stream.Image, from: usize) !media.State {
+-        return .{ .image = try shared.media.Media.init(v.a, v.encoder, ids, images, v.limits, from), .prep = v.prep, .pool = v.pool, .prep_paged = v.prep_paged, .pool_paged = v.pool_paged };
++        return .{ .image = try shared.media.Media.init(v.a, v.encoder, ids, images, v.limits, from), .prep = v.prep, .pool = v.pool, .prep_paged = v.prep_paged, .pool_paged = v.pool_paged, .prep8 = v.prep8 };
      }
      pub fn receive(v: *Vision, n: usize, runs: []const shared.media.Run) !media.State {
          const p = try shared.media.Plan.init(v.a, n, runs, v.limits);
@@ -953,13 +953,13 @@ index 000000000..c5f6d0958
 +    }
 +}
 diff --git a/zig/src/families/flashnext/cuda_lanes.zig b/zig/src/families/flashnext/cuda_lanes.zig
-index fbd6b31b6..d98780f22 100644
+index ad470b8ce..f1f9d90a6 100644
 --- a/zig/src/families/flashnext/cuda_lanes.zig
 +++ b/zig/src/families/flashnext/cuda_lanes.zig
 @@ -60,7 +60,12 @@ pub fn Namespace(comptime Tri: type) type {
-             pub const min_gap: u32 = 256;
              pub const min_prompt: u32 = 512;
          };
+         pub const warm_quiet: u64 = 150 * std.time.ns_per_ms; // warm turns: a reply's background pass waits for quiet
 -        pub const Options = struct { vision: ?@import("cuda_images.zig").Limits = null, context: usize, drafts: bool, segments: usize = 1, slide: bool = false, tp: usize = 1, rank: usize = 0, master: ?[]const u8 = null, master_port: u16 = 29551, one_stream: bool = false };
 +        /// The MTP head cache's format for a drafting stream of `cap` positions (cuda_mtp_draft.zig headFormat).
 +        fn headKv(self: *const Cuda, cap: usize) @import("cuda_kv.zig").Kv {
@@ -970,7 +970,7 @@ index fbd6b31b6..d98780f22 100644
          /// Living Weights' learner (--slide): lessons put neurons in each layer's pocket beside its shared expert.
          pub const slide = slide_mod.Slide(Tri);
          /// The first file a lesson would rewrite through a link, or null: a teaching copy may hard-link the others.
-@@ -308,8 +313,8 @@ pub fn Namespace(comptime Tri: type) type {
+@@ -306,8 +311,8 @@ pub fn Namespace(comptime Tri: type) type {
                  }
                  if (drafting and from != .pool and l.part_seq != null) {
                      l.part_draft = try Parts.take(&self.parts.drafts, self.engine.driver, mtp.Draft.partsBytes(self.head.?.ids.len, self.engine.chunk, self.engine.heads));
@@ -978,9 +978,9 @@ index fbd6b31b6..d98780f22 100644
 -                } else if (drafting) l.draft = if (from == .pool) try self.kv.pool.?.draft(&l.seq, cap) else try mtp.Draft.init(self.gpa, self.engine.driver, self.stream, cap, self.head.?.ids.len, self.engine.chunk, self.engine.heads);
 +                    l.draft = try mtp.Draft.initPartsKv(self.gpa, self.engine.driver, self.stream, cap, self.head.?.ids.len, self.engine.chunk, self.engine.heads, l.part_draft.?, headKv(self, cap));
 +                } else if (drafting) l.draft = if (from == .pool) try self.kv.pool.?.draft(&l.seq, cap) else try mtp.Draft.initKv(self.gpa, self.engine.driver, self.stream, cap, self.head.?.ids.len, self.engine.chunk, self.engine.heads, headKv(self, cap));
-                 if (s.images.len != 0) {
-                     const v = self.vision orelse return error.VisionNotEnabled;
-                     l.seq.media = try v.state(ids, s.images);
+                 if (l.draft) |*d| d.label = s.id;
+                 s.cached = 0;
+                 // one rank restores first so a kept state's images skip the tower; ranks send every image's rows unfed
 diff --git a/zig/src/families/flashnext/cuda_lanes_explain.zig b/zig/src/families/flashnext/cuda_lanes_explain.zig
 index 51035bc98..c73f90225 100644
 --- a/zig/src/families/flashnext/cuda_lanes_explain.zig
@@ -994,7 +994,7 @@ index 51035bc98..c73f90225 100644
      };
  }
 diff --git a/zig/src/families/flashnext/cuda_lanes_load.zig b/zig/src/families/flashnext/cuda_lanes_load.zig
-index 9bc26ca99..0b813911d 100644
+index 5ad7e03cd..f6d767061 100644
 --- a/zig/src/families/flashnext/cuda_lanes_load.zig
 +++ b/zig/src/families/flashnext/cuda_lanes_load.zig
 @@ -36,6 +36,8 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
@@ -1006,9 +1006,9 @@ index 9bc26ca99..0b813911d 100644
      const driver: *cuda.Driver = @constCast(ctx.d);
      const own = try gpa.create(Cuda);
      errdefer gpa.destroy(own);
-@@ -65,6 +67,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
-     };
+@@ -66,6 +68,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
      own.engine = try prompt.Engine.initRank(gpa, io, driver, &own.stream, dir, o.tp, o.rank);
+     errdefer own.engine.deinit();
      own.engine.chunk = chunk;
 +    own.engine.kv = if (o.kv8) .fp8 else .bf16;
      if (own.ranks) |r| {
@@ -1059,7 +1059,7 @@ index 9bc26ca99..0b813911d 100644
 +    return @as(usize, v.image_tokens) * @import("cuda_prompt_wt.zig").dims * 2 + 16 * context;
 +}
 diff --git a/zig/src/families/flashnext/cuda_lanes_snap.zig b/zig/src/families/flashnext/cuda_lanes_snap.zig
-index 2af2dcce2..dfbaa6c5d 100644
+index 53939d353..4df048f1c 100644
 --- a/zig/src/families/flashnext/cuda_lanes_snap.zig
 +++ b/zig/src/families/flashnext/cuda_lanes_snap.zig
 @@ -26,7 +26,7 @@ pub fn Snaps(comptime Cuda: type) type {
@@ -1166,7 +1166,7 @@ index 72bf2c8e3..10f8fd353 100644
      }
      pub fn pooled(v: View, stream: cuda.Stream, ikc: u64, out: u64, pos: u64, w: u64, inv: u64, eps: f32, rows: usize, pg: Pg) !void {
 diff --git a/zig/src/families/flashnext/cuda_mtp.zig b/zig/src/families/flashnext/cuda_mtp.zig
-index 4d6f0424b..d8c061dc3 100644
+index d81114959..9082d83ce 100644
 --- a/zig/src/families/flashnext/cuda_mtp.zig
 +++ b/zig/src/families/flashnext/cuda_mtp.zig
 @@ -337,6 +337,7 @@ pub fn headBytes(fp8: bool) usize {
@@ -1344,7 +1344,7 @@ index dc236fac9..3fab7427a 100644
      pub fn hcDenseMix(_: @This(), _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) !void {}
      pub fn hcDown(_: @This(), _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) !void {}
 diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
-index e3aa3a0a5..0f64844ec 100644
+index 7d7fd7dd6..146f39767 100644
 --- a/zig/src/families/flashnext/cuda_prompt.zig
 +++ b/zig/src/families/flashnext/cuda_prompt.zig
 @@ -9,6 +9,7 @@ pub const batch = @import("cuda_batch.zig");
@@ -1373,7 +1373,7 @@ index e3aa3a0a5..0f64844ec 100644
      pub fn init(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, model_dir: []const u8) !*Engine {
          return initRank(gpa, io, driver, stream, model_dir, 1, 0);
      }
-@@ -153,6 +158,7 @@ pub const Engine = struct {
+@@ -155,6 +160,7 @@ pub const Engine = struct {
          e.image_factory = null;
          e.round_graph = .{};
          e.graphs = .{};
@@ -1381,7 +1381,7 @@ index e3aa3a0a5..0f64844ec 100644
          errdefer for (e.layers[0..e.n_layers]) |*l| l.free(gpa);
          e.model_dir = try gpa.dupe(u8, model_dir);
          errdefer gpa.free(e.model_dir);
-@@ -307,6 +313,7 @@ pub const Engine = struct {
+@@ -310,6 +316,7 @@ pub const Engine = struct {
              .fed = 0,
              .logits = &.{},
              .cap = cap,
@@ -1389,7 +1389,7 @@ index e3aa3a0a5..0f64844ec 100644
          };
          paged = null; // seq owns the pages from here
          // One rollback owns every published array, and drains before releasing any destination.
-@@ -314,8 +321,10 @@ pub const Engine = struct {
+@@ -317,8 +324,10 @@ pub const Engine = struct {
          seq.logits = try e.gpa.alloc(u8, vocab * 2);
          seq.conv = try zeros(e.gpa, e.driver, e.stream.*, linear_n, sizes.convBytes(e.heads));
          seq.state = try zeros(e.gpa, e.driver, e.stream.*, linear_n, sizes.stateBytes(e.heads));
@@ -1402,7 +1402,7 @@ index e3aa3a0a5..0f64844ec 100644
          seq.ikc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .index) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.indexBytes(cap));
          seq.pooled = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .pooled) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, pooledBytes(cap));
          seq.tail = try cuda.DeviceBuffer.alloc(e.driver, ple_tail_n * wide * 2);
-@@ -492,10 +501,12 @@ pub const Seq = struct {
+@@ -495,10 +504,12 @@ pub const Seq = struct {
      cap: usize,
      /// The model as shipped: no learned neuron acts on its rows (a lesson writer's and its judge's reads).
      untaught: bool = false,
@@ -1416,7 +1416,7 @@ index e3aa3a0a5..0f64844ec 100644
      }
  
      /// The attention kernels' page argument (zero: contiguous caches).
-@@ -579,4 +590,5 @@ test {
+@@ -582,4 +593,5 @@ test {
      _ = @import("cuda_sequence_completion_test.zig");
      _ = chunks;
      _ = sizes;
@@ -1696,10 +1696,10 @@ index 768bebd64..eaa6f20f0 100644
 +    }
 +}
 diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
-index dc9d051d9..6d44c4ba6 100644
+index 02a7d9680..14f3b0406 100644
 --- a/zig/src/native/cuda.zig
 +++ b/zig/src/native/cuda.zig
-@@ -542,6 +542,7 @@ test "Flash Next takes --vision at family admission" {
+@@ -548,6 +548,7 @@ test "Flash Next takes --vision at family admission" {
      try @import("cuda_flashnext_refusal_test.zig").vision();
  }
  test {
@@ -2007,10 +2007,10 @@ index 000000000..03b261a33
 +    check.pass("flashnext-kv8: the quantizing write equals the format's model byte for byte; the widening reads equal the bf16 kernels on the dequantized rows, dense and sparse, chunked and fused", .{});
 +}
 diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
-index f09b14e3e..c078a00bd 100644
+index 73de15d90..f45fdfc7e 100644
 --- a/zig/tests/cuda/main.zig
 +++ b/zig/tests/cuda/main.zig
-@@ -95,6 +95,7 @@ const lane_half_tests = @import("lane_half_tests.zig");
+@@ -92,6 +92,7 @@ const lane_half_tests = @import("lane_half_tests.zig");
  const flashnext_dense_hc_tests = @import("flashnext_dense_hc_tests.zig");
  const flashnext_hc_tests = @import("flashnext_hc_tests.zig");
  const flashnext_attn_tests = @import("flashnext_attn_tests.zig");
@@ -2018,7 +2018,7 @@ index f09b14e3e..c078a00bd 100644
  const ggml_tests = @import("ggml_tests.zig");
  const paged_tests = @import("paged_tests.zig");
  const glm_loader_gate = @import("glm_loader_gate.zig");
-@@ -204,6 +205,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+@@ -201,6 +202,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
      if (std.mem.eql(u8, cmd, "flashnext-pages")) return @import("contract_fn_pages.zig").run(gpu);
      if (std.mem.eql(u8, cmd, "flashnext-attn-lanes")) return @import("contract_fn_attn_lanes.zig").run(gpu);
      if (std.mem.startsWith(u8, cmd, "flashnext-readout-")) return if (std.mem.eql(u8, cmd, "flashnext-readout-cut")) @import("flashnext_readout_cut.zig").run(gpu) else if (std.mem.eql(u8, cmd, "flashnext-readout-fused")) @import("flashnext_readout_fused.zig").run(gpu) else error.UnknownCommand;
@@ -2027,7 +2027,7 @@ index f09b14e3e..c078a00bd 100644
      if (std.mem.eql(u8, cmd, "smoke")) return runtime_tests.smoke(gpu);
      if (std.mem.eql(u8, cmd, "shared-context")) return runtime_tests.sharedContext(gpu);
 diff --git a/zig/tests/cuda/main_usage.zig b/zig/tests/cuda/main_usage.zig
-index e588db109..7c81672ad 100644
+index 0712cd8b6..f6fe352f7 100644
 --- a/zig/tests/cuda/main_usage.zig
 +++ b/zig/tests/cuda/main_usage.zig
 @@ -31,6 +31,7 @@ pub const usage =

@@ -40,7 +40,7 @@ for arg in "$@"; do [[ "$arg" == -h || "$arg" == --help ]] && { usage; exit 0; }
 for v in THINKING DRAFTS VISION VISION_URLS PDF VIDEO; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
 [[ "$PDF" != 1 || "$VISION" == 1 ]] || die "PDF=1 renders pages through the vision path: start it with VISION=1 (the default)"
 [[ "$VIDEO" != 1 || "$VISION" == 1 ]] || die "VIDEO=1 decodes through the vision path: start it with VISION=1 (the default)"
-(( CONTEXT <= 262144 )) || die "CONTEXT=$CONTEXT is past 262,144: TensorFold 1.3.2's Flash Next engine has no YaRN extension"
+(( CONTEXT <= 262144 )) || die "CONTEXT=$CONTEXT is past 262,144: TensorFold 1.3.4's Flash Next engine has no YaRN extension"
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 
 SERVE_ARGS=(--context "$CONTEXT" --parallel "$PARALLEL" --max-tokens "$MAX_TOKENS"

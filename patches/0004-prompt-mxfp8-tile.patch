@@ -1,8 +1,8 @@
 diff --git a/zig/kernels/cuda/qmmf.cu b/zig/kernels/cuda/qmmf.cu
-index c08ad62af..e388731c4 100644
+index 20452d9f6..dbba5ce12 100644
 --- a/zig/kernels/cuda/qmmf.cu
 +++ b/zig/kernels/cuda/qmmf.cu
-@@ -248,8 +248,148 @@ BF16_K32(true)
+@@ -262,8 +262,148 @@ BF16_K32(true)
  template __global__ void reduce_kernel<true>(const float* __restrict__, void* __restrict__, long long, int, float);
  template __global__ void reduce_kernel<false>(const float* __restrict__, void* __restrict__, long long, int, float);
  
@@ -152,7 +152,7 @@ index c08ad62af..e388731c4 100644
  // tf-cuda-test native-fp: e2m1_pairs == fp4pair on all words, codes x e4m3 scales; out: misses, first, checks
  extern "C" __global__ void tf_qmmf_native_fp4_check(unsigned long long* __restrict__ out) {
 diff --git a/zig/src/cuda/qmmf.zig b/zig/src/cuda/qmmf.zig
-index 5a5269ff9..cfafe9b8c 100644
+index e515a93a5..1a6e30ec0 100644
 --- a/zig/src/cuda/qmmf.zig
 +++ b/zig/src/cuda/qmmf.zig
 @@ -157,6 +157,12 @@ fn loadTiles(mod: Module, comptime mode: Mode, comptime wide: bool) ![7]Function
@@ -168,7 +168,7 @@ index 5a5269ff9..cfafe9b8c 100644
  
  pub fn promptK32Symbol(comptime out: Out) [:0]const u8 {
      return std.fmt.comptimePrint("_ZN7tf_qmmf22qmmf_prompt_k32_kernelILb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{@intFromBool(out == .f32)});
-@@ -188,6 +194,9 @@ pub const Lane = struct {
+@@ -191,6 +197,9 @@ pub const Lane = struct {
      prompt: ?[2][2]Function = null, // Out, then plain / fused; loadPrompt() fills it on sm_12x
      prompt_k32: ?[2]Function = null, // Out; unsplit BF16 prompt calls, loadPrompt() fills it on sm_12x
      prompt_sms: usize = 0, // the device's SMs: the tile runs when its blocks fill more than half of them
@@ -178,7 +178,7 @@ index 5a5269ff9..cfafe9b8c 100644
      clusters: bool, // sm_90 on: slices meet in a cluster's shared memory
      pdl: bool = false, // decode launches dependent (qmmf_kernel waits after its weight loads); weights fixed after load
  
-@@ -245,6 +254,20 @@ pub const Lane = struct {
+@@ -253,6 +262,20 @@ pub const Lane = struct {
          l.prompt_sms = @intCast(@max(sms, 1));
      }
  
@@ -199,7 +199,7 @@ index 5a5269ff9..cfafe9b8c 100644
      pub fn unload(l: *Lane) void {
          l.mod.unload();
      }
-@@ -274,6 +297,43 @@ pub const Lane = struct {
+@@ -282,6 +305,43 @@ pub const Lane = struct {
              2 * promptBlocks(m, w.n) > l.prompt_sms;
      }
  
@@ -243,7 +243,7 @@ index 5a5269ff9..cfafe9b8c 100644
      /// matmul() writing y as `out` says: bf16, or fp32.
      pub fn matmulOut(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out, part: u64) !void {
          const p = planFor(m, w, l.clusters);
-@@ -389,6 +449,12 @@ test "tile shared bytes, slices and row tiles as the Python host picks them" {
+@@ -399,6 +459,12 @@ test "tile shared bytes, slices and row tiles as the Python host picks them" {
      try std.testing.expect(r.reduce and !r.cluster);
  }
  
@@ -419,10 +419,10 @@ index 543c3d266..39999ac3b 100644
      _ = env.setenv("TF_FLASHNEXT_FACT_ROWS", "32", 1);
      try t.expectEqual(@as(usize, 128), Forms.resolve().readout_rows);
 diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
-index c078a00bd..1085242e7 100644
+index f45fdfc7e..bd7757db6 100644
 --- a/zig/tests/cuda/main.zig
 +++ b/zig/tests/cuda/main.zig
-@@ -190,6 +190,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+@@ -187,6 +187,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
      if (std.mem.eql(u8, cmd, "nvfp4-nz5")) return @import("nvfp4_nz5_tests.zig").run(gpu);
      if (std.mem.eql(u8, cmd, "qmmf-prompt")) return @import("qmmf_prompt_tests.zig").run(gpu);
      if (std.mem.eql(u8, cmd, "qmmf-prompt-contract")) return @import("contract_qmmf_prompt.zig").run(gpu);
@@ -431,10 +431,10 @@ index c078a00bd..1085242e7 100644
      if (std.mem.eql(u8, cmd, "qmmf-prompt-bench")) return @import("qmmf_prompt_tests.zig").bench(gpu);
      if (std.mem.eql(u8, cmd, "lane-half")) return lane_half_tests.run(gpu);
 diff --git a/zig/tests/cuda/main_usage.zig b/zig/tests/cuda/main_usage.zig
-index 7c81672ad..2d40df09f 100644
+index f6fe352f7..f05efa5a9 100644
 --- a/zig/tests/cuda/main_usage.zig
 +++ b/zig/tests/cuda/main_usage.zig
-@@ -138,6 +138,7 @@ pub const usage =
+@@ -141,6 +141,7 @@ pub const usage =
      \\  qmmf-prompt-contract     K64 and K32 replacement gates with both new output controls
      \\  qmmf-prompt-repro        isolate M=65 N=8240 K=2560 SK=4 BF16 without clusters
      \\  qmmf-prompt-bench        rank0 normal-main weighted A-B-A timings, plus separate MTP hidden timings

@@ -1,9 +1,37 @@
 # Changelog
 
-Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:v1.3.2-b472b9f`, built by
-`scripts/prepare.sh` from TensorFold v1.3.2 (`b472b9f8`) plus `patches/` (0001 to 0005).
+Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:v1.3.4-12ebd41`, built by
+`scripts/prepare.sh` from TensorFold v1.3.4 (`12ebd414`) plus `patches/` (0002 to 0005).
 
 ## Unreleased
+
+**2026-11-23: TensorFold v1.3.2 to v1.3.4 (`12ebd414`, 990 commits), patch `0001` retired, and the pooled n-gram gather on: 5-stream decode up to 4.7% faster, the same replies.**
+- `TF_REF`, the release archive (`libtfgrammar.so`, SHA-256 `02566a52…`, the release's own `.sha256`) and the image tag (`tensorfold-qwen38:v1.3.4-12ebd41`)
+  move to v1.3.4. Zig 0.17.0 and FFmpeg 9.0.2 are unchanged.
+- `0001-vision-nvidia-fp4-tower` is gone: TensorFold v1.3.3 decodes ModelOpt's MXFP8 and NVFP4 vision linears to bf16 at load itself (#3727), the same
+  arithmetic with the code rearranged, so the patch no longer applies and isn't needed.
+- `0002` and `0004` apply as they were. `0003` met v1.3.3's image resume (`Vision.state` now takes the row a resumed prompt starts from) and v1.3.4's
+  warm turns in `cuda_lanes.zig` (the kept-state restore moved into `snaps.resumeKept`); its MTP head cache calls (`initKv`, `initPartsKv`) and
+  `prep8` field go on the new lines. `0005`'s `prepareVideo` sits beside the new `state`. The only changed +/- line is `0003`'s `state`, which passes
+  the new `from` argument.
+- New for Flash Next on CUDA in v1.3.3 and v1.3.4, and what the recipe does with it:
+  - `TF_FLASHNEXT_GATHER_EARLY=1` (opt-in upstream, #4009): a shared decode round gathers every stream's n-gram rows in one pooled read.
+    **`config.sh` turns it on.**
+  - `TF_FLASHNEXT_FUSED_SPLIT=1` (opt-in upstream, #3475): split-K decode projections of 2,048 columns or more on the fused form, the same bits.
+    Within noise here (+0.4% at most), so it stays off.
+  - The 4-bit draft head is now TensorFold's default (#3477); `config.sh` already set `TF_FLASHNEXT_DRAFT_HEAD=affine4`.
+  - On by default, not measured by this A/B: warm turns (#3219: after a chat reply a background pass prefills it, so the next turn resumes past it),
+    and long prompts beside running replies (#3486: a prompt with more than 32,768 rows left gives replies 0.25 of the time).
+- A/B on one Spark, one fresh server per arm, interleaved twice (v1.3.4, v1.3.2, + gather, + fused split, + both; five distinct prompts, 256 tokens,
+  two passes a server, the first while the n-gram table is still on disk):
+  - v1.3.4 against v1.3.2, first pass 1s greedy / 1s sampled / 5s greedy / 5s sampled: 46.9 / 41.4 / 111.9 / 96.3 tok/s against 46.6 / 41.3 / 111.4 /
+    96.4; second pass 48.6 / 44.2 / 114.6 / 104.2 against 48.6 / 44.2 / 114.5 / 104.1. Prefill 4k / 8k / 16k / 31k / 63k / 126k: 2,385 / 2,485 /
+    2,516 / 2,522 / 2,487 / 2,380 tok/s against 2,378 / 2,478 / 2,508 / 2,515 / 2,484 / 2,385.
+  - The pooled gather, first pass: 5s sampled 100.8 tok/s (+4.7%), 5s greedy 113.3 (+1.3%); second pass +0.3% on both; one stream and prefill level.
+  - The fused split: first pass 111.9 / 96.5, second pass 115.0 / 104.3 (0.0 to +0.4%). Both together: 113.6 / 100.8 and 115.3 / 104.8.
+  - `exact.py` on all ten servers: every output byte-identical to v1.3.2's, accepted drafts included.
+- Checked on v1.3.4: `zig build test-cuda-host` (470/470 steps, 8,576 tests passed, 49 skipped), `compile-cuda-tests`, `exact.py`. Not yet re-run:
+  `exact.py --pad 3000`, `toolcheck.py`, `visioncheck.py`, `prompt_reuse.py`, the needle, `context_boundary.py`, `scripts/harden.sh`'s boot gate.
 
 **2026-11-20: TensorFold v1.3.0 to v1.3.2 (`b472b9f8`, 452 commits), and its fused read-out on: prefill about 4% faster, the same replies.**
 - `TF_REF`, the release archive (`libtfgrammar.so`, SHA-256 `364ab50d…`, the release's own `.sha256`) and the image tag (`tensorfold-qwen38:v1.3.2-b472b9f`)
