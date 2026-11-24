@@ -77,8 +77,13 @@ API_HOST="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && API_HOST=127.0.
 URL="http://$API_HOST:$PORT"
 
 running() { [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null)" == true ]]; }
+# every route but /health needs the key when the server has one; curl reads it from a file descriptor, not its arguments
+auth_header() {
+  local key=${TENSORFOLD_API_KEY:-$(arg_value --api-key)}
+  [[ -z "$key" ]] || printf 'Authorization: Bearer %s\n' "$key"
+}
 served_name() {
-  curl -s --max-time 5 "$URL/v1/models" 2>/dev/null |
+  curl -s --max-time 5 -H @<(auth_header) "$URL/v1/models" 2>/dev/null |
     python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null
 }
 
@@ -253,7 +258,7 @@ log "Server answered after ${LOADED_S}s"
 step 5 "Smoke test: one chat completion"
 SERVED=$(served_name || echo "$SERVED_NAME")
 body="{\"model\": \"$SERVED\", \"max_tokens\": 32, \"temperature\": 0, \"chat_template_kwargs\": {\"enable_thinking\": false}, \"messages\": [{\"role\": \"user\", \"content\": \"Reply with OK.\"}]}"
-if smoke=$(curl -s --max-time 180 "$URL/v1/chat/completions" -H 'Content-Type: application/json' -d "$body" |
+if smoke=$(curl -s --max-time 180 "$URL/v1/chat/completions" -H 'Content-Type: application/json' -H @<(auth_header) -d "$body" |
            python3 -c 'import json,sys; r = json.load(sys.stdin); c = r["choices"][0]["message"].get("content") or ""; assert c.strip(); print(repr(c.strip()[:40]) + ",", r["usage"]["completion_tokens"], "tokens")' 2>/dev/null); then
   log "OK: $smoke"
 else
