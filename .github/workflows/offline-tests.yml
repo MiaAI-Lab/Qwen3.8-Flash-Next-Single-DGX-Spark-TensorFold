@@ -1,0 +1,26 @@
+name: offline tests
+
+# The tools/test_*.py checks that need no GPU, Docker or network. Tests that check a patched TensorFold checkout
+# (they read TF_SRC) and the live-server checks (tools/exact.py, tools/verify_ablate.py, ...) run on a Spark instead.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: tools/test_*.py
+        run: |
+          failed=0
+          for t in $(grep -L TF_SRC tools/test_*.py); do
+            echo "::group::$t"
+            python3 "$t" || { echo "::error file=$t::$t failed"; failed=1; }
+            echo "::endgroup::"
+          done
+          exit $failed

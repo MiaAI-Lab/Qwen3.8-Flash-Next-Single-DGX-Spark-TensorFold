@@ -142,6 +142,12 @@ This recipe no longer applies those patches (the serving path is the Zig engine)
   [#90](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/pull/90), the video patch for the CUDA
   engine: `patches/0005` is theirs, re-based onto TensorFold v1.2.7 by MiaAI-Lab (the field layout had moved and the patch
   had to be re-split), with `VIDEO=1`, the pinned FFmpeg build and the tests MiaAI-Lab's.
+- **[Loke-60000](https://github.com/Loke-60000)** wrote
+  [#87](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/pull/87), per-request identities:
+  `patches/0006-ablate`, `0007-identities` and `0008-per-layer-identities` (MIT License like the rest of `patches/`; the TensorFold
+  code they modify keeps TensorFold's licenses), `ABLIT=2`, the `hf:` identity entries with their SHA-256 pin, the API-key gate in
+  `start.sh`, `tools/ablate_from_overlay.py`, `tools/verify_ablate.py` and the identity tests. `ABLIT=2`'s directions file is
+  recovered from drowzeys's house-qsa sidecar (above) with `tools/ablate_from_overlay.py` and carries that overlay's licenses.
 - The scripts (`start.sh`, `stop.sh`, `scripts/`) and the checks in `tools/` are MiaAI-Lab's. `client.py`,
   `needle.py`, `toolcheck.py` and `prompt_reuse.py` are adapted from MiaAI-Lab's two-Spark recipe
   [GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold);

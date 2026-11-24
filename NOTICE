@@ -13,8 +13,8 @@ TensorFold
   scripts/prepare.sh builds TensorFold's Zig engine (tensorfold-native) from TensorFold's source at the commit pinned
   in scripts/config.sh; the image carries that build in /opt/tensorfold and TensorFold's LICENSE, LICENSES/, NOTICE and
   THIRD_PARTY_NOTICES.md in /opt/tensorfold/share/doc/tensorfold. The files in patches/ modify TensorFold's source and
-  are applied to it with git apply before the build. The changes in patches/ (0001 to 0004) are this project's work, written by MiaAI-Lab (Mia's AI Lab) and listed
-  one by one in CREDITS.md, under the MIT
+  are applied to it with git apply before the build. The changes in patches/ (0001 to 0008) are this project's work, written by MiaAI-Lab (Mia's AI Lab) and its
+  contributors and listed one by one in CREDITS.md, under the MIT
   License; the TensorFold code they modify, and quote as diff context, stays under TensorFold's licenses: Apache-2.0,
   and for code written before 0.6.0 also its MIT notice (TensorFold's LICENSES/MIT.txt), so keep TensorFold's NOTICE
   and this copyright and permission notice with any copy of a patched tree:
