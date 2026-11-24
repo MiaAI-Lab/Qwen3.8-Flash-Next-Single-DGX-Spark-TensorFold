@@ -16,7 +16,9 @@
 #   files    CHECKPOINT (nvfp4 | int4), MODEL_ID, MODEL_REVISION, HF_CACHE, KERNEL_CACHE, STATE_DIR
 #   vision   VISION (0|1), VISION_URLS (0|1, public https media), PDF (0|1, PDF document parts through the engine's PDFium),
 #            VIDEO (0|1, video parts; puts the image's libtfvideo.so, FFmpeg 9.0.2, on the loader's path)
-#   ablit    ABLIT=1 serves NVIDIA's FP4 with the Keys house-qsa abliteration overlay (gated; needs an HF token); 0 is stock (default)
+#   ablit    ABLIT=1 serves NVIDIA's FP4 with the Keys house-qsa abliteration overlay (gated; needs an HF token); 0 is stock (default);
+#            2 serves stock as SERVED_NAME and the same abliteration as SERVED_NAME-abliterated, per request (needs TENSORFOLD_API_KEY
+#            unless HOST is loopback; checked with tools/verify_ablate.py after the smoke test); ABLIT_DIRECTIONS_* pin its file
 #   image    IMAGE, TF_REPO, TF_REF, ZIG_VERSION, BASE_IMAGE, GHCR_IMAGE, CONTAINER_NAME
 #   setup    PREPARE (auto | 1 | 0), PULL, FOREGROUND=1, WAIT_TIMEOUT, DRY_RUN=1, MEM_NEED_GIB, MEM_CHECK=0
 #   engine   every TENSORFOLD_* and TF_FLASHNEXT_* variable goes into the container
@@ -72,6 +74,10 @@ arg_value() {
   done
   echo "$value"
 }
+bind_host=$(arg_value --host); bind_host=${bind_host:-$HOST}
+if identities_unguarded "$bind_host" "${USER_ARGS[@]}"; then
+  die "TENSORFOLD_IDENTITIES serves models whose safety refusals have been removed, and host $bind_host with no API key would answer anyone who reaches port $PORT. Set TENSORFOLD_API_KEY (or pass --api-key-file), or HOST=127.0.0.1"
+fi
 API_HOST="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && API_HOST=127.0.0.1
 [[ "$API_HOST" == *:* ]] && API_HOST="[$API_HOST]"
 URL="http://$API_HOST:$PORT"
@@ -93,7 +99,7 @@ source ./scripts/banner.sh
 echo
 banner
 printf '\n%s  Mia'"'"'s TensorFold Start Script%s\n' "$M" "$R"
-printf '%s  %s · %s at once · %s-token window · %s KV · vision %s · drafts %s · port %s%s\n\n' "$D" "$MODEL_ID$( [[ "$ABLIT" == 1 ]] && echo ' + ablit')" \
+printf '%s  %s · %s at once · %s-token window · %s KV · vision %s · drafts %s · port %s%s\n\n' "$D" "$MODEL_ID$( [[ "$ABLIT" == 1 ]] && echo ' + ablit'; [[ "$ABLIT" == 2 ]] && echo " + $SERVED_NAME-abliterated")" \
   "$(arg_value --parallel)" "$(arg_value --context)" "$KV_DTYPE" \
   "$( [[ "$VISION" == 1 ]] && echo on || echo off)" \
   "$( [[ "$DRAFTS" == 1 ]] && echo MTP || echo off)" "$PORT" "$R"
@@ -180,6 +186,10 @@ if (( PARALLEL * full + WEIGHTS_GIB + TENSORFOLD_MEMORY_RESERVE_GIB > 121 )); th
   warn "$PARALLEL full windows are ~$((PARALLEL * full)) GiB of $KV_DTYPE cache beside ~$WEIGHTS_GIB GiB of weights: the engine keeps $TENSORFOLD_MEMORY_RESERVE_GIB GiB free and refuses a request that would not fit"
 fi
 
+if [[ -n "$(hf_identities)" ]]; then
+  if resolved=$(identities_resolved); then export TENSORFOLD_IDENTITIES="$resolved"
+  else missing "TENSORFOLD_IDENTITIES names a Hugging Face file that is not ready (above): $why download and check it"; fi
+fi
 ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}")
 while IFS='=' read -r name _; do
   [[ "$name" == TENSORFOLD_API_KEY ]] && continue
@@ -263,6 +273,20 @@ if smoke=$(curl -s --max-time 180 "$URL/v1/chat/completions" -H 'Content-Type: a
   log "OK: $smoke"
 else
   fail "the smoke test request failed; the server is still running"
+fi
+# with identities: each one, and the stock model, resumes its own prompt state and gives the same greedy reply (a ~12k-token prompt)
+ids=()
+while IFS= read -r entry; do
+  entry=${entry%%=*}; entry=${entry//[[:space:]]/}; [[ -z "$entry" ]] || ids+=("$entry")
+done < <(tr ',' '\n' <<< "${TENSORFOLD_IDENTITIES:-${TENSORFOLD_ABLATE:+${TENSORFOLD_ABLATE_MODEL:-}=}}")
+if (( ${#ids[@]} )) && (( $(arg_value --context) >= 16384 )); then
+  log "Identities: tools/verify_ablate.py $SERVED ${ids[*]}"
+  if ! API_URL="$URL" API_KEY="${TENSORFOLD_API_KEY:-$(arg_value --api-key)}" CONTAINER="$CONTAINER_NAME" \
+       python3 tools/verify_ablate.py "$SERVED" "${ids[@]}" > "$STATE_DIR/verify_ablate.log" 2>&1; then
+    sed 's/^/  /' "$STATE_DIR/verify_ablate.log" >&2
+    fail "tools/verify_ablate.py failed (above); the server is still running"
+  fi
+  log "OK: every id resumed its own prompt state with the same greedy reply"
 fi
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] || IP="$HOST"

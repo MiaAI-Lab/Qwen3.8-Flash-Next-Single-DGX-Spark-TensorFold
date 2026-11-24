@@ -45,18 +45,27 @@ MODEL_REVISION="${MODEL_REVISION:-}"
 # export HF_TOKEN or `hf auth login` with that account. It only fits the nvfp4 checkpoint at the revision it was made from. The model has had safety
 # refusals removed. Its author's own checks (refusal32 32/32) ran on the vLLM/TensorFold recipe, not on this build: validate it here (tools/exact.py,
 # tools/needle.py) before relying on it.
+# ABLIT=2 serves the same house-qsa abliteration per request instead (patches 0006 to 0008, docs/ablation.md): the stock model as SERVED_NAME,
+# unchanged, and the abliterated one as SERVED_NAME-abliterated, both from the stock weights. Its directions file (246,192 bytes, recovered from
+# the overlay's sidecar with tools/ablate_from_overlay.py) is ABLIT_DIRECTIONS_FILE in ABLIT_DIRECTIONS_ID at ABLIT_DIRECTIONS_REVISION, checked
+# against ABLIT_DIRECTIONS_SHA256. start.sh refuses ABLIT=2 (or any identity) on a non-loopback HOST without an API key, and checks each identity
+# with tools/verify_ablate.py after its smoke test. A TENSORFOLD_IDENTITIES of your own takes precedence.
 ABLIT="${ABLIT:-0}"
-[[ "$ABLIT" =~ ^[01]$ ]] || { echo "ABLIT must be 0 or 1, not $ABLIT" >&2; exit 1; }
+[[ "$ABLIT" =~ ^[012]$ ]] || { echo "ABLIT must be 0, 1 or 2, not $ABLIT" >&2; exit 1; }
+ABLIT_DIRECTIONS_ID=Loke-60000/Qwen3.8-Flash-Next-FP4-Local-house-qsa-directions
+ABLIT_DIRECTIONS_REVISION="${ABLIT_DIRECTIONS_REVISION:-5983c8cc876085905ab2837492dcd8d28c657da0}"
+ABLIT_DIRECTIONS_FILE=house-qsa.safetensors
+ABLIT_DIRECTIONS_SHA256="${ABLIT_DIRECTIONS_SHA256:-f5941a3b085e340c4e3bb94319b7a76367fe0130e24f30a2013d9767a75978dc}"
 ABLIT_ID=drowzeys/keys-Qwen3.8-Flash-Next-NVFP4-FP4-QAD-house-qsa-L3-47
 ABLIT_REVISION="${ABLIT_REVISION:-c44f5b92ee3d307b82aab1c55f4cc4ae1d440344}"
 ABLIT_SIDECAR=fp4-local/house-qsa-oproj-mxfp8-L3-47.safetensors
 ABLIT_STOCK_REVISION=b9ce18a6887e18c089fdea8509a33e63429a3300     # the nvidia/Qwen3.8-Flash-Next-FP4-Local snapshot the sidecar was made from
-if [[ "$ABLIT" == 1 ]]; then
+if [[ "$ABLIT" != 0 ]]; then
   if [[ "$CHECKPOINT" != nvfp4 || "$_pin" != 1 || "$MODEL_REVISION" != "$ABLIT_STOCK_REVISION" ]]; then
-    echo "ABLIT=1 grafts onto nvidia/Qwen3.8-Flash-Next-FP4-Local @ ${ABLIT_STOCK_REVISION:0:8} (CHECKPOINT=nvfp4, no MODEL_ID or MODEL_REVISION of your own)" >&2
+    echo "ABLIT=$ABLIT fits nvidia/Qwen3.8-Flash-Next-FP4-Local @ ${ABLIT_STOCK_REVISION:0:8} only (CHECKPOINT=nvfp4, no MODEL_ID or MODEL_REVISION of your own)" >&2
     exit 1
   fi
-  QUANT_LABEL+=" + Keys house-qsa ablit"
+  [[ "$ABLIT" != 1 ]] || QUANT_LABEL+=" + Keys house-qsa ablit"
 fi
 unset _pin
 
@@ -109,6 +118,7 @@ prebuilt_image() {
 CONTAINER_NAME="${CONTAINER_NAME:-qwen38-flash-next-tf}"
 
 SERVED_NAME="${SERVED_NAME:-Qwen3.8-Flash-Next}"
+[[ "$ABLIT" != 2 || -n "${TENSORFOLD_IDENTITIES:-}" ]] || export TENSORFOLD_IDENTITIES="$SERVED_NAME-abliterated=hf:$ABLIT_DIRECTIONS_ID/$ABLIT_DIRECTIONS_FILE@$ABLIT_DIRECTIONS_REVISION:sha256:$ABLIT_DIRECTIONS_SHA256"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
 # Native window 262,144; the Flash Next CUDA engine of TensorFold 1.2.7 has no YaRN extension (it refuses a legacy rope_scaling), so this is also the maximum.
@@ -241,12 +251,81 @@ model_sub() {
   else echo "hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)"; fi
 }
 
+# A TENSORFOLD_IDENTITIES entry may name a directions file on Hugging Face, id=hf:owner/repo/path/in/repo[@revision][:sha256:HEX]
+# (revision default main). prepare.sh downloads it into HF_CACHE; prepare.sh and start.sh both check it against the SHA-256 when the
+# entry pins one, and start.sh hands the engine its path in the container.
+hf_identities() {   # one "owner/repo revision path sha256" line per hf: entry, sha256 "-" when the entry pins none
+  local entry ref repo rev sha
+  local -a entries
+  IFS=',' read -ra entries <<< "${TENSORFOLD_IDENTITIES:-}"
+  for entry in "${entries[@]}"; do
+    ref=${entry#*=}; ref=${ref//[[:space:]]/}
+    [[ "$ref" == hf:* ]] || continue
+    ref=${ref#hf:}; rev=main; sha=-
+    [[ "$ref" =~ ^(.*):sha256:(.*)$ ]] && { ref=${BASH_REMATCH[1]}; sha=${BASH_REMATCH[2]:-?}; }
+    [[ "$ref" == *@* ]] && { rev=${ref##*@}; ref=${ref%@*}; }
+    repo=$(cut -d/ -f1-2 <<< "$ref")
+    ref=${ref#"$repo"}; ref=${ref#/}
+    echo "$repo $rev ${ref:-?} $sha"
+  done
+}
+hf_snapshot() {     # hf_snapshot <repo> <revision>: the downloaded snapshot's folder name, empty when not downloaded
+  if [[ "$2" =~ ^[0-9a-f]{40}$ ]]; then echo "$2"
+  else cat "$HF_CACHE/hub/models--${1//\//--}/refs/$2" 2>/dev/null; fi
+}
+hf_file() {         # hf_file <repo> <revision> <path>: where the file is (or would be) in HF_CACHE
+  echo "$HF_CACHE/hub/models--${1//\//--}/snapshots/$(hf_snapshot "$1" "$2")/$3"
+}
+hf_ref_problem() {  # hf_ref_problem <repo> <revision> <path> <sha256|->: what is wrong with the entry itself, empty when nothing
+  [[ "$3" != "?" ]] || { echo "hf:$1 names no file (the form is hf:owner/repo/file[@revision][:sha256:HEX])"; return; }
+  [[ "$4" == - || "$4" =~ ^[0-9a-f]{64}$ ]] || echo "hf:$1/$3: the pinned SHA-256 is 64 lowercase hex digits, not '$4'"
+}
+hf_file_problem() { # hf_file_problem <repo> <revision> <path> <sha256|->: why the file cannot be served, empty when it can
+  local file got problem
+  problem=$(hf_ref_problem "$@"); [[ -z "$problem" ]] || { echo "$problem"; return; }
+  file=$(hf_file "$1" "$2" "$3")
+  [[ -n "$(hf_snapshot "$1" "$2")" && -s "$file" ]] || { echo "hf:$1/$3 @ $2 is not downloaded"; return; }
+  [[ "$4" == - ]] && return
+  got=$(sha256sum < "$file" | cut -d' ' -f1)
+  [[ "$got" == "$4" ]] || echo "hf:$1/$3 @ $2 has SHA-256 $got, not the pinned $4 ($file)"
+}
+identities_resolved() {   # TENSORFOLD_IDENTITIES with every hf: entry replaced by its file's path in the container; on a problem, says it and fails
+  local entry id ref repo rev path sha problem out=""
+  local -a entries
+  IFS=',' read -ra entries <<< "$TENSORFOLD_IDENTITIES"
+  for entry in "${entries[@]}"; do
+    id=${entry%%=*}; ref=${entry#*=}
+    if [[ "${ref//[[:space:]]/}" == hf:* ]]; then
+      read -r repo rev path sha <<< "$(TENSORFOLD_IDENTITIES="x=$ref" hf_identities)"
+      problem=$(hf_file_problem "$repo" "$rev" "$path" "$sha")
+      [[ -z "$problem" ]] || { echo "TENSORFOLD_IDENTITIES: $problem" >&2; return 1; }
+      ref="/root/.cache/huggingface/hub/models--${repo//\//--}/snapshots/$(hf_snapshot "$repo" "$rev")/$path"
+    fi
+    out+="${out:+,}$id=$ref"
+  done
+  echo "$out"
+}
+
+# An identity is a model whose refusals have been removed, so start.sh does not offer one to whoever can reach an open port. With
+# TENSORFOLD_IDENTITIES (ABLIT=2 sets it) or TENSORFOLD_ABLATE set, the server needs an API key (TENSORFOLD_API_KEY, or --api-key /
+# --api-key-file among the serve arguments) or a loopback host. identities_unguarded <host> [serve args]: succeeds when it has neither.
+identities_unguarded() {
+  local host=$1 key=${TENSORFOLD_API_KEY:-} arg; shift
+  [[ -n "${TENSORFOLD_IDENTITIES:-}${TENSORFOLD_ABLATE:-}" && -z "${key//[[:space:]]/}" ]] || return 1
+  for arg in "$@"; do
+    case "$arg" in --api-key|--api-key=?*|--api-key-file|--api-key-file=?*) return 1 ;; esac
+  done
+  case "$host" in localhost|127.*|::1|"[::1]") return 1 ;; esac
+  return 0
+}
+
 PREPARED_MARKER="$STATE_DIR/prepared"
 prepared_state() {
-  local hash label rev extra=""
+  local hash label rev extra="" hf
   hash=$(image_hash)
   label=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo missing)
   rev=$(snapshot_rev)
   [[ "$ABLIT" != 1 ]] || extra=" ablit=$ABLIT_ID@$ABLIT_REVISION"
+  hf=$(hf_identities | tr ' \n' ':,'); [[ -z "$hf" ]] || extra+=" identities=${hf%,}"
   echo "model=$MODEL_ID@$rev image=$label patches=$hash$extra"
 }

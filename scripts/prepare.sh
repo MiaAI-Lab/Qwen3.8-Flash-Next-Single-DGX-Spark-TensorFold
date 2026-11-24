@@ -8,6 +8,7 @@
 #   3. the checkpoint in the Hugging Face cache (~96 GiB for the NVIDIA FP4 default, ~122 GiB for CHECKPOINT=int4), at its pinned revision
 #   4. verify it: every shard its index names is there, and it is a checkpoint format this engine serves (ModelOpt NVFP4 or GPTQ int4)
 #   5. ABLIT=1 only: the Keys overlay's sidecar (~190 MB, gated) and the checkpoint folder with it grafted in (scripts/ablit_view.py)
+#   6. hf: entries in TENSORFOLD_IDENTITIES (ABLIT=2 sets one): their directions files (KB to MB), checked against a pinned SHA-256
 # ./start.sh runs this by itself when needed. Safe to re-run: every step skips work that is already done.
 # Pass --rebuild to rebuild the image from scratch.
 set -euo pipefail
@@ -299,5 +300,25 @@ if [[ "$ABLIT" == 1 ]]; then
   info=$(python3 -I -c "$CHECK_PY" "$HF_CACHE/$ABLIT_VIEW_SUB" 2>&1) || die "the checkpoint at $HF_CACHE/$ABLIT_VIEW_SUB is not ready: $info"
   log "ABLIT=1 checkpoint OK ($ABLIT_VIEW_SUB): $info"
 fi
+
+[[ "$ABLIT" != 2 ]] || warn "ABLIT=2 serves $SERVED_NAME-abliterated beside $SERVED_NAME: a model whose safety refusals have been removed." \
+  "start.sh refuses it on a non-loopback HOST without TENSORFOLD_API_KEY."
+while read -r repo rev path sha; do
+  [[ -n "$repo" ]] || continue
+  problem=$(hf_ref_problem "$repo" "$rev" "$path" "$sha")
+  [[ -z "$problem" ]] || die "TENSORFOLD_IDENTITIES: $problem"
+  log "Downloading the identity file $path from $repo @ $rev"
+  if ! download "$repo" "$rev" "$path"; then
+    [[ -s "$(hf_file "$repo" "$rev" "$path")" ]] || die "$repo: the download of $path failed (a gated repo needs its terms accepted by the account of HF_TOKEN)"
+    warn "$repo: could not reach Hugging Face; using the $path already here"
+  fi
+  problem=$(hf_file_problem "$repo" "$rev" "$path" "$sha")
+  [[ -z "$problem" ]] || die "TENSORFOLD_IDENTITIES: $problem"
+  if [[ "$sha" == - ]]; then
+    warn "$repo/$path is not pinned: its SHA-256 is $(sha256sum < "$(hf_file "$repo" "$rev" "$path")" | cut -d' ' -f1); add :sha256:<that> to the entry to pin it"
+  else
+    log "Identity file OK: $path, SHA-256 ${sha:0:12}..."
+  fi
+done < <(hf_identities)
 prepared_state > "$PREPARED_MARKER"
 log "Done. Start the server with ./start.sh (port $PORT)."
