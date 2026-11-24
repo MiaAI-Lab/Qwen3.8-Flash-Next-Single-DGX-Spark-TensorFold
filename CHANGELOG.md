@@ -1,9 +1,20 @@
 # Changelog
 
 Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:v1.2.7-93a2e93`, built by
-`scripts/prepare.sh` from TensorFold v1.2.7 (`93a2e93e`) plus `patches/` (0001 to 0004).
+`scripts/prepare.sh` from TensorFold v1.2.7 (`93a2e93e`) plus `patches/` (0001 to 0008).
 
 ## Unreleased
+
+**2026-11-24: `ABLIT=2` (new, opt-in) serves the stock model and the house-qsa abliteration side by side, per request.**
+Patches `0006` to `0008` ([Loke-60000](https://github.com/Loke-60000),
+[#87](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/pull/87)): a request whose `model` names an identity in
+`TENSORFOLD_IDENTITIES` gets the abliterated model's reply from the stock weights, in the same decode round; `SERVED_NAME` stays the stock model, byte
+for byte. `ABLIT=2` lists `SERVED_NAME-abliterated` with a 246,192-byte directions file, recorded like the other downloads (`ABLIT_DIRECTIONS_ID`,
+`_REVISION`, `_FILE`, `_SHA256`; `prepare.sh` and `start.sh` check the SHA-256, `prepared_state` records all four). After its smoke test, `start.sh` runs
+`tools/verify_ablate.py` on the stock id and each identity. `start.sh` now refuses any identity on a non-loopback `HOST` without an API key, and sends `TENSORFOLD_API_KEY` with
+its model lookup and smoke test (a keyed start used to fail its smoke test on a 401). `ABLIT=0` and `ABLIT=1` are unchanged. The offline
+`tools/test_*.py` checks now run in GitHub Actions. Measured on a Spark: see the README's [ABLIT=2](README.md#ablit2-stock-and-abliterated-from-one-server).
+Tests: `tools/test_identities_hf.py`, `tools/test_identities_gate.py` (offline), `tools/verify_ablate.py` (live).
 
 **2026-11-18: `scripts/harden.sh` (new) cuts the NGC base's unused ballast into its own image tag, opt-in.**
 [issue #77](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/issues/77) by

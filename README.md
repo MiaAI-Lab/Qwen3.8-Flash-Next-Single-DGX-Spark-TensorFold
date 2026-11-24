@@ -224,6 +224,40 @@ is active with `docker inspect -f '{{.Config.Cmd}}' qwen38-flash-next-tf`: the p
 numbers (refusal32 32/32 on a thinking-off run of their TensorFold recipe) are theirs, not measured here. The edit changes the weights, so replies differ from the stock checkpoint's: the byte-identical
 checks in this repository compare a build against itself, not `ABLIT=1` against `ABLIT=0`.
 
+### ABLIT=2: stock and abliterated from one server
+
+`ABLIT=2` serves both models at once from the stock checkpoint: the stock model as `SERVED_NAME`, unchanged, and the same house-qsa
+abliteration as `SERVED_NAME-abliterated`, picked per request by the `model` a request names (patches `0006` to `0008`; how it works,
+its settings and its directions files are in [docs/ablation.md](docs/ablation.md)). Instead of the overlay's sidecar it downloads a
+246,192-byte directions file, recorded in `scripts/config.sh` the way the other downloads are (`ABLIT_DIRECTIONS_ID`, `_REVISION`, `_FILE`
+and `_SHA256`), and `prepare.sh` and `start.sh` check it against that SHA-256. After its smoke test, `start.sh` runs `tools/verify_ablate.py` on
+the stock id and each identity. It needs an API key, unless the server listens on loopback only:
+
+```bash
+export TENSORFOLD_API_KEY=$(openssl rand -hex 24)     # or HOST=127.0.0.1
+ABLIT=2 ./start.sh restart
+```
+
+`start.sh` refuses `ABLIT=2`, or any `TENSORFOLD_IDENTITIES`, on a non-loopback `HOST` with no key: the abliterated model would
+otherwise answer anyone who can reach the port. The key guards every model id, the stock one included.
+
+**What has been checked** (2026-11-24, one Spark, this branch's image: 262,144-token window, fp8 KV, vision on, 3 requests at once because 5 did not
+fit beside the host's other services). Two boots of the same image, `ABLIT=0` on loopback, then `ABLIT=2` on `0.0.0.0` with a key, all passing:
+
+- The stock model is unchanged: its greedy replies to `tools/exact.py` and `--pad 3000` under `ABLIT=2` are byte-identical to the `ABLIT=0` boot's
+  (12 of 12, text and token hashes). The abliterated id differs from them on 10 of 12.
+- On both ids: `tools/exact.py` and `--pad 3000` (drafted equal `"draft": false`, concurrent equal one at a time), `tools/toolcheck.py` 3/3,
+  `tools/visioncheck.py`, `tools/prompt_reuse.py 30000` (worst 99.3%), a 199,730-token needle found (prefill 96.0 s stock, 95.6 s abliterated),
+  `tools/context_boundary.py --context 262144` (16 checks), and live `tool_choice: "required"`, a named function, Anthropic `{"type":"any"}` and a
+  `response_format` JSON schema.
+- `tools/verify_ablate.py`, from `start.sh` and again after the suite: each id's cold pass resumed 0 of 12,061 tokens and its second 12,054, with the
+  same reply; 6 of 6 stock and abliterated requests decoded together equal their one-at-a-time replies.
+- A request with no key or a wrong one gets HTTP 401, on loopback and on the LAN address; `start.sh` refuses `ABLIT=2` on `0.0.0.0` with no key, and
+  `prepare.sh` stops on a wrong SHA-256.
+- A refusal panel of 8 mild requests stock models often decline (a roast, lock picking, a fake review, ...): stock refused 5, the abliterated id 0. A
+  small panel, not a safety benchmark.
+- `zig build test` on TensorFold `93a2e93e` with `0001` to `0008`, and `tf-cuda-test qmmf-prompt-mx` on the GPU.
+
 ## Images and video
 
 The model's own vision tower (27 layers, 0.84 GiB, from the same checkpoint) turns images into tokens. The engine
@@ -322,6 +356,7 @@ the docker command and changes nothing.
 3. The checkpoint, at the pinned revision.
 4. A check that it is a `qwen4_exp` ModelOpt NVFP4 checkpoint and every shard present.
 5. With `ABLIT=1` only: the overlay's sidecar from Hugging Face, and the checkpoint folder with it grafted in ([ABLIT](#ablit-opt-in)).
+6. `hf:` entries in `TENSORFOLD_IDENTITIES` (`ABLIT=2` sets one): their directions files, checked against their pinned SHA-256.
 
 ```bash
 scripts/prepare.sh
@@ -439,6 +474,7 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `TENSORFOLD_VISION_WORKSPACE_MIB` | `2048` | kept out of the KV budget for the vision path (the tower and its scratch) |
 | `SERVED_NAME` | `Qwen3.8-Flash-Next` | the model id in `/v1/models` |
 | `PORT` / `HOST` | `8888` / `0.0.0.0` | where the API listens |
+| `TENSORFOLD_API_KEY` | unset | the API key every route but `/health` then needs (passed to the container by name). Required with `ABLIT=2` or any identity unless `HOST` is loopback |
 | `KV_DTYPE` | `fp8` | lossy (~98.8% top-1 agreement with bf16, about 1.8x the pool). `bf16` is exact. Works with `VISION=1`. Adapted from MiaAI-Lab's GLM recipe patch `0038-glm-kv-fp8` |
 | `TENSORFOLD_MEMORY_RESERVE_GIB` | `9` | kept free when the engine sizes the pool (9 since the v1.1.4 build's patch 0014; five full windows need 23.9 GiB). `prepare.sh` and `start.sh` refuse a Spark below this |
 | `TF_FLASHNEXT_DRAFTS` | `6` | drafts a round at most |
@@ -452,7 +488,8 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `TF_FLASHNEXT_HEAD_KV` | unset | `fp8` keeps the MTP head's own cache in fp8 under `KV_DTYPE=fp8`; unset, it stays bf16 while the stream fits its charge (patch 0003) |
 | `CHECKPOINT` | `nvfp4` | `nvfp4` serves `nvidia/Qwen3.8-Flash-Next-FP4-Local`. `int4` is not supported on this branch. `MODEL_ID` / `MODEL_REVISION` override the model |
 | `MODEL_REVISION` | `b9ce18a6…` | the checkpoint commit this recipe serves |
-| `ABLIT` | `0` | `1` serves the checkpoint with drowzeys's Keys house-qsa abliteration overlay ([above](#ablit-opt-in)); gated, needs `HF_TOKEN`. Only with `CHECKPOINT=nvfp4` at the pinned revision |
+| `ABLIT` | `0` | `1` serves the checkpoint with drowzeys's Keys house-qsa abliteration overlay ([above](#ablit-opt-in)); gated, needs `HF_TOKEN`. `2` serves the stock model and the same abliteration as `SERVED_NAME-abliterated`, per request ([above](#ablit2-stock-and-abliterated-from-one-server)); needs `TENSORFOLD_API_KEY` or a loopback `HOST`. Only with `CHECKPOINT=nvfp4` at the pinned revision |
+| `ABLIT_DIRECTIONS_REVISION` / `ABLIT_DIRECTIONS_SHA256` | `5983c8cc…` / `f5941a3b…` | `ABLIT=2`'s directions file, `house-qsa.safetensors` in `Loke-60000/Qwen3.8-Flash-Next-FP4-Local-house-qsa-directions`: the commit it is downloaded at and the SHA-256 `prepare.sh` and `start.sh` check |
 
 KV is fp8 (or bf16). The NVIDIA checkpoint's NVFP4 n-gram table (26.8 GiB) is read from disk by the host
 (`TF_FLASHNEXT_GATHER_READ=pread` by default, with read-ahead of the next prompt chunk; `TF_FLASHNEXT_WARM_AHEAD=0` turns that off).
@@ -516,6 +553,9 @@ Drafted replies are still checked: a drafted reply matches `"draft": false`.
 | `0003` | `--kv-cache fp8` for Flash Next (one rank, contiguous caches): five full 262,144-token windows fit where bf16 fits three. The fp8 attention reader keeps the next tile in registers, and the MTP head's own cache stays bf16 while the stream fits its charge (the v1.1.4 build's 0003 and 0005, rebased onto v1.2.7's paged and lane-batched attention) |
 | `0004` | prompt passes run the MXFP8 projections 1,024 columns or wider on a 128 x 128 tile (64 x 64 for calls of 128 rows or fewer) that folds the block scales into the weights: one fp32 sum over K, 1.4-1.65x the exact kernels, prefill +7-9%. Prompt rows leave the exact kernels' bits (within their rounding bound; a row's bytes never depend on its chunk, so replies stay exact across drafting and batching); `TF_FLASHNEXT_PROMPT_MX128=0` turns it off (the v1.1.4 build's 0006 and 0015) |
 | `0005` | video parts on the CUDA engine: Flash Next offers the template's `<\|video_pad\|>` groups to the server (the sampler and patchifier are TensorFold's `core/qwen_vl/video.zig`, the same the Triton host runs) and the shared media plan reads a group of video rows beside image rows. Nothing decodes a video until `VIDEO=1` puts `libtfvideo.so` on the loader's path (chai-md's [#90](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/pull/90), re-based onto v1.2.7 by MiaAI-Lab) |
+| `0006` | per-request abliteration: a request whose `model` names an identity gets its directions subtracted from the residual-stream writers' outputs (`self_attn.o_proj`, `linear_attn.out_proj`, the shared expert's down projection) for its rows only, in the same decode round as everyone else; a pass with no such row launches nothing extra. Each identity's prompt states are cached under a key of their own |
+| `0007` | identities as data: up to 32 `id=file` entries in `TENSORFOLD_IDENTITIES`, each listed in `/v1/models`; the server refuses a malformed list, a repeated id, or an id that is `--name` or an alias, and refuses to start when the engine cannot apply them |
+| `0008` | per-layer identities: a file that edits only the layers it lists, each with a direction, a strength and an optional row rescale, the form of an overlay baked as `W' = D (W - lam v v^T W)` (`ABLIT=2`'s file) |
 
 The v1.1.4 build carried seventeen patches. v1.2.7 has most of the rest itself, and the recipe sets its switches for them in `scripts/config.sh`:
 
@@ -546,7 +586,11 @@ Whether the pieces that were not ported still matter is a measurement of the v1.
 | `tools/prompt_reuse.py` | a resumed prompt matches a fresh one |
 | `tools/bench.py` | prefill at 8k-128k and a short decode |
 | `tools/bench_streams.py` | decode at 1 to 5 concurrent requests (prose and code, with TTFT) and prefill 4k to 128k, median of 3 |
+| `tools/verify_ablate.py [model id ...]` | with identities: each id resumes only its own prompt state (cold under 10%, again at least 90% of a ~12k-token prompt, same greedy reply), and stock and identity requests decoded in the same rounds equal their one-at-a-time replies. `start.sh` runs it when identities are listed |
 | `tools/context_boundary.py --context N` | a prompt plus reply that fills `--context` succeeds; one token over is refused (HTTP 400, or an error in the stream). Authored by [321sssrt-bit](https://github.com/321sssrt-bit) |
+
+The offline checks, `tools/test_*.py` (no GPU, Docker or network), run on every push and pull request (`.github/workflows/offline-tests.yml`),
+except those that read a patched TensorFold checkout from `TF_SRC`.
 
 ## Repository layout
 
@@ -556,7 +600,7 @@ stop.sh       stop it
 scripts/      prepare.sh, config.sh, harden.sh, publish-image.sh, banner.sh, ablit_view.py
 patches/      this recipe's changes, applied onto TensorFold v1.2.7 at TF_REF
 tools/        checks
-.github/      issue and pull request templates, GitHub Sponsors
+.github/      the offline-tests workflow, issue and pull request templates, GitHub Sponsors
 CREDITS.md    who and what this builds on
 CHANGELOG.md  upgrade notes
 NOTICE        third-party notices
@@ -593,6 +637,8 @@ covers this repository's scripts only.
   MIT License like the rest of `patches/`.
   Several of the v1.1.4 build's patches (0004 to 0017) are now part of TensorFold v1.2.7 in upstream's own form; upstream credits MiaAI-Lab for the K32
   expert staging it adapted from patch 0014.
+- **Patches 0006 to 0008 (per-request identities, `ABLIT=2`):** by [Loke-60000](https://github.com/Loke-60000) in
+  [#87](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/pull/87), MIT License like the rest of `patches/`.
 - **Earlier db281878 series** (on `main`): free after drain and admission reclaim (patch 0029) and image prompts in the prompt cache (patch 0030) by [tempeste](https://github.com/tempeste), now built
   into TensorFold v1.1.4; sliced fills one at a time (patch 0021) by [BadAd84](https://github.com/BadAd84) (PR #53).
 - **Model:** [Qwen3.8 Flash Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team (Alibaba).
