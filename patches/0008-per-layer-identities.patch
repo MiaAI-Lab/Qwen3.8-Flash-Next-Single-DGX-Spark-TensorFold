@@ -1,0 +1,335 @@
+diff --git a/zig/kernels/cuda/flashnext_ablate.cuh b/zig/kernels/cuda/flashnext_ablate.cuh
+index 68a2a54..83c26bd 100644
+--- a/zig/kernels/cuda/flashnext_ablate.cuh
++++ b/zig/kernels/cuda/flashnext_ablate.cuh
+@@ -3,12 +3,48 @@ extern "C" __global__ void __launch_bounds__(256) fn_ablate_rows(float* __restri
+                                                                  long long slice_stride, int slices,
+                                                                  const int* __restrict__ who, const float* __restrict__ table,
+                                                                  const int* __restrict__ meta, int stride, int kind, int layer,
+-                                                                 int d) {
++                                                                 int d, const float* __restrict__ layer_table,
++                                                                 const int* __restrict__ layer_map, int layers) {
+     // identity 0 is the stock model; `meta` holds an identity's k and first layer, its table block R then the lams
+     const int id = who[blockIdx.x];
+     if (id == 0) return;
+     const int k = meta[2 * (id - 1)];
+     if (layer < meta[2 * (id - 1) + 1]) return;
++    if (k == 0) {
++        // k 0, per-layer: `layer_map` names this layer's [v | D | lam] (-1: none); the mixer's y -> D (y - lam (v.y) v)
++        if (kind != 0) return;
++        const int e = layer_map[static_cast<long long>(id - 1) * layers + layer];
++        if (e < 0) return;
++        const float* __restrict__ v = layer_table + static_cast<long long>(e) * (2 * d + 1);
++        const float* __restrict__ D = v + d;
++        float* row = y + static_cast<long long>(blockIdx.x) * row_stride;
++        float acc = 0.0f;
++        for (int i = threadIdx.x; i < d; i += blockDim.x) {
++            float x = row[i];
++            for (int s = 1; s < slices; ++s) x = __fadd_rn(x, row[static_cast<long long>(s) * slice_stride + i]);
++            acc = __fadd_rn(acc, __fmul_rn(v[i], x));
++        }
++        __shared__ float lpart[8];
++        __shared__ float lcoef;
++        const unsigned lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++        for (int o = 16; o > 0; o >>= 1) acc = __fadd_rn(acc, __shfl_down_sync(0xffffffffu, acc, o));
++        if (lane == 0) lpart[warp] = acc;
++        __syncthreads();
++        if (threadIdx.x == 0) {
++            float s = 0.0f;
++            for (unsigned w = 0; w < blockDim.x / 32; ++w) s = __fadd_rn(s, lpart[w]);
++            lcoef = __fmul_rn(s, v[2 * d]);
++        }
++        __syncthreads();
++        // slice 0 takes y's whole change: y0 += D (y - lam (v . y) v) - y
++        for (int i = threadIdx.x; i < d; i += blockDim.x) {
++            float x = row[i];
++            for (int s = 1; s < slices; ++s) x = __fadd_rn(x, row[static_cast<long long>(s) * slice_stride + i]);
++            const float target = __fmul_rn(D[i], __fsub_rn(x, __fmul_rn(lcoef, v[i])));
++            row[i] = __fadd_rn(row[i], __fsub_rn(target, x));
++        }
++        return;
++    }
+     const float* __restrict__ R = table + static_cast<long long>(id - 1) * stride;
+     const float* __restrict__ lam = R + k * d + kind * k;
+     float* row = y + static_cast<long long>(blockIdx.x) * row_stride;
+diff --git a/zig/src/families/flashnext/cuda_ablate.zig b/zig/src/families/flashnext/cuda_ablate.zig
+index 005247c..b116692 100644
+--- a/zig/src/families/flashnext/cuda_ablate.zig
++++ b/zig/src/families/flashnext/cuda_ablate.zig
+@@ -8,17 +8,24 @@ const zs = @import("cuda_zero_slice.zig");
+ 
+ const dims = wt.dims;
+ const slots = wt.slots;
++const layers_n = wt.layers_n;
+ 
+ pub const max_k = 4;
+ /// Floats an identity takes in the table: max_k directions, then max_k lam_attn and max_k lam_shared (k of each used).
+ const stride = max_k * dims + 2 * max_k;
++/// Floats one per-layer entry takes: its direction, its row scale (D's diagonal), its lam.
++const entry = 2 * dims + 1;
+ 
+ /// TENSORFOLD_IDENTITIES' files: `directions` [k, dims] fp32 orthonormal, `lam_attn`, `lam_shared` [k], `first_layer`.
+ pub const Ablation = struct {
+     /// [n * stride] fp32: each identity's [k * dims directions | k lam_attn | k lam_shared] from its block's start
+     table: cuda.DeviceBuffer,
+-    /// [n * 2] i32: each identity's k and first layer
++    /// [n * 2] i32: each identity's k (0: a per-layer identity) and first layer
+     meta: cuda.DeviceBuffer,
++    /// [entries * entry] fp32: the per-layer identities' [direction | row scale | lam], one entry a listed layer
++    layer_table: cuda.DeviceBuffer,
++    /// [n * layers_n] i32: identity i's entry for a layer, -1 where it leaves the layer alone (every global identity's)
++    layer_map: cuda.DeviceBuffer,
+     n: usize,
+     /// Each identity's layers by kind (bit l: layer l): a launch that no asking row's identity reaches is skipped.
+     reach: [identities.max][2]u64,
+@@ -39,36 +46,56 @@ pub const Ablation = struct {
+         defer gpa.free(host);
+         @memset(host, 0);
+         var meta: [identities.max * 2]i32 = @splat(0);
+-        var a: Ablation = .{ .table = undefined, .meta = undefined, .n = listed.len, .reach = @splat(.{ 0, 0 }), .hash = 0 };
++        const map = try gpa.alloc(i32, listed.len * layers_n);
++        defer gpa.free(map);
++        @memset(map, -1);
++        var entries: std.ArrayList(f32) = .empty;
++        defer entries.deinit(gpa);
++        var a: Ablation = .{ .table = undefined, .meta = undefined, .layer_table = undefined, .layer_map = undefined, .n = listed.len, .reach = @splat(.{ 0, 0 }), .hash = 0 };
+         for (listed, 0..) |ident, i| {
+             const block = host[i * stride ..][0..stride];
+-            const got = load(gpa, io, ident.path, scale, block) catch |err| {
+-                std.log.err("identity {d} {s}: {s}: {s}", .{ i + 1, ident.id, ident.path, @errorName(err) });
+-                return err;
+-            };
++            var file = core.safetensors.File.open(gpa, io, ident.path) catch |err| return failed(i, ident, err);
++            defer file.close(io);
++            if (file.get("layers") != null) {
++                const before = entries.items.len / entry;
++                const reach = loadLayers(gpa, &file, scale, &entries, map[i * layers_n ..][0..layers_n]) catch |err| return failed(i, ident, err);
++                meta[2 * i + 1] = @intCast(@ctz(reach)); // meta[2 * i] stays 0: per-layer
++                a.reach[i] = .{ reach, 0 };
++                std.log.info("identity {d} {s}: {s}, one direction at each of {d} layers from layer {d} (mixers only, scale {d})", .{ i + 1, ident.id, ident.path, entries.items.len / entry - before, @ctz(reach), scale });
++                continue;
++            }
++            const got = load(&file, scale, block) catch |err| return failed(i, ident, err);
+             meta[2 * i] = @intCast(got.k);
+             meta[2 * i + 1] = @intCast(got.first);
+             const from = ~@as(u64, 0) << @intCast(got.first);
+             a.reach[i] = .{ from, from };
+             std.log.info("identity {d} {s}: {s}, {d} directions from layer {d}, lam_attn {any}, lam_shared {any} (scale {d})", .{ i + 1, ident.id, ident.path, got.k, got.first, block[got.k * dims ..][0..got.k], block[got.k * dims + got.k ..][0..got.k], scale });
+         }
++        // a buffer is never empty: a list with no per-layer identity keeps one unused entry
++        if (entries.items.len == 0) try entries.appendNTimes(gpa, 0, entry);
+         const used = meta[0 .. 2 * listed.len];
+         var h = std.hash.Wyhash.init(listed.len);
+-        h.update(std.mem.sliceAsBytes(host));
+-        h.update(std.mem.sliceAsBytes(used));
++        for ([_][]const u8{ std.mem.sliceAsBytes(host), std.mem.sliceAsBytes(used), std.mem.sliceAsBytes(entries.items), std.mem.sliceAsBytes(map) }) |b| h.update(b);
+         a.hash = h.final();
+         a.table = try cuda.DeviceBuffer.fromHost(drv, std.mem.sliceAsBytes(host));
+         errdefer a.table.free();
+         a.meta = try cuda.DeviceBuffer.fromHost(drv, std.mem.sliceAsBytes(used));
++        errdefer a.meta.free();
++        a.layer_table = try cuda.DeviceBuffer.fromHost(drv, std.mem.sliceAsBytes(entries.items));
++        errdefer a.layer_table.free();
++        a.layer_map = try cuda.DeviceBuffer.fromHost(drv, std.mem.sliceAsBytes(map));
+         return a;
+     }
+ 
++    fn failed(i: usize, ident: identities.Identity, err: anyerror) anyerror {
++        std.log.err("identity {d} {s}: {s}: {s}", .{ i + 1, ident.id, ident.path, @errorName(err) });
++        return err;
++    }
++
+     const Loaded = struct { k: usize, first: usize };
+ 
+     /// One identity's directions, then lam_attn and lam_shared times `scale`, packed from `out`'s start.
+-    fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, scale: f32, out: []f32) !Loaded {
+-        var file = try core.safetensors.File.open(gpa, io, path);
+-        defer file.close(io);
++    fn load(file: *const core.safetensors.File, scale: f32, out: []f32) !Loaded {
+         const dirs = file.get("directions") orelse return error.AblateFileMissesDirections;
+         if (dirs.dtype != .f32 or dirs.rank != 2 or dirs.shape[1] != dims) return error.AblateDirectionsShape;
+         const k = dirs.shape[0];
+@@ -79,7 +106,7 @@ pub const Ablation = struct {
+         const first_t = file.get("first_layer") orelse return error.AblateFileMissesFirstLayer;
+         if (!first_t.is(.i64, &.{1})) return error.AblateFirstLayerShape;
+         const first = std.mem.readInt(i64, first_t.bytes[0..8], .little);
+-        if (first < 0 or first >= wt.layers_n) return error.AblateFirstLayerShape;
++        if (first < 0 or first >= layers_n) return error.AblateFirstLayerShape;
+         // the mapped bytes may be unaligned: copied out before they are read as floats
+         @memcpy(std.mem.sliceAsBytes(out[0 .. k * dims]), dirs.bytes);
+         @memcpy(std.mem.sliceAsBytes(out[k * dims ..][0..k]), lam_attn.bytes);
+@@ -98,9 +125,48 @@ pub const Ablation = struct {
+         return .{ .k = k, .first = @intCast(first) };
+     }
+ 
++    /// A per-layer file (a baked W' = D (W - lam v v^T W) on its mixers) into `entries` and `map`; its layers' bits.
++    fn loadLayers(gpa: std.mem.Allocator, file: *const core.safetensors.File, scale: f32, entries: *std.ArrayList(f32), map: []i32) !u64 {
++        // `layers` [n] i64 rising, `directions` [n, dims] unit rows, `lam` [n], `row_scale` [n, dims] (absent: ones)
++        const which = file.get("layers").?;
++        if (which.dtype != .i64 or which.rank != 1 or which.shape[0] < 1 or which.shape[0] > layers_n) return error.AblateLayersShape;
++        const n = which.shape[0];
++        const dirs = file.get("directions") orelse return error.AblateFileMissesDirections;
++        if (!dirs.is(.f32, &.{ n, dims })) return error.AblateDirectionsShape;
++        const lam = file.get("lam") orelse return error.AblateFileMissesLambdas;
++        if (!lam.is(.f32, &.{n})) return error.AblateLambdaShape;
++        const rows = file.get("row_scale");
++        if (rows) |r| if (!r.is(.f32, &.{ n, dims })) return error.AblateRowScaleShape;
++        const base = entries.items.len / entry;
++        const block = try entries.addManyAsSlice(gpa, n * entry);
++        var reach: u64 = 0;
++        var last: i64 = -1;
++        for (0..n) |j| {
++            const layer = std.mem.readInt(i64, which.bytes[8 * j ..][0..8], .little);
++            if (layer <= last or layer >= layers_n) return error.AblateLayersShape;
++            last = layer;
++            const e = block[j * entry ..][0..entry];
++            // the mapped bytes may be unaligned: copied out before they are read as floats
++            @memcpy(std.mem.sliceAsBytes(e[0..dims]), dirs.bytes[4 * dims * j ..][0 .. 4 * dims]);
++            if (rows) |r| @memcpy(std.mem.sliceAsBytes(e[dims..][0..dims]), r.bytes[4 * dims * j ..][0 .. 4 * dims]) else @memset(e[dims..][0..dims], 1);
++            @memcpy(std.mem.sliceAsBytes(e[2 * dims ..][0..1]), lam.bytes[4 * j ..][0..4]);
++            var norm: f64 = 0;
++            for (e[0..dims]) |x| norm += @as(f64, x) * x;
++            if (!(@abs(norm - 1) <= 1e-3)) return error.AblateDirectionsNotOrthonormal;
++            for (e[dims..][0..dims]) |x| if (!std.math.isFinite(x) or x <= 0) return error.AblateRowScaleShape;
++            if (!std.math.isFinite(e[2 * dims])) return error.AblateLambdaShape;
++            e[2 * dims] *= scale;
++            map[@intCast(layer)] = @intCast(base + j);
++            reach |= @as(u64, 1) << @intCast(layer);
++        }
++        return reach;
++    }
++
+     pub fn deinit(a: *Ablation) void {
+         a.table.free();
+         a.meta.free();
++        a.layer_table.free();
++        a.layer_map.free();
+         a.* = undefined;
+     }
+ 
+@@ -120,6 +186,9 @@ pub const Ablation = struct {
+         args.add(@as(c_int, @backingInt(kind)));
+         args.add(@as(c_int, @intCast(layer)));
+         args.add(@as(c_int, dims));
++        args.add(a.layer_table.ptr);
++        args.add(a.layer_map.ptr);
++        args.add(@as(c_int, layers_n));
+         try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &args);
+     }
+ 
+@@ -206,7 +275,7 @@ test "identities are refused at --tp 2 before anything loads, the legacy pair to
+ }
+ 
+ test "a launch runs only at the layers and kinds an asking row's identity reaches" {
+-    var a: Ablation = .{ .table = undefined, .meta = undefined, .n = 2, .reach = @splat(.{ 0, 0 }), .hash = 0 };
++    var a: Ablation = .{ .table = undefined, .meta = undefined, .layer_table = undefined, .layer_map = undefined, .n = 2, .reach = @splat(.{ 0, 0 }), .hash = 0 };
+     a.reach[0] = .{ ~@as(u64, 0) << 3, ~@as(u64, 0) << 3 };
+     a.reach[1] = .{ 1 << 7, 0 };
+     const Seq = struct { identity: u8 };
+@@ -222,3 +291,86 @@ test "a launch runs only at the layers and kinds an asking row's identity reache
+     try std.testing.expect(asked(&P{ .lanes = &.{}, .seq = .{ .identity = 1 } }, &a, 3, .shared));
+     try std.testing.expect(!asked(&P{ .lanes = &.{}, .seq = .{ .identity = 3 } }, &a, 40, .attn));
+ }
++
++const Named = struct { name: []const u8, dtype: []const u8, shape: []const usize, bytes: []const u8 };
++
++/// A safetensors file of `list` at `path` in `dir` (the tests' stand-in for an identity's file).
++fn writeFile(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, list: []const Named) !void {
++    var header: std.Io.Writer.Allocating = .init(a);
++    defer header.deinit();
++    try header.writer.writeAll("{");
++    var at: usize = 0;
++    for (list, 0..) |s, i| {
++        try header.writer.print("{s}\"{s}\":{{\"dtype\":\"{s}\",\"shape\":[", .{ if (i == 0) "" else ",", s.name, s.dtype });
++        for (s.shape, 0..) |d, j| try header.writer.print("{s}{d}", .{ if (j == 0) "" else ",", d });
++        try header.writer.print("],\"data_offsets\":[{d},{d}]}}", .{ at, at + s.bytes.len });
++        at += s.bytes.len;
++    }
++    try header.writer.writeAll("}");
++    const head = header.written();
++    const image = try a.alloc(u8, 8 + head.len + at);
++    defer a.free(image);
++    std.mem.writeInt(u64, image[0..8], head.len, .little);
++    @memcpy(image[8..][0..head.len], head);
++    var p: usize = 8 + head.len;
++    for (list) |s| {
++        @memcpy(image[p..][0..s.bytes.len], s.bytes);
++        p += s.bytes.len;
++    }
++    try dir.writeFile(io, .{ .sub_path = path, .data = image });
++}
++
++test "an identity's files: a global one packed and scaled, a per-layer one mapped, their shapes refused" {
++    const a = std.testing.allocator;
++    const io = std.testing.io;
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
++    defer a.free(root);
++    var dirs: [2 * dims]f32 = @splat(0);
++    dirs[0] = 1;
++    dirs[dims + 1] = 1;
++    const lam = [_]f32{ 1, 0.5 };
++    const first = [_]i64{3};
++    const layers = [_]i64{ 3, 7 };
++    try writeFile(a, io, tmp.dir, "g.safetensors", &.{ .{ .name = "directions", .dtype = "F32", .shape = &.{ 2, dims }, .bytes = std.mem.sliceAsBytes(&dirs) }, .{ .name = "lam_attn", .dtype = "F32", .shape = &.{2}, .bytes = std.mem.sliceAsBytes(&lam) }, .{ .name = "lam_shared", .dtype = "F32", .shape = &.{2}, .bytes = std.mem.sliceAsBytes(&lam) }, .{ .name = "first_layer", .dtype = "I64", .shape = &.{1}, .bytes = std.mem.sliceAsBytes(&first) } });
++    try writeFile(a, io, tmp.dir, "l.safetensors", &.{ .{ .name = "layers", .dtype = "I64", .shape = &.{2}, .bytes = std.mem.sliceAsBytes(&layers) }, .{ .name = "directions", .dtype = "F32", .shape = &.{ 2, dims }, .bytes = std.mem.sliceAsBytes(&dirs) }, .{ .name = "lam", .dtype = "F32", .shape = &.{2}, .bytes = std.mem.sliceAsBytes(&lam) } });
++    const backwards = [_]i64{ 7, 3 };
++    try writeFile(a, io, tmp.dir, "b.safetensors", &.{ .{ .name = "layers", .dtype = "I64", .shape = &.{2}, .bytes = std.mem.sliceAsBytes(&backwards) }, .{ .name = "directions", .dtype = "F32", .shape = &.{ 2, dims }, .bytes = std.mem.sliceAsBytes(&dirs) }, .{ .name = "lam", .dtype = "F32", .shape = &.{2}, .bytes = std.mem.sliceAsBytes(&lam) } });
++    var skew = dirs;
++    skew[1] = 1; // the first row no longer unit, nor orthogonal to the second
++    try writeFile(a, io, tmp.dir, "s.safetensors", &.{ .{ .name = "directions", .dtype = "F32", .shape = &.{ 2, dims }, .bytes = std.mem.sliceAsBytes(&skew) }, .{ .name = "lam_attn", .dtype = "F32", .shape = &.{2}, .bytes = std.mem.sliceAsBytes(&lam) }, .{ .name = "lam_shared", .dtype = "F32", .shape = &.{2}, .bytes = std.mem.sliceAsBytes(&lam) }, .{ .name = "first_layer", .dtype = "I64", .shape = &.{1}, .bytes = std.mem.sliceAsBytes(&first) } });
++    const at = struct {
++        fn open(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) !core.safetensors.File {
++            const path = try std.fs.path.join(gpa, &.{ dir, name });
++            defer gpa.free(path);
++            return core.safetensors.File.open(gpa, std.testing.io, path);
++        }
++    };
++    var block: [stride]f32 = @splat(0);
++    var g = try at.open(a, root, "g.safetensors");
++    defer g.close(io);
++    const got = try Ablation.load(&g, 2, &block);
++    try std.testing.expectEqual(@as(usize, 2), got.k);
++    try std.testing.expectEqual(@as(usize, 3), got.first);
++    try std.testing.expectEqualSlices(f32, &.{ 2, 1, 2, 1 }, block[2 * dims ..][0..4]);
++    var l = try at.open(a, root, "l.safetensors");
++    defer l.close(io);
++    var entries: std.ArrayList(f32) = .empty;
++    defer entries.deinit(a);
++    var map: [layers_n]i32 = @splat(-1);
++    try std.testing.expectEqual(@as(u64, 1 << 3 | 1 << 7), try Ablation.loadLayers(a, &l, 2, &entries, &map));
++    try std.testing.expectEqual(@as(i32, 0), map[3]);
++    try std.testing.expectEqual(@as(i32, 1), map[7]);
++    try std.testing.expectEqual(@as(i32, -1), map[4]);
++    try std.testing.expectEqual(@as(usize, 2 * entry), entries.items.len);
++    try std.testing.expectEqual(@as(f32, 1), entries.items[entry + 1]); // the second entry's direction
++    try std.testing.expectEqual(@as(f32, 1), entries.items[entry + dims + 5]); // its row scale, ones when absent
++    try std.testing.expectEqual(@as(f32, 1), entries.items[entry + 2 * dims]); // its lam, 0.5 times the scale
++    var b = try at.open(a, root, "b.safetensors");
++    defer b.close(io);
++    try std.testing.expectError(error.AblateLayersShape, Ablation.loadLayers(a, &b, 1, &entries, &map));
++    var s = try at.open(a, root, "s.safetensors");
++    defer s.close(io);
++    try std.testing.expectError(error.AblateDirectionsNotOrthonormal, Ablation.load(&s, 1, &block));
++}
+diff --git a/zig/src/families/flashnext/cuda_lanes_explain.zig b/zig/src/families/flashnext/cuda_lanes_explain.zig
+index 9fa201a..4f0c23d 100644
+--- a/zig/src/families/flashnext/cuda_lanes_explain.zig
++++ b/zig/src/families/flashnext/cuda_lanes_explain.zig
+@@ -12,6 +12,7 @@ pub fn open(err: anyerror) ?[]const u8 {
+         error.AblateDirectionsShape, error.AblateDirectionsNotOrthonormal => explain(err),
+         error.AblateFileMissesDirections, error.AblateFileMissesLambdas, error.AblateFileMissesFirstLayer => explain(err),
+         error.AblateLambdaShape, error.AblateFirstLayerShape, error.BadAblateScale => explain(err),
++        error.AblateLayersShape, error.AblateRowScaleShape => explain(err),
+         else => null,
+     };
+ }
+@@ -36,6 +37,7 @@ pub fn explain(err: anyerror) ?[]const u8 {
+         error.IdentitiesMalformed, error.IdentitiesDuplicate, error.IdentitiesTooMany => "TENSORFOLD_IDENTITIES takes id=path entries apart by commas or newlines, each id once, at most 32",
+         error.BadAblateScale => "TENSORFOLD_ABLATE_SCALE takes a finite number (1: the file's strengths)",
+         error.AblateDirectionsShape, error.AblateDirectionsNotOrthonormal, error.AblateFileMissesDirections, error.AblateFileMissesLambdas, error.AblateFileMissesFirstLayer, error.AblateLambdaShape, error.AblateFirstLayerShape => "an identity's file takes `directions` [k, 2560] fp32 orthonormal rows (k <= 4), `lam_attn` and `lam_shared` [k] fp32 and `first_layer` [1] int64 under 48; the log names the file",
++        error.AblateLayersShape, error.AblateRowScaleShape => "a per-layer identity's file takes `layers` [n] int64 increasing under 48, `directions` [n, 2560] fp32 unit rows, `lam` [n] fp32 and optionally `row_scale` [n, 2560] fp32 > 0; the log names the file",
+     };
+ }
+ 
