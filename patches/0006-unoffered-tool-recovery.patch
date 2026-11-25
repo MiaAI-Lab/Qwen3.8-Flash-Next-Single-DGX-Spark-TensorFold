@@ -1,0 +1,182 @@
+diff --git a/zig/src/server/tool_parse.zig b/zig/src/server/tool_parse.zig
+--- a/zig/src/server/tool_parse.zig
++++ b/zig/src/server/tool_parse.zig
+@@ -98,7 +98,22 @@
+ }
+ 
+ /// ``parse_tool_calls_from_content``: the reply's content and its calls (null when it makes none).
++pub const Testing = if (@import("builtin").is_test) struct {
++    pub threadlocal var forward_unoffered: bool = false;
++} else struct {};
++
++/// Opt-in forwarding; the API client remains responsible for authorization.
++pub fn forwardUnoffered() bool {
++    if (@import("builtin").is_test) return Testing.forward_unoffered;
++    const value = @import("sys").getenv("TENSORFOLD_FORWARD_UNOFFERED_TOOLS") orelse return false;
++    return std.mem.eql(u8, value, "1");
++}
++
+ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize) Allocator.Error!Parsed {
++    return parseWithRecovery(a, text, tools, max_calls, forwardUnoffered());
++}
++
++fn parseWithRecovery(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize, recover: bool) Allocator.Error!Parsed {
+     if (tools.len == 0) return .{ .content = text, .calls = null };
+     var known: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+     for (tools) |tool| {
+@@ -139,6 +154,26 @@
+             }
+             break :blk null;
+         };
++        // Only explicitly closed Qwen XML, never bare JSON or fenced examples.
++        if (recover and std.ascii.startsWithIgnoreCase(text[env.start..env.end], "<tool_call>") and
++            std.ascii.startsWithIgnoreCase(env.payload, "<function=") and
++            std.mem.indexOf(u8, text[0..env.start], "```") == null)
++        {
++            if (parsed) |list| {
++                if (list.len == 1 and (try callName(a, list[0], &known)) == null) {
++                    const strict = functionBlock(a, env.payload, &schemas, true) catch |err| switch (err) {
++                        error.OutOfMemory => return error.OutOfMemory,
++                        error.Invalid => null,
++                    };
++                    if (strict) |c| {
++                        if (recoverableName(c.name) and c.arguments == .object and tool_params.finite(c.arguments)) {
++                            try calls.append(a, try openaiCall(a, c.name, c.arguments));
++                            continue;
++                        }
++                    }
++                }
++            }
++        }
+         const good = if (parsed) |list| list.len > 0 and for (list) |c| {
+             if ((try callName(a, c, &known)) == null) break false;
+         } else true else false;
+@@ -162,7 +197,7 @@
+     const tail = try argumentsClose(a, strip(block));
+     const closed = try std.mem.concat(a, u8, &.{ "<tool_call>", block, tail, "</tool_call>" });
+     // the strict reading: one whole call to an offered tool, nothing but its markup
+-    if ((try parse(a, closed, tools, 1)).calls == null) return "";
++    if ((try parseWithRecovery(a, closed, tools, 1, false)).calls == null) return "";
+     return std.mem.concat(a, u8, &.{ tail, "</tool_call>" });
+ }
+ 
+@@ -193,6 +228,12 @@
+     return closed[body.len..];
+ }
+ 
++fn recoverableName(name: []const u8) bool {
++    if (name.len == 0 or name.len > 64) return false;
++    for (name) |ch| if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '-') return false;
++    return true;
++}
++
+ /// The offered tool's spelling, or null when the request did not declare that name.
+ fn callName(a: Allocator, c: Call, known: *const std.StringArrayHashMapUnmanaged([]const u8)) Allocator.Error!?[]const u8 {
+     const name = strip(c.name);
+diff --git a/zig/src/server/tool_parse_test.zig b/zig/src/server/tool_parse_test.zig
+--- a/zig/src/server/tool_parse_test.zig
++++ b/zig/src/server/tool_parse_test.zig
+@@ -598,3 +598,41 @@
+ test {
+     _ = @import("tool_parse_visibility_test.zig");
+ }
++
++
++test "opt-in unoffered Qwen XML recovery" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
++    const raw = "<tool_call>\n<function=view_generated_image>\n<parameter=image_url>\n/tmp/probe.png\n</parameter>\n</function>\n</tool_call>";
++    for ([_]?usize{null, 1}) |limit| {
++        const off = try parse(a, raw, tools, limit);
++        try std.testing.expect(off.calls == null);
++        try std.testing.expectEqualStrings(raw, off.content);
++    }
++    tool_parse.Testing.forward_unoffered = true;
++    defer tool_parse.Testing.forward_unoffered = false;
++    for ([_]?usize{null, 1}) |limit| {
++        const on = try parse(a, raw, tools, limit);
++        try std.testing.expectEqual(@as(usize, 1), on.calls.?.len);
++        try std.testing.expectEqualStrings("", on.content);
++        try std.testing.expectEqual(@as(usize, 0), on.rejected_envelopes);
++        const f = on.calls.?[0].get("function").?;
++        try std.testing.expectEqualStrings("view_generated_image", f.get("name").?.string);
++        try std.testing.expectEqualStrings("{\"image_url\":\"/tmp/probe.png\"}", f.get("arguments").?.string);
++        for ([_][]const u8{
++            "{\"name\":\"view_generated_image\",\"arguments\":{}}",
++            "<tool_call><function=bad.name></function></tool_call>",
++            "<tool_call><function=missing><parameter=x>oops</function></tool_call>",
++            "<tool_call><function=missing></function>",
++            "```xml\n" ++ raw ++ "\n```",
++        }) |text| {
++            const r = try parse(a, text, tools, limit);
++            try std.testing.expect(r.calls == null);
++            try std.testing.expectEqualStrings(text, r.content);
++        }
++        try std.testing.expect((try parse(a, raw, &.{}, limit)).calls == null);
++    }
++    try std.testing.expectEqualStrings("", try closeCall(a, raw[0..raw.len - "</tool_call>".len], tools));
++}
+diff --git a/zig/src/server/tool_stream.zig b/zig/src/server/tool_stream.zig
+--- a/zig/src/server/tool_stream.zig
++++ b/zig/src/server/tool_stream.zig
+@@ -202,7 +202,9 @@
+                         const name = s.known.get(lower) orelse {
+                             s.buffered_close = "</tool_call>";
+                             s.dsml_searched = s.pos;
+-                            if (!s.giveUp()) return;
++                            if (tool_parse.forwardUnoffered() and std.mem.indexOf(u8, text[0..s.buffered_start], "```") == null) {
++                                s.state = .buffered;
++                            } else if (!s.giveUp()) return;
+                             continue;
+                         };
+                         try s.begin(name, out);
+diff --git a/zig/src/server/tool_stream_test.zig b/zig/src/server/tool_stream_test.zig
+--- a/zig/src/server/tool_stream_test.zig
++++ b/zig/src/server/tool_stream_test.zig
+@@ -251,3 +251,44 @@
+         try std.testing.expectEqualStrings("{\"q\":\"<tool_call><function=lookup></function></tool_call>\"{}", try sentArguments(a, out.items));
+     }
+ }
++
++
++test "opt-in unoffered Qwen XML streams once at its closer" {
++    tool_parse.Testing.forward_unoffered = true;
++    defer tool_parse.Testing.forward_unoffered = false;
++    const raw = "<tool_call>\n<function=view_generated_image>\n<parameter=image_url>\n/tmp/probe.png\n</parameter>\n</function>\n</tool_call>";
++    const offered = "<tool_call><function=lookup></function></tool_call>";
++    for ([_][]const u8{"", offered}) |prefix| {
++        for (0..prefix.len + raw.len + 1) |boundary| {
++            var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++            defer arena.deinit();
++            const a = arena.allocator();
++            const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
++            const text = try std.mem.concat(a, u8, &.{prefix, raw});
++            var stream_test = try Streamer.init(a, tools);
++            var out: std.ArrayList(Value) = .empty;
++            try stream_test.feed(text[0..boundary], &out);
++            if (boundary < text.len) for (out.items) |delta| {
++                for (delta.get("tool_calls").?.array) |call| {
++                    if (call.get("function").?.get("name")) |name| try std.testing.expect(!std.mem.eql(u8, name.string, "view_generated_image"));
++                }
++            };
++            try stream_test.feed(text, &out);
++            try stream_test.feed(text, &out);
++            var count: usize = 0;
++            var args: std.ArrayList(u8) = .empty;
++            const wanted: i64 = if (prefix.len == 0) 0 else 1;
++            for (out.items) |delta| for (delta.get("tool_calls").?.array) |call| {
++                if (call.get("index").?.int64().? != wanted) continue;
++                const f = call.get("function").?;
++                if (f.get("name")) |name| {
++                    try std.testing.expectEqualStrings("view_generated_image", name.string);
++                    count += 1;
++                }
++                if (f.get("arguments")) |part| try args.appendSlice(a, part.string);
++            };
++            try std.testing.expectEqual(@as(usize, 1), count);
++            try std.testing.expectEqualStrings("{\"image_url\":\"/tmp/probe.png\"}", args.items);
++        }
++    }
++}

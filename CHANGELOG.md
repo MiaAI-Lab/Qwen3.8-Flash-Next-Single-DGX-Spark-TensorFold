@@ -5,6 +5,12 @@ Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:
 
 ## Unreleased
 
+**2026-11-25: opt-in recovery of calls to unoffered tools.** Patch `0006` forwards explicitly closed Qwen XML calls to
+unoffered tools as structured tool calls when `TENSORFOLD_FORWARD_UNOFFERED_TOOLS=1`. Agentic clients can then return a
+tool error and let the model recover rather than ending the turn with text or empty content. The switch defaults to off;
+the client must validate authorization. Includes host regression tests and `tools/tool_recovery_check.py` for streaming and
+non-streaming transport and simulated error recovery. See [#40](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/issues/40).
+
 **2026-11-18: `scripts/harden.sh` (new) cuts the NGC base's unused ballast into its own image tag, opt-in.**
 [issue #77](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/issues/77) by
 [MimiTechAi](https://github.com/MimiTechAi) reported 28 CRITICAL and 628 HIGH from a scan of the image and brought a
