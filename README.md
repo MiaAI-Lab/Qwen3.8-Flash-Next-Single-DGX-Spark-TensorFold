@@ -505,6 +505,51 @@ the model was still thinking.
   ([issue #1](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/issues/1),
   [PR #2](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Dual-DGX-Sparks-TensorFold/pull/2)).
 
+### Recovery from calls to unoffered tools (opt-in)
+
+Agentic clients such as Open WebUI can expose different sets of tools on successive
+requests, including tools that are only discoverable on demand. A model may still
+emit a complete Qwen XML call to a tool that is not in the current request's
+`tools` list. Treating that call as ordinary text (or dropping it) can end an
+otherwise recoverable agent turn with `finish_reason: stop`, sometimes with empty
+assistant content. A structured tool call lets the client return an unknown-tool
+error and the model choose an offered alternative instead. See
+[#40](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/issues/40)
+and [TensorFold #256](https://github.com/ashhart/TensorFold/issues/256).
+
+By default, the existing behavior is unchanged. To opt in at server startup:
+
+```bash
+TENSORFOLD_FORWARD_UNOFFERED_TOOLS=1 ./start.sh restart
+```
+
+Only the value `1` enables forwarding; an unset variable or `0` leaves it disabled.
+The existing `start.sh` environment forwarding passes `TENSORFOLD_*` variables to
+the container. Patch `0006` forwards explicitly closed Qwen XML calls to unoffered
+functions with a valid name and finite object arguments as structured OpenAI
+`tool_calls`, including SSE streaming. It does not repair incomplete unknown-tool
+envelopes or enable forwarding of unoffered bare JSON calls. A request must already
+offer tools.
+
+**The client remains responsible for authorization.** This switch does not grant
+access to, register or execute additional tools. Enable it only for clients that
+validate tool calls and reject unauthorized or unknown functions. For such agentic
+clients, enabling recovery by default may be preferable to silently ending the
+turn; the patch is initially default-off to preserve compatibility for other clients.
+
+Live checks against a running server (adjust URL and model to the served values):
+
+```bash
+python3 tools/tool_recovery_check.py --url http://127.0.0.1:8888/v1/chat/completions --model Qwen3.8-Flash-Next --expect forward
+python3 tools/tool_recovery_check.py --url http://127.0.0.1:8888/v1/chat/completions --model Qwen3.8-Flash-Next --expect forward --stream
+```
+
+For a server restarted with the variable unset or set to `0`, use
+`--expect keep --phase transport` to check the legacy behavior with the default
+parallel tool-call policy. An inconclusive result means the model did not emit
+the intended complete envelope. The recovery phase uses a separate simulated
+tool-error history; it does not execute real tools or test OWUI itself.
+
 ## What the patches are
 
 `patches/*.patch` are this recipe's changes to TensorFold v1.2.7 (commit `93a2e93e`), applied with `git apply` in the checkout root by `scripts/prepare.sh`.
@@ -516,6 +561,7 @@ Drafted replies are still checked: a drafted reply matches `"draft": false`.
 | `0003` | `--kv-cache fp8` for Flash Next (one rank, contiguous caches): five full 262,144-token windows fit where bf16 fits three. The fp8 attention reader keeps the next tile in registers, and the MTP head's own cache stays bf16 while the stream fits its charge (the v1.1.4 build's 0003 and 0005, rebased onto v1.2.7's paged and lane-batched attention) |
 | `0004` | prompt passes run the MXFP8 projections 1,024 columns or wider on a 128 x 128 tile (64 x 64 for calls of 128 rows or fewer) that folds the block scales into the weights: one fp32 sum over K, 1.4-1.65x the exact kernels, prefill +7-9%. Prompt rows leave the exact kernels' bits (within their rounding bound; a row's bytes never depend on its chunk, so replies stay exact across drafting and batching); `TF_FLASHNEXT_PROMPT_MX128=0` turns it off (the v1.1.4 build's 0006 and 0015) |
 | `0005` | video parts on the CUDA engine: Flash Next offers the template's `<\|video_pad\|>` groups to the server (the sampler and patchifier are TensorFold's `core/qwen_vl/video.zig`, the same the Triton host runs) and the shared media plan reads a group of video rows beside image rows. Nothing decodes a video until `VIDEO=1` puts `libtfvideo.so` on the loader's path (chai-md's [#90](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/pull/90), re-based onto v1.2.7 by MiaAI-Lab) |
+| `0006` | opt-in forwarding of explicitly closed Qwen XML calls to unoffered tools, including SSE streaming (`TENSORFOLD_FORWARD_UNOFFERED_TOOLS=1`); allows an authorized client to return an unknown-tool error and continue the agent turn |
 
 The v1.1.4 build carried seventeen patches. v1.2.7 has most of the rest itself, and the recipe sets its switches for them in `scripts/config.sh`:
 
@@ -542,6 +588,7 @@ Whether the pieces that were not ported still matter is a measurement of the v1.
 | --- | --- |
 | `tools/exact.py` | greedy replies: drafted, `"draft": false`, and concurrent, must match |
 | `tools/toolcheck.py` | a tool call whose array argument comes back as a JSON array |
+| `tools/tool_recovery_check.py` | opt-in unknown-tool transport and simulated client-error recovery, streamed or non-streamed |
 | `tools/needle.py` | a passphrase in a ~200,000-token prompt |
 | `tools/prompt_reuse.py` | a resumed prompt matches a fresh one |
 | `tools/bench.py` | prefill at 8k-128k and a short decode |
