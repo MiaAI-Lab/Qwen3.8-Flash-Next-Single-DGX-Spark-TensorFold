@@ -1,9 +1,32 @@
 # Changelog
 
-Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:v1.3.5-02b324a`, built by
-`scripts/prepare.sh` from TensorFold v1.3.5 (`02b324ae`) plus `patches/` (0002 to 0005).
+Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:v1.3.6-f56b142`, built by
+`scripts/prepare.sh` from TensorFold v1.3.6 (`f56b1420`) plus `patches/` (0002 to 0005).
 
 ## Unreleased
+
+**2026-11-27: TensorFold v1.3.5 to v1.3.6 (`f56b1420`, 511 commits): the same speed and the same replies; its two new Flash Next opt-ins stay off.**
+- `TF_REF`, the release archive (`libtfgrammar.so`, SHA-256 `7f979048…`, the release's own `.sha256`) and the image tag (`tensorfold-qwen38:v1.3.6-f56b142`)
+  move to v1.3.6. Zig 0.17.0 and FFmpeg 9.0.2 are unchanged. Flash Next on CUDA still has no YaRN.
+- `0002`, `0004` and `0005` apply as they were. `0003` met upstream's cache-only prompt step (#4529): the attention rows' rope and cache writes moved
+  out of `attnRows` into `cuda_batch_cache.zig`, so `0003`'s fp8 cache writes move there with them (`attnRows` keeps its fp8 reads), and the new
+  lean-prefill host test's kernel stand-in gets the fp8 entry points and a bf16 sequence.
+- New for Flash Next on CUDA in v1.3.6, and what the recipe does with it:
+  - `TF_FLASHNEXT_GRAPH_TAIL=1` (opt-in upstream, #4544): a lone drafted window's rollback copies and greedy best-row pick run inside its captured
+    graph, the same bits. Level here (1s greedy 54.5 against 54.2 tok/s, copy 392.1 against 393.1), so off.
+  - `TF_FLASHNEXT_PREFILL_MTP_LEAN=1` (opt-in upstream, #4529, which still lists device checks as to do): the MTP head's prompt step keeps only its
+    caches. Here it answers `CudaFailed` (`cuMemsetD8Async`: invalid argument) on prompts of about 900 to 2,200 tokens, with fp8 KV and with bf16
+    KV alike, and on a 4,000-token one at the 262,144-token window, so off. `exact.py`'s short prompts pass with it.
+  - TFQ3 (#4986) needs a checkpoint re-quantized to TensorFold's `.tffpw` records; NVIDIA's FP4 export has none, so nothing changes here.
+- A/B on one Spark, one fresh server per arm, interleaved twice (v1.3.6, v1.3.5, + graph tail, + lean prefill, + both), the 2026-11-26 entry's bench:
+  - v1.3.6 against v1.3.5, second pass 1s greedy / 1s sampled / 5s greedy / 5s sampled: 54.2 / 57.5 / 156.6 / 154.6 tok/s against 54.2 / 57.4 /
+    156.2 / 153.9. Copy 393.1 against 391.4. Prefill 4k / 8k / 16k / 31k / 63k / 126k: 2,386 / 2,496 / 2,528 / 2,532 / 2,490 / 2,385 tok/s against
+    2,388 / 2,474 / 2,514 / 2,517 / 2,479 / 2,380.
+  - `exact.py` on all ten servers: every output byte-identical to v1.3.5's (and to the 2026-11-26 run's), and every decode and copy reply the same
+    on every server.
+- Checked on v1.3.6: `zig build test-cuda-host` (510/510 steps, 9,818 tests passed, 52 skipped), `compile-cuda-tests`, `exact.py` on all ten
+  servers, then with the final defaults `exact.py --pad 3000`, `toolcheck.py` 3/3, `visioncheck.py`, `prompt_reuse.py 30000`
+  (worst 99.3%) and `scripts/harden.sh`'s boot gate, all passing. Not yet re-run: the needle and `context_boundary.py`.
 
 **2026-11-26: TensorFold v1.3.4 to v1.3.5 (`02b324ae`, 955 commits), and its boot-checked copy window on: a lone stream copying text 25% faster, the same replies.**
 - `TF_REF`, the release archive (`libtfgrammar.so`, SHA-256 `9223b9fd…`, the release's own `.sha256`) and the image tag (`tensorfold-qwen38:v1.3.5-02b324a`)

@@ -60,11 +60,11 @@ if [[ "$ABLIT" == 1 ]]; then
 fi
 unset _pin
 
-# The engine: TensorFold's Zig engine (tensorfold-native), built from TF_REPO at TF_REF (the v1.3.5 release) with patches/*.patch
+# The engine: TensorFold's Zig engine (tensorfold-native), built from TF_REPO at TF_REF (the v1.3.6 release) with patches/*.patch
 # applied (git apply in the checkout's root), with Zig ZIG_VERSION. Only the Zig build goes into the image, plus the two
 # image decoders the engine wants (libjpeg-turbo for JPEG, libwebp's decoder for WebP), built from pinned sources.
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
-TF_REF="${TF_REF:-02b324ae9767253d9911d753d5c835a5070eed1b}"   # v1.3.5
+TF_REF="${TF_REF:-f56b1420ff3e17fa531d90eb97bef41053cd852d}"   # v1.3.6
 ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
 ZIG_SHA256="${ZIG_SHA256:-9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
@@ -85,9 +85,9 @@ FFMPEG_VERSION=9.0.2
 FFMPEG_SHA256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
 # libtfgrammar.so (structured output, tool_choice "required" and named functions) comes prebuilt from TensorFold's own release archive, checked against its SHA-256;
 # the archive ships it with xgrammar's Apache-2.0 notices. TF_RELEASE is the release that matches TF_REF.
-TF_RELEASE_VERSION=1.3.5
-TF_RELEASE_AARCH64_SHA256=9223b9fd3d1ab1b3f1a3493990533a2ca41f18404a882e872221fc94487ad65f
-TF_TAG="v1.3.5-${TF_REF:0:7}"
+TF_RELEASE_VERSION=1.3.6
+TF_RELEASE_AARCH64_SHA256=7f9790480e0a0f4baef73eaf0a5168ffee6d0ddb0e8f11102908f7894d14eb32
+TF_TAG="v1.3.6-${TF_REF:0:7}"
 IMAGE="${IMAGE:-tensorfold-qwen38:${TF_TAG}}"
 image_hash() {
   ( cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
@@ -98,7 +98,7 @@ image_hash() {
 }
 GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold}"
 # The published image of the current patch set (scripts/publish-image.sh): prepare.sh pulls it by digest while the patch hash matches IMAGE_TAG.
-# None is published for the v1.3.5 patch set yet, so prepare.sh tries $GHCR_IMAGE:<tag> and otherwise builds locally.
+# None is published for the v1.3.6 patch set yet, so prepare.sh tries $GHCR_IMAGE:<tag> and otherwise builds locally.
 # The v1.1.4 image stays in the registry: v1.1.4-eab8582-4baf16137ecd, sha256:5c6c42b9747318c1cd8b6cb85cb69493fff2e82cb23b61e49b9cf54cd09ac28e.
 IMAGE_TAG="${IMAGE_TAG:-}"
 IMAGE_DIGEST="${IMAGE_DIGEST:-}"
@@ -111,7 +111,7 @@ CONTAINER_NAME="${CONTAINER_NAME:-qwen38-flash-next-tf}"
 SERVED_NAME="${SERVED_NAME:-Qwen3.8-Flash-Next}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
-# Native window 262,144; the Flash Next CUDA engine of TensorFold 1.3.5 has no YaRN extension (it refuses a legacy rope_scaling), so this is also the maximum.
+# Native window 262,144; the Flash Next CUDA engine of TensorFold 1.3.6 has no YaRN extension (it refuses a legacy rope_scaling), so this is also the maximum.
 CONTEXT="${CONTEXT:-262144}"
 # Requests decoded together. The engine admits each one inside its own budget (MemAvailable after load, less
 # TENSORFOLD_MEMORY_RESERVE_GIB, and with VISION=1 less another 2 GiB kept for the vision helper) and refuses one
@@ -153,6 +153,9 @@ export TF_FLASHNEXT_GATHER_EARLY="${TF_FLASHNEXT_GATHER_EARLY:-1}"
 # ~1,900-token text decodes about 25% faster (314 to 392 tok/s); other decode and prefill are level. It costs about 15 s at load and 0.02 GiB a stream
 # (the prompt cache 4.1 to 3.9 GiB at 5 streams). 0 keeps the 32-row window and skips the check.
 export TF_FLASHNEXT_WINDOW_CHECK="${TF_FLASHNEXT_WINDOW_CHECK:-1}"
+# Left off (upstream opt-ins of v1.3.6, not set here): TF_FLASHNEXT_GRAPH_TAIL=1 (#4544) puts a lone verify's tail copies and greedy pick in its
+# window graph, the same bits; on a Spark level (1s greedy 54.5 against 54.2, copy 392 against 393). TF_FLASHNEXT_PREFILL_MTP_LEAN=1 (#4529) answers
+# CudaFailed (cuMemsetD8Async, invalid argument) on a ~900 to 2,200-token prompt in v1.3.6, with fp8 or bf16 KV, so it stays off.
 # Prefill (patch 0004, the v1.1.4 series' 0006 and 0015 ported): prompt passes run the MXFP8 projections 1,024 columns or wider on a
 # 128 x 128 tile with the block scales folded into the weights (one fp32 sum over K; 1.4-1.65x the exact lane at a 3,072-row chunk,
 # +7-9% prefill; calls of 128 rows or fewer take its 64 x 64 form, same bits, so short prompts are not slower). Unlike the switches above it changes a prompt's numbers (within the exact kernels' rounding bound; each row's bits
