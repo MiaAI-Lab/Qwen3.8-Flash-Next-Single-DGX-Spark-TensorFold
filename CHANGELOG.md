@@ -1,9 +1,38 @@
 # Changelog
 
-Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:v1.3.4-12ebd41`, built by
-`scripts/prepare.sh` from TensorFold v1.3.4 (`12ebd414`) plus `patches/` (0002 to 0005).
+Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:v1.3.5-02b324a`, built by
+`scripts/prepare.sh` from TensorFold v1.3.5 (`02b324ae`) plus `patches/` (0002 to 0005).
 
 ## Unreleased
+
+**2026-11-26: TensorFold v1.3.4 to v1.3.5 (`02b324ae`, 955 commits), and its boot-checked copy window on: a lone stream copying text 25% faster, the same replies.**
+- `TF_REF`, the release archive (`libtfgrammar.so`, SHA-256 `9223b9fd…`, the release's own `.sha256`) and the image tag (`tensorfold-qwen38:v1.3.5-02b324a`)
+  move to v1.3.5. Zig 0.17.0 and FFmpeg 9.0.2 are unchanged.
+- `0002` applies as it was. `0003` met upstream's draft buffers sized by the load's window rows (`Layout.rows`, #4801) in `cuda_mtp_draft.zig`: its
+  `initKv` and `initPartsKv` keep the fp8 head cache and take upstream's `@max(rows, l.rows)`; in `cuda_prompt.zig` its `kv` field sits beside the new
+  `widths`. `0004`'s `mx_min_n` form sits beside `readout_fused`, now `true` by default, and the new `TF_FLASHNEXT_GDN_CHAIN_TPR` in the disk-policy
+  test. `0005`'s two video errors follow the new `NoVisionTower` message.
+- New for Flash Next on CUDA in v1.3.5, and what the recipe does with it:
+  - `TF_FLASHNEXT_WINDOW_CHECK=1` (opt-in upstream, #4075): a boot self-check proves which verify widths score byte-equal to one-token steps and
+    grows a lone stream's copy window from 32 rows up to 48. With fp8 KV it proved all 1,176 rows of widths 1 to 48. **`config.sh` turns it on.**
+    It costs about 15 s at load (60.3 s against 45.5 s) and 0.02 GiB a stream (the prompt cache 4.1 to 3.9 GiB).
+  - `TF_FLASHNEXT_WINDOW_GRAPH_PARITY=1` (#4492) and `TF_FLASHNEXT_GDN_CHAIN_TPR=1` (#4484), opt-in upstream with the same bits: level here, so off.
+  - The fused read-out is now TensorFold's default (#4799); `config.sh` already set it. On by default: a non-final prompt chunk skips the last
+    layer's MLP (#4885), the MTP draft rows' best value and log-sum-exp run over 32 one-warp blocks (#4632), and the pass scratch has room for the MTP
+    head's rows, so a 128 to 1,023-token prompt with drafts on no longer writes past it (#4801).
+- A/B on one Spark, one fresh server per arm, interleaved twice (v1.3.5, v1.3.4, + window check, + graph parity, + chain TPR). Decode: five distinct
+  prompts, 256 tokens, one stream in turn (median) and five at once (sum), greedy and seeded sampled, two passes a server. Copy: one stream repeats
+  a ~1,900-token text, greedy, 768 tokens. This bench's decode figures are not comparable with the 2026-11-23 entry's.
+  - v1.3.5 against v1.3.4, second pass 1s greedy / 1s sampled / 5s greedy / 5s sampled: 54.7 / 57.5 / 158.2 / 154.6 tok/s against 54.3 / 57.3 /
+    157.4 / 154.6 (first pass within 0.5% too). Copy 314.1 against 314.3. Prefill 4k / 8k / 16k / 31k / 63k / 126k: 2,388 / 2,488 / 2,527 / 2,532 /
+    2,485 / 2,379 tok/s against 2,385 / 2,482 / 2,506 / 2,518 / 2,480 / 2,381.
+  - The window check: copy 392.5 tok/s (+25%); decode within 1% (5s 156.8 / 153.6 second pass, two servers each).
+  - Graph parity: copy 314.9, decode level. Chain TPR: copy 313.6, decode level.
+  - `exact.py` on all ten servers: every output byte-identical to v1.3.4's (and to the 2026-11-23 run's), and every decode and copy reply the same
+    on every server.
+- Checked on v1.3.5: `zig build test-cuda-host` (497/497 steps, 9,477 tests passed, 51 skipped), `compile-cuda-tests`, `exact.py` on all ten
+  servers, then with the final defaults `exact.py --pad 3000`, `toolcheck.py` 3/3, `visioncheck.py`, `prompt_reuse.py 30000` (worst 99.3%) and
+  `scripts/harden.sh`'s boot gate. Not yet re-run: the needle and `context_boundary.py`.
 
 **2026-11-23: TensorFold v1.3.2 to v1.3.4 (`12ebd414`, 990 commits), patch `0001` retired, and the pooled n-gram gather on: 5-stream decode up to 4.7% faster, the same replies.**
 - `TF_REF`, the release archive (`libtfgrammar.so`, SHA-256 `02566a52…`, the release's own `.sha256`) and the image tag (`tensorfold-qwen38:v1.3.4-12ebd41`)

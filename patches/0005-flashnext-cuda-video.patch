@@ -1,5 +1,5 @@
 diff --git a/zig/src/families/flashnext/cuda_images.zig b/zig/src/families/flashnext/cuda_images.zig
-index 266c63ce5..ed658220f 100644
+index 19b4171..df54460 100644
 --- a/zig/src/families/flashnext/cuda_images.zig
 +++ b/zig/src/families/flashnext/cuda_images.zig
 @@ -8,6 +8,10 @@ const media = @import("cuda_media.zig");
@@ -41,17 +41,17 @@ index 266c63ce5..ed658220f 100644
      pub fn state(v: *Vision, ids: []const u32, images: []const @import("lanes").stream.Image, from: usize) !media.State {
          return .{ .image = try shared.media.Media.init(v.a, v.encoder, ids, images, v.limits, from), .prep = v.prep, .pool = v.pool, .prep_paged = v.prep_paged, .pool_paged = v.pool_paged, .prep8 = v.prep8 };
      }
-@@ -83,6 +92,8 @@ pub const Vision = struct {
-             error.BadImageLimits, error.BadImageCount => "image count or row budget exceeds the configured limits",
+@@ -84,6 +93,8 @@ pub const Vision = struct {
              error.BadImageGrid, error.BadImagePatches, error.BadImagePlaceholders => "image rows do not match the prompt placeholders",
-             error.NoVisionTower, error.BadVisionWidth, error.UnsupportedQwenVision => "unsupported Flash Next Qwen-VL tower configuration",
+             error.NoVisionTower => @import("engine_api").visionWords("this Flash Next checkpoint", error.VisionWithoutTower),
+             error.BadVisionWidth, error.UnsupportedQwenVision => "unsupported Flash Next Qwen-VL tower configuration",
 +            error.VideoTooShort, error.VideoTooLarge, error.BadVideo => "the video could not be sampled into the tower's grid: too short, too large or unreadable",
 +            error.VideoLibraryUnavailable => "video input needs libtfvideo.so (FFmpeg 9.0.2) reachable on the loader path",
              else => core.qwen_vl.geometry.problem(err),
          };
      }
 diff --git a/zig/src/native/cuda_vision_offer.zig b/zig/src/native/cuda_vision_offer.zig
-index f0a0b398e..83865aeb5 100644
+index 1e42b9e..e79be9e 100644
 --- a/zig/src/native/cuda_vision_offer.zig
 +++ b/zig/src/native/cuda_vision_offer.zig
 @@ -43,7 +43,7 @@ pub fn offer(v: anytype, open: ?api.VisionOpen) ?api.Vision {
@@ -64,7 +64,7 @@ index f0a0b398e..83865aeb5 100644
      return out;
  }
 diff --git a/zig/src/vision/qwen_cuda_media.zig b/zig/src/vision/qwen_cuda_media.zig
-index 109e9588a..29090d841 100644
+index 109e958..29090d8 100644
 --- a/zig/src/vision/qwen_cuda_media.zig
 +++ b/zig/src/vision/qwen_cuda_media.zig
 @@ -5,7 +5,7 @@ const lanes = @import("lanes");

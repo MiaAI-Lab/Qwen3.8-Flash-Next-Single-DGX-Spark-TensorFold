@@ -60,11 +60,11 @@ if [[ "$ABLIT" == 1 ]]; then
 fi
 unset _pin
 
-# The engine: TensorFold's Zig engine (tensorfold-native), built from TF_REPO at TF_REF (the v1.3.4 release) with patches/*.patch
+# The engine: TensorFold's Zig engine (tensorfold-native), built from TF_REPO at TF_REF (the v1.3.5 release) with patches/*.patch
 # applied (git apply in the checkout's root), with Zig ZIG_VERSION. Only the Zig build goes into the image, plus the two
 # image decoders the engine wants (libjpeg-turbo for JPEG, libwebp's decoder for WebP), built from pinned sources.
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
-TF_REF="${TF_REF:-12ebd414de443485d281768036ac4835e5abe8fe}"   # v1.3.4
+TF_REF="${TF_REF:-02b324ae9767253d9911d753d5c835a5070eed1b}"   # v1.3.5
 ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
 ZIG_SHA256="${ZIG_SHA256:-9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
@@ -85,9 +85,9 @@ FFMPEG_VERSION=9.0.2
 FFMPEG_SHA256=8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e
 # libtfgrammar.so (structured output, tool_choice "required" and named functions) comes prebuilt from TensorFold's own release archive, checked against its SHA-256;
 # the archive ships it with xgrammar's Apache-2.0 notices. TF_RELEASE is the release that matches TF_REF.
-TF_RELEASE_VERSION=1.3.4
-TF_RELEASE_AARCH64_SHA256=02566a5297dd67db9b0b834737fe73e192907454896ee7d097d3a0dfca303937
-TF_TAG="v1.3.4-${TF_REF:0:7}"
+TF_RELEASE_VERSION=1.3.5
+TF_RELEASE_AARCH64_SHA256=9223b9fd3d1ab1b3f1a3493990533a2ca41f18404a882e872221fc94487ad65f
+TF_TAG="v1.3.5-${TF_REF:0:7}"
 IMAGE="${IMAGE:-tensorfold-qwen38:${TF_TAG}}"
 image_hash() {
   ( cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
@@ -98,7 +98,7 @@ image_hash() {
 }
 GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold}"
 # The published image of the current patch set (scripts/publish-image.sh): prepare.sh pulls it by digest while the patch hash matches IMAGE_TAG.
-# None is published for the v1.3.4 patch set yet, so prepare.sh tries $GHCR_IMAGE:<tag> and otherwise builds locally.
+# None is published for the v1.3.5 patch set yet, so prepare.sh tries $GHCR_IMAGE:<tag> and otherwise builds locally.
 # The v1.1.4 image stays in the registry: v1.1.4-eab8582-4baf16137ecd, sha256:5c6c42b9747318c1cd8b6cb85cb69493fff2e82cb23b61e49b9cf54cd09ac28e.
 IMAGE_TAG="${IMAGE_TAG:-}"
 IMAGE_DIGEST="${IMAGE_DIGEST:-}"
@@ -111,7 +111,7 @@ CONTAINER_NAME="${CONTAINER_NAME:-qwen38-flash-next-tf}"
 SERVED_NAME="${SERVED_NAME:-Qwen3.8-Flash-Next}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
-# Native window 262,144; the Flash Next CUDA engine of TensorFold 1.3.4 has no YaRN extension (it refuses a legacy rope_scaling), so this is also the maximum.
+# Native window 262,144; the Flash Next CUDA engine of TensorFold 1.3.5 has no YaRN extension (it refuses a legacy rope_scaling), so this is also the maximum.
 CONTEXT="${CONTEXT:-262144}"
 # Requests decoded together. The engine admits each one inside its own budget (MemAvailable after load, less
 # TENSORFOLD_MEMORY_RESERVE_GIB, and with VISION=1 less another 2 GiB kept for the vision helper) and refuses one
@@ -138,8 +138,8 @@ export TF_FLASHNEXT_GDN_LANES="${TF_FLASHNEXT_GDN_LANES:-1}"
 # NVFP4 prompt experts on the shared-memory K32 tiles adapted from our patch 0014 (2: gate/up and down; 1 gate/up only; 0 off).
 export TF_FLASHNEXT_WARM_AHEAD="${TF_FLASHNEXT_WARM_AHEAD:-1}"
 export TF_FLASHNEXT_PROMPT_EXPERT_TILE="${TF_FLASHNEXT_PROMPT_EXPERT_TILE:-2}"
-# Opt-in upstream since v1.3.2, on here: a prompt pass of 768 rows or more runs the BF16 hyper-connection read-out on two fused tiles
-# (three launches instead of five, every output byte the same). On a Spark about 4% faster prefill (+3.5% to +5.2%) at 4k to 126k tokens, decode unchanged,
+# Upstream's default since v1.3.5 (opt-in in v1.3.2 to v1.3.4), set here so a .env can turn it off: a prompt pass of 768 rows or more runs the BF16
+# hyper-connection read-out on two fused tiles (three launches instead of five, every output byte the same). On a Spark about 4% faster prefill (+3.5% to +5.2%) at 4k to 126k tokens, decode unchanged,
 # and the same greedy replies (exact.py --pad 3000, cold prompts of 1.6k to 82k tokens). 0 runs the unfused read-out.
 export TF_FLASHNEXT_READOUT_FUSED="${TF_FLASHNEXT_READOUT_FUSED:-1}"
 # Opt-in upstream since v1.3.4, on here: a shared decode round gathers every stream's n-gram rows in one pooled read instead of one call a
@@ -147,6 +147,12 @@ export TF_FLASHNEXT_READOUT_FUSED="${TF_FLASHNEXT_READOUT_FUSED:-1}"
 # On a Spark, 5-stream decode on a fresh server (n-gram table still on disk) +4.7% sampled and +1.3% greedy; once the table is cached, +0.3%.
 # One stream and prefill are level. 0 keeps the per-stream gather.
 export TF_FLASHNEXT_GATHER_EARLY="${TF_FLASHNEXT_GATHER_EARLY:-1}"
+# Opt-in upstream since v1.3.5, on here: before serving, a self-check measures the widest verify window whose every row scores byte-equal to its
+# one-token step (with fp8 KV on a Spark: all 1,176 rows of widths 1 to 48), and a lone stream's copy window grows from 32 rows to that width, at most 48.
+# A check that fails or proves nothing past 32 keeps 32, so replies are unchanged (exact.py byte-identical). On a Spark a lone stream repeating a
+# ~1,900-token text decodes about 25% faster (314 to 392 tok/s); other decode and prefill are level. It costs about 15 s at load and 0.02 GiB a stream
+# (the prompt cache 4.1 to 3.9 GiB at 5 streams). 0 keeps the 32-row window and skips the check.
+export TF_FLASHNEXT_WINDOW_CHECK="${TF_FLASHNEXT_WINDOW_CHECK:-1}"
 # Prefill (patch 0004, the v1.1.4 series' 0006 and 0015 ported): prompt passes run the MXFP8 projections 1,024 columns or wider on a
 # 128 x 128 tile with the block scales folded into the weights (one fp32 sum over K; 1.4-1.65x the exact lane at a 3,072-row chunk,
 # +7-9% prefill; calls of 128 rows or fewer take its 64 x 64 form, same bits, so short prompts are not slower). Unlike the switches above it changes a prompt's numbers (within the exact kernels' rounding bound; each row's bits

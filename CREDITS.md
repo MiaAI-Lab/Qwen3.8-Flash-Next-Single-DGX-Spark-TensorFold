@@ -47,7 +47,7 @@ license files from the pinned checkout.
   The Flash Next CUDA engine in this recipe is ported from TensorFold's Python Flash Next CUDA engine, written by
   Ash Hart and the TensorFold contributors ([contributors](https://github.com/ashhart/TensorFold/graphs/contributors));
   their authorship is recorded in TensorFold's history.
-- **The 3 patches `0002` to `0004` in `patches/` on TensorFold v1.3.4 are written by MiaAI-Lab** (Mia's AI Lab,
+- **The 3 patches `0002` to `0004` in `patches/` on TensorFold v1.3.5 are written by MiaAI-Lab** (Mia's AI Lab,
   [MiaAI-Lab](https://github.com/MiaAI-Lab)), under this
   repository's MIT License. They modify TensorFold's own Flash Next CUDA engine, which is by Ash Hart and the TensorFold
   contributors; that code keeps TensorFold's licenses (see `NOTICE`). Patch by patch:
@@ -142,7 +142,7 @@ This recipe no longer applies those patches (the serving path is the Zig engine)
 - **[chai-md](https://github.com/chai-md)** wrote
   [#90](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/pull/90), the video patch for the CUDA
   engine: `patches/0005` is theirs, re-based onto TensorFold v1.2.7 by MiaAI-Lab (the field layout had moved and the patch
-  had to be re-split) and carried to v1.3.4 unchanged, with `VIDEO=1`, the pinned FFmpeg build and the tests MiaAI-Lab's.
+  had to be re-split) and carried to v1.3.5 unchanged, with `VIDEO=1`, the pinned FFmpeg build and the tests MiaAI-Lab's.
 - The scripts (`start.sh`, `stop.sh`, `scripts/`) and the checks in `tools/` are MiaAI-Lab's. `client.py`,
   `needle.py`, `toolcheck.py` and `prompt_reuse.py` are adapted from MiaAI-Lab's two-Spark recipe
   [GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold);
