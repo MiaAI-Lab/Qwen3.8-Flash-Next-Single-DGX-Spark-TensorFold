@@ -1,0 +1,429 @@
+diff --git a/zig/kernels/cuda/flashnext_batch.cu b/zig/kernels/cuda/flashnext_batch.cu
+index c52f18334..1df35a059 100644
+--- a/zig/kernels/cuda/flashnext_batch.cu
++++ b/zig/kernels/cuda/flashnext_batch.cu
+@@ -557,6 +557,70 @@ extern "C" __global__ void __launch_bounds__(1024) fn_qsa_select_lanes(const flo
+     fn_qsa_select_body(sc, LI + LI[4 * MAX + blockIdx.x], ids, nkr, spr, nb, idw, top, ratio);
+ }
+ 
++// Target-guided long-context MTP draft selection: reuses up to (top*ratio - 64) guided distant keys strictly before
++// (end - 64) from target layer 43's verify selection, then appends the exact 64 most recent tokens [end-64 .. end).
++// Skips fn_qsa_scores and fn_qsa_select over 65K-262K pooled blocks while preserving strict causal order.
++extern "C" __global__ void __launch_bounds__(256) fn_qsa_guide_apply(const int* __restrict__ guide,
++                                                                     const int* __restrict__ pos0,
++                                                                     int* __restrict__ ids, int* __restrict__ nkr,
++                                                                     int* __restrict__ spr, int idw, int top,
++                                                                     int ratio) {
++    __shared__ int warp_sums[8];
++    const int r = blockIdx.x;
++    const int end = *pos0 + r + 1;
++    const int budget = top * ratio;
++    int* out = ids + static_cast<long long>(r) * idw;
++    if (end <= budget) {
++        if (threadIdx.x == 0) {
++            nkr[r] = end;
++            spr[r] = 0;
++        }
++        return;
++    }
++    constexpr int RECENT = 64;
++    const int recent_start = end - RECENT;
++    const int keep_max = budget - RECENT;
++    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
++    const unsigned below = (1u << lane) - 1u;
++    // Each thread checks 8 slots of `guide[0 .. budget)` (256 * 8 = 2048); compact valid IDs < recent_start.
++    int vals[8];
++    int mine = 0;
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        const int idx = (warp * 8 + i) * 32 + lane;
++        const int id = (idx < budget) ? guide[idx] : -1;
++        const bool ok = (id >= 0 && id < recent_start);
++        vals[i] = ok ? id : -1;
++        mine += ok ? 1 : 0;
++    }
++    int warp_total = mine;
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) warp_total += __shfl_xor_sync(0xffffffffu, warp_total, o);
++    if (lane == 0) warp_sums[warp] = warp_total;
++    __syncthreads();
++    int warp_base = 0;
++    for (int w = 0; w < warp; ++w) warp_base += warp_sums[w];
++    int total_valid = warp_base;
++    for (int w = warp; w < 8; ++w) total_valid += warp_sums[w];
++    int place = warp_base;
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        const bool ok = vals[i] >= 0;
++        const unsigned mask = __ballot_sync(0xffffffffu, ok);
++        if (ok) {
++            const int dst = place + __popc(mask & below);
++            if (dst < keep_max) out[dst] = vals[i];
++        }
++        place += __popc(mask);
++    }
++    const int kept = min(total_valid, keep_max);
++    if (t < RECENT) out[kept + t] = recent_start + t;
++    if (t == 0) {
++        nkr[r] = kept + RECENT;
++        spr[r] = 1;
++    }
++}
++
+ // Training or a live pocket requests the ordered FP32 expert sum.
+ extern "C" __global__ void fn_moe_sum(const float* __restrict__ y, const float* __restrict__ wts, float* __restrict__ out,
+                                       int d, int slots) {
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index 2bfb0efc7..011e6f064 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -363,14 +363,17 @@ pub fn Pass(comptime Tri: type) type {
+                 // shared rounds: each lane's rope, cache writes, selection and attention on its own stream's caches
+                 const own_seq = self.seq;
+                 const own_pos0 = self.pos0;
++                const own_guide_dst = self.hooks.qsa_guide_dst;
+                 defer {
+                     self.seq = own_seq;
+                     self.pos0 = own_pos0;
++                    self.hooks.qsa_guide_dst = own_guide_dst;
+                 }
+                 var row0: usize = 0;
+                 for (self.lanes, 0..) |l, i| {
+                     self.seq = l.seq;
+                     self.pos0 = l.pos;
++                    self.hooks.qsa_guide_dst = l.qsa_guide_dst;
+                     try self.attnRows(lw, ai, pa + row0 * pn * 2, l.rows, .{ .pos = s.pos + i * 16, .q = s.q + row0 * h.q * head_dim * 2, .iq = s.iq + row0 * index_heads * index_dim * 2, .ao = s.ao + row0 * h.q * head_dim * 2 });
+                     row0 += l.rows;
+                 }
+@@ -413,19 +416,36 @@ pub fn Pass(comptime Tri: type) type {
+                     const pos = at.pos + (r0 / att_rows) * 16;
+                     const iq = at.iq + r0 * index_heads * index_dim * 2;
+                     const sel = r0 - g0; // this block's rows in the selection buffers
+-                    // rows past `top` complete blocks score theirs; _scores leaves the rest, so skip it when none is
+-                    if (ends / ratio > top) try self.tri.qsaScores(iq, pooled, pos, self.seq.scores, nb, m, @min(nb, cdiv(ends, ratio)), pg);
+-                    var a: cuda.Args = .{};
+-                    a.add(self.seq.scores);
+-                    a.add(pos);
+-                    a.add(s.qids + sel * idw * 4);
+-                    a.add(s.qnk + sel * 4);
+-                    a.add(s.qspr + sel * 4);
+-                    a.add(cint(nb));
+-                    a.add(cint(idw));
+-                    a.add(cint(top));
+-                    a.add(cint(ratio));
+-                    try cuda.launch.launch(self.k.select, .{ .grid = .{ .x = @intCast(m) }, .block = .{ .x = 1024 } }, self.stream, &a);
++                    const guided = self.hooks.qsa_guide_src != 0 and self.lanes.len == 0 and ends / ratio > top;
++                    if (guided) {
++                        var ga: cuda.Args = .{};
++                        ga.add(self.hooks.qsa_guide_src);
++                        ga.add(pos);
++                        ga.add(s.qids + sel * idw * 4);
++                        ga.add(s.qnk + sel * 4);
++                        ga.add(s.qspr + sel * 4);
++                        ga.add(cint(idw));
++                        ga.add(cint(top));
++                        ga.add(cint(ratio));
++                        try cuda.launch.launch(self.k.qsa_guide_apply, .{ .grid = .{ .x = @intCast(m) }, .block = .{ .x = 256 } }, self.stream, &ga);
++                    } else {
++                        // rows past `top` complete blocks score theirs; _scores leaves the rest, so skip it when none is
++                        if (ends / ratio > top) try self.tri.qsaScores(iq, pooled, pos, self.seq.scores, nb, m, @min(nb, cdiv(ends, ratio)), pg);
++                        var a: cuda.Args = .{};
++                        a.add(self.seq.scores);
++                        a.add(pos);
++                        a.add(s.qids + sel * idw * 4);
++                        a.add(s.qnk + sel * 4);
++                        a.add(s.qspr + sel * 4);
++                        a.add(cint(nb));
++                        a.add(cint(idw));
++                        a.add(cint(top));
++                        a.add(cint(ratio));
++                        try cuda.launch.launch(self.k.select, .{ .grid = .{ .x = @intCast(m) }, .block = .{ .x = 1024 } }, self.stream, &a);
++                        if (ai == @import("cuda_prompt_knobs.zig").qsa_guide_ai and self.hooks.qsa_guide_dst != 0 and ends / ratio > top) {
++                            try self.copy(self.hooks.qsa_guide_dst + r0 * idw * 4, s.qids + sel * idw * 4, m * idw * 4);
++                        }
++                    }
+                     if (!fused) {
+                         const chunks = cdiv(@min(ends, wt.dense_keys), 512);
+                         if (fp8) {
+diff --git a/zig/src/families/flashnext/cuda_batch_kernels.zig b/zig/src/families/flashnext/cuda_batch_kernels.zig
+index 138bd38d9..64a0f9668 100644
+--- a/zig/src/families/flashnext/cuda_batch_kernels.zig
++++ b/zig/src/families/flashnext/cuda_batch_kernels.zig
+@@ -104,6 +104,7 @@ pub const Kernels = struct {
+     /// Each sparse row's top blocks (attention._select / _select_tiles), native.
+     select: cuda.Function,
+     select_lanes: cuda.Function,
++    qsa_guide_apply: cuda.Function,
+ 
+     pub fn load(d: *const cuda.Driver) !Kernels {
+         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+@@ -152,6 +153,7 @@ pub const Kernels = struct {
+         k.shift = try k.batch.function("fn_shift_window");
+         k.select = try k.batch.function("fn_qsa_select");
+         k.select_lanes = try k.batch.function("fn_qsa_select_lanes");
++        k.qsa_guide_apply = try k.batch.function("fn_qsa_guide_apply");
+         k.gdn = try Gdn.load(k.batch, "");
+         k.gdn_h8 = try Gdn.load(k.batch, "_h8");
+         k.front_log = try k.batch.function("fn_gdn_front_log");
+diff --git a/zig/src/families/flashnext/cuda_batch_lanes.zig b/zig/src/families/flashnext/cuda_batch_lanes.zig
+index 316fe3576..11a718c73 100644
+--- a/zig/src/families/flashnext/cuda_batch_lanes.zig
++++ b/zig/src/families/flashnext/cuda_batch_lanes.zig
+@@ -124,6 +124,15 @@ pub fn attn(pass: anytype, lw: anytype, ai: usize, pa: u64) !void {
+     var a: cuda.Args = .{};
+     inline for (.{ scores, li, s.qids, s.qnk, s.qspr, cint(nb), cint(wt.index_idw), cint(wt.index_top), cint(wt.index_ratio) }) |v| a.add(v);
+     try cuda.launch.launch(pass.k.select_lanes, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 1024 } }, pass.stream, &a);
++    if (ai == @import("cuda_prompt_knobs.zig").qsa_guide_ai) {
++        var row0: usize = 0;
++        for (pass.lanes) |l| {
++            if (l.qsa_guide_dst != 0 and (l.pos + l.rows) / wt.index_ratio > wt.index_top) {
++                try pass.copy(l.qsa_guide_dst, s.qids + row0 * wt.index_idw * 4, l.rows * wt.index_idw * 4);
++            }
++            row0 += l.rows;
++        }
++    }
+     if (fp8) {
+         try g.attnChunksLanesKv8(pass.stream, s.q, lp, li, s.po, s.pm, s.pl, s.qids, s.qnk, s.qspr, n, wt.kv_heads, chunks);
+     } else {
+diff --git a/zig/src/families/flashnext/cuda_batch_state.zig b/zig/src/families/flashnext/cuda_batch_state.zig
+index e5010b376..a10d36712 100644
+--- a/zig/src/families/flashnext/cuda_batch_state.zig
++++ b/zig/src/families/flashnext/cuda_batch_state.zig
+@@ -155,6 +155,10 @@ pub const Hooks = struct {
+     marks: [max_marks]Mark = .{ .{}, .{} },
+     /// TF_FLASHNEXT_GRAPH_TAIL: a lone verify's copies and row best around the pass, in its graph when it has one.
+     tail: ?*const @import("cuda_graph_tail.zig").Tail = null,
++    /// TF_FLASHNEXT_MTP_QSA_GUIDE: destination [rows, index_idw] i32 for layer 43 verify QSA selection (0: off).
++    qsa_guide_dst: u64 = 0,
++    /// TF_FLASHNEXT_MTP_QSA_GUIDE: source [index_idw] i32 of guided keys for MTP draft attention (0: off).
++    qsa_guide_src: u64 = 0,
+ };
+ 
+ /// Rows a layer's pending-row log holds, and the pending count past which a chain stores its state in place.
+@@ -543,7 +547,7 @@ pub const scoreStride = sizes.scoreStride;
+ pub const scoreBytes = sizes.scoreBytes;
+ 
+ /// One stream's rows in a shared pass from `pos` on its own caches, and its window's rollback, hidden rows and scores.
+-pub const Lane = struct { seq: SeqState, pos: usize, rows: usize = 1, keep: ?*const Keep = null, streams: u64 = 0, logits: u64 = 0 };
++pub const Lane = struct { seq: SeqState, pos: usize, rows: usize = 1, keep: ?*const Keep = null, streams: u64 = 0, logits: u64 = 0, qsa_guide_dst: u64 = 0 };
+ 
+ /// The engine's resident weights the pass reads.
+ pub const Model = struct {
+diff --git a/zig/src/families/flashnext/cuda_mtp_draft.zig b/zig/src/families/flashnext/cuda_mtp_draft.zig
+index 0744b73b1..9baee3eb0 100644
+--- a/zig/src/families/flashnext/cuda_mtp_draft.zig
++++ b/zig/src/families/flashnext/cuda_mtp_draft.zig
+@@ -125,6 +125,10 @@ pub const Draft = struct {
+     best_ahead: bool = false,
+     /// TF_FLASHNEXT_GRAPH_TAIL: the verify queued that reduction after its pass, so draws skips its own.
+     best_queued: bool = false,
++    /// TF_FLASHNEXT_MTP_QSA_GUIDE: target layer 43 verify QSA keys [max_rows, index_idw] i32 (allocated lazily when enabled).
++    qsa_guide: ?cuda.DeviceBuffer = null,
++    qsa_guide_valid: bool = false,
++    qsa_guide_row: usize = 0,
+ 
+     /// `saved`'s pieces and the spares' size at the model's heads: conv windows, projection rows, tail, n-gram rows.
+     pub const Layout = struct {
+@@ -384,9 +388,18 @@ pub const Draft = struct {
+         d.pending = 0;
+     }
+ 
++    /// Lazily allocates the device buffer holding target layer 43's verify-time QSA selection [max_rows, index_idw] i32.
++    pub fn ensureQsaGuide(d: *Draft, driver: *const cuda.Driver) !u64 {
++        if (d.qsa_guide) |b| return b.ptr;
++        const b = try cuda.DeviceBuffer.alloc(driver, max_rows * wt.index_idw * 4);
++        d.qsa_guide = b;
++        return b.ptr;
++    }
++
+     pub fn deinit(d: *Draft) void {
+         if (d.stream) |stream| cuda.completion.drain(stream.d, stream, "Flash Next draft work did not drain before release");
+         d.gpa.free(d.host);
++        if (d.qsa_guide) |*b| b.free();
+         for (&d.spare) |*b| b.free();
+         if (d.log) |*b| b.free();
+         d.saved.free();
+@@ -408,6 +421,8 @@ pub const Draft = struct {
+         d.rows = 0;
+         d.log_first = 0;
+         d.pending = 0;
++        d.qsa_guide_valid = false;
++        d.qsa_guide_row = 0;
+     }
+ };
+ 
+diff --git a/zig/src/families/flashnext/cuda_mtp_ops.zig b/zig/src/families/flashnext/cuda_mtp_ops.zig
+index 1f8dd575c..3c5a95c05 100644
+--- a/zig/src/families/flashnext/cuda_mtp_ops.zig
++++ b/zig/src/families/flashnext/cuda_mtp_ops.zig
+@@ -175,8 +175,13 @@ pub fn Ops(comptime Tri: type) type {
+             const s = try e.reserve(want);
+             const part_cap = scratch_sizes.partRows(s.cap) / (2 * streams);
+             const piece = @max(@as(usize, 1), @min(row_limit, @min(s.cap / 2, if (lean) part_cap else row_limit)));
++            const knobs = @import("cuda_prompt_knobs.zig");
++            const guide_src: u64 = if (!lean and knobs.mtpQsaGuide() and d.qsa_guide_valid and d.qsa_guide != null and d.media == null and d.len >= knobs.mtpQsaMinContext())
++                d.qsa_guide.?.ptr + d.qsa_guide_row * wt.index_idw * 4
++            else
++                0;
+             // the engine's block scores (the passes share one stream), for rows past 2,048 keys of the head's cache
+-            const score_rows = if (lean) 0 else try e.reserveScores(d.cap, piece);
++            const score_rows = if (lean or guide_src != 0) 0 else try e.reserveScores(d.cap, piece);
+             var p: batch.Pass(Tri) = .{
+                 .gpa = e.gpa,
+                 .io = e.io,
+@@ -186,7 +191,7 @@ pub fn Ops(comptime Tri: type) type {
+                 .s = s,
+                 .m = .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .table_dense = e.table.dense, .layers = (&h.layer)[0..1], .mixer = h.mixer, .head = h.draft, .ngram = &e.ngram },
+                 .seq = .{ .media = d.media, .conv = &.{}, .state = &.{}, .kc = (&d.kc)[0..1], .vc = (&d.vc)[0..1], .ikc = (&d.ikc)[0..1], .pooled = (&d.pooled)[0..1], .pg = d.pg, .tail = d.kc, .history = &d.unused_history, .cap = d.cap, .scores = score_rows, .kv = d.kv },
+-                .hooks = .{ .logits = .none },
++                .hooks = .{ .logits = .none, .qsa_guide_src = guide_src },
+             };
+             var at: usize = 0;
+             while (at < next.len) {
+@@ -330,8 +335,13 @@ pub fn Ops(comptime Tri: type) type {
+             d.rows = n;
+             d.history = seq.history;
+             @memcpy(d.ids[0..n], ids);
+-            const hooks: batch.Hooks = .{ .logits = .all, .logits_out = d.logits.ptr, .keep = if (keeps) &d.keep else null, .streams = d.streams.ptr, .host_logits = @import("cuda_batch_state.zig").verifyHostLogits() };
++            const knobs = @import("cuda_prompt_knobs.zig");
++            const want_guide = knobs.mtpQsaGuide() and seq.media == null and seq.fed >= knobs.mtpQsaMinContext();
++            const guide_dst: u64 = if (want_guide) try d.ensureQsaGuide(o.e.driver) else 0;
++            const hooks: batch.Hooks = .{ .logits = .all, .logits_out = d.logits.ptr, .keep = if (keeps) &d.keep else null, .streams = d.streams.ptr, .host_logits = @import("cuda_batch_state.zig").verifyHostLogits(), .qsa_guide_dst = guide_dst };
+             try verifyTail(o, seq, d, ids, hooks, keeps);
++            d.qsa_guide_valid = guide_dst != 0;
++            d.qsa_guide_row = n - 1;
+             d.open = keeps;
+         }
+ 
+@@ -356,7 +366,11 @@ pub fn Ops(comptime Tri: type) type {
+                 d.history = seq.history;
+                 @memcpy(d.ids[0..n], ids);
+                 if (keeps) try copyAsync(o.stream(), d.saved.ptr + d.layout.tail_at, seq.tail.ptr, ple_tail_n * wide * 2);
+-                w.* = .{ .seq = seq, .ids = ids, .keep = if (keeps) &d.keep else null, .streams = d.streams.ptr, .logits = d.logits.ptr };
++                const knobs = @import("cuda_prompt_knobs.zig");
++                const guide_dst: u64 = if (knobs.mtpQsaGuide() and seq.media == null and seq.fed >= knobs.mtpQsaMinContext()) try d.ensureQsaGuide(o.e.driver) else 0;
++                d.qsa_guide_valid = guide_dst != 0;
++                d.qsa_guide_row = n - 1;
++                w.* = .{ .seq = seq, .ids = ids, .keep = if (keeps) &d.keep else null, .streams = d.streams.ptr, .logits = d.logits.ptr, .qsa_guide_dst = guide_dst };
+             }
+             try o.e.windows(Tri, o.tri, wins, out);
+             var row0: usize = 0;
+@@ -420,6 +434,7 @@ pub fn Ops(comptime Tri: type) type {
+             if (o.main) |m| return m.rollback(m.ptr, seq, d, keep);
+             o.e.round_graph.clear();
+             if (keep == 0 or keep > d.rows) return error.CannotRewind;
++            if (d.qsa_guide_valid) d.qsa_guide_row = @min(keep - 1, mtp.max_rows - 1);
+             if (keep == d.rows) return d.settle(seq);
+             if (!d.open) return error.CannotRewind;
+             const e = o.e;
+diff --git a/zig/src/families/flashnext/cuda_mtp_pieces.zig b/zig/src/families/flashnext/cuda_mtp_pieces.zig
+index 8907d812f..67c89a9cb 100644
+--- a/zig/src/families/flashnext/cuda_mtp_pieces.zig
++++ b/zig/src/families/flashnext/cuda_mtp_pieces.zig
+@@ -82,7 +82,8 @@ pub fn runPiece(one: anytype, score_rows: u64) !void {
+     const d = one.d;
+     const s = one.p.s;
+     if (one.kv_only or !window_graph.enabled() or d.media != null) return one.run();
+-    const key: window_graph.HeadKey = .init(d, one.m, one.last, one.score, one.input, s, score_rows);
++    const guide_src: u64 = if (@hasField(@TypeOf(one.p.*), "hooks")) one.p.hooks.qsa_guide_src else 0;
++    const key: window_graph.HeadKey = .initGuide(d, one.m, one.last, one.score, one.input, s, score_rows, guide_src);
+     try e.graphs.head.run(e.gpa, e.stream.*, key, one);
+ }
+ 
+diff --git a/zig/src/families/flashnext/cuda_prompt_knobs.zig b/zig/src/families/flashnext/cuda_prompt_knobs.zig
+index 9239ba4bf..2189cb905 100644
+--- a/zig/src/families/flashnext/cuda_prompt_knobs.zig
++++ b/zig/src/families/flashnext/cuda_prompt_knobs.zig
+@@ -14,6 +14,19 @@ pub fn expertFast() bool {
+     return @import("sys").environment.read(bool, "TF_FLASHNEXT_PROMPT_EXPERT_FAST", false) catch false;
+ }
+ 
++/// Target attention layer whose verify-time QSA key selection guides long-context MTP draft attention (layer 43 -> ai 10).
++pub const qsa_guide_ai: usize = 10;
++
++/// TF_FLASHNEXT_MTP_QSA_GUIDE=1: past mtpQsaMinContext(), MTP draft steps reuse target layer 43's verify QSA keys + 64 recent tokens.
++pub fn mtpQsaGuide() bool {
++    return @import("sys").environment.read(bool, "TF_FLASHNEXT_MTP_QSA_GUIDE", false) catch false;
++}
++
++/// TF_FLASHNEXT_MTP_QSA_MIN_CONTEXT=N: context length where guided MTP draft attention activates (default 65536).
++pub fn mtpQsaMinContext() usize {
++    return @import("sys").environment.read(usize, "TF_FLASHNEXT_MTP_QSA_MIN_CONTEXT", 65536) catch 65536;
++}
++
+ test "unset, the MXFP8 projections of 1,024 columns or more take the prompt tile" {
+     if (std.c.getenv("TF_FLASHNEXT_PROMPT_MX128") == null) try std.testing.expectEqual(@as(usize, 1024), mx128MinN());
+ }
+diff --git a/zig/src/families/flashnext/cuda_prompt_windows.zig b/zig/src/families/flashnext/cuda_prompt_windows.zig
+index 601bfbd45..18b6ea9dd 100644
+--- a/zig/src/families/flashnext/cuda_prompt_windows.zig
++++ b/zig/src/families/flashnext/cuda_prompt_windows.zig
+@@ -21,7 +21,7 @@ pub fn forwardGraph(e: *Engine, comptime Tri: type, p: *batch.Pass(Tri), seq: *S
+ }
+ 
+ /// A stream's window in a shared pass: its rows, and where its rollback rows, hidden rows and scores go (0: none).
+-pub const Window = struct { seq: *Seq, ids: []const u32, keep: ?*const batch.Keep = null, streams: u64 = 0, logits: u64 = 0 };
++pub const Window = struct { seq: *Seq, ids: []const u32, keep: ?*const batch.Keep = null, streams: u64 = 0, logits: u64 = 0, qsa_guide_dst: u64 = 0 };
+ 
+ /// Several streams' windows in one batched pass, each row's bits its lone pass's; `out` holds every row's scores.
+ pub fn windows(e: *Engine, comptime Tri: type, tri: Tri, wins: []const Window, out: u64) !void {
+@@ -47,7 +47,7 @@ pub fn windows(e: *Engine, comptime Tri: type, tri: Tri, wins: []const Window, o
+     const scores = try e.reserveScores(cap, s.cap);
+     var at: usize = 0;
+     for (wins, lanes) |w, *l| {
+-        l.* = .{ .seq = w.seq.view(scores), .pos = w.seq.fed, .rows = w.ids.len, .keep = w.keep, .streams = w.streams, .logits = w.logits };
++        l.* = .{ .seq = w.seq.view(scores), .pos = w.seq.fed, .rows = w.ids.len, .keep = w.keep, .streams = w.streams, .logits = w.logits, .qsa_guide_dst = w.qsa_guide_dst };
+         @memcpy(ids[at..][0..w.ids.len], w.ids);
+         @memset(untaught[at..][0..w.ids.len], w.seq.untaught);
+         at += w.ids.len;
+diff --git a/zig/src/families/flashnext/cuda_window_graph.zig b/zig/src/families/flashnext/cuda_window_graph.zig
+index 066322cf8..37604aa64 100644
+--- a/zig/src/families/flashnext/cuda_window_graph.zig
++++ b/zig/src/families/flashnext/cuda_window_graph.zig
+@@ -135,6 +135,7 @@ pub const Key = struct {
+             const tv = tail.values();
+             h.values(&tv);
+         }
++        if (hooks.qsa_guide_dst != 0) h.values(&[_]u64{hooks.qsa_guide_dst});
+         return .{ .rows = @intCast(rows), .shape = h.shape.final(), .moving = h.moving.final() };
+     }
+ };
+@@ -148,9 +149,16 @@ pub const HeadKey = struct {
+     moving: u64,
+ 
+     pub fn init(d: anytype, rows: usize, last: bool, scores: bool, input: u64, s: *const parts.Scratch, score_rows: u64) HeadKey {
++        return initGuide(d, rows, last, scores, input, s, score_rows, 0);
++    }
++
++    pub fn initGuide(d: anytype, rows: usize, last: bool, scores: bool, input: u64, s: *const parts.Scratch, score_rows: u64, guide_src: u64) HeadKey {
+         var h: Hash = .{};
+-        h.geometry(.at(d.len + rows, d.cap));
++        var g = Geometry.at(d.len + rows, d.cap);
++        if (guide_src != 0) g.score_grid = 0;
++        h.geometry(g);
+         h.values(&[_]u64{ d.gen, d.cap, d.kc.ptr, input, d.out.ptr, d.dlogits.ptr, s.h, s.cap, score_rows });
++        if (guide_src != 0) h.values(&[_]u64{guide_src});
+         return .{ .rows = @intCast(rows), .last = last, .scores = scores, .shape = h.shape.final(), .moving = h.moving.final() };
+     }
+ };
+@@ -171,6 +179,7 @@ pub const SharedKey = struct {
+             h.fixed(l.rows);
+             h.geometry(.at(l.pos + l.rows, l.seq.cap));
+             h.values(&[_]u64{ l.seq.gen, pieces(l.seq), l.seq.cap, l.streams, l.logits });
++            if (l.qsa_guide_dst != 0) h.values(&[_]u64{l.qsa_guide_dst});
+             h.keep(l.keep);
+             rows += l.rows;
+         }
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index df674d306..f1952b759 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -329,6 +329,8 @@ const stock_rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_PROFILE", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_VERIFY_HOST_LOGITS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_PREFILL_MTP_LEAN", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1 keeps only MTP KV/indexer caches during prefill)" },
++    .{ .name = "TF_FLASHNEXT_MTP_QSA_GUIDE", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1 reuses target layer 43 QSA key selection for MTP drafts past TF_FLASHNEXT_MTP_QSA_MIN_CONTEXT)" },
++    .{ .name = "TF_FLASHNEXT_MTP_QSA_MIN_CONTEXT", .scope = .flashnext, .kind = .size, .forms = "a whole token count from 0 to the native size maximum (default 65536)" },
+     .{ .name = "TF_FLASHNEXT_DRAFTS", .scope = .flashnext, .kind = .size, .forms = "a whole draft count from 0 to the native size maximum (default 6; clamped to 1 through 15)" },
+     .{ .name = "TF_FLASHNEXT_DRAFTS_GREEDY", .scope = .flashnext, .kind = .size, .forms = "a whole draft count from 0 to the native size maximum (default 8; clamped to 1 through 15)" },
+     .{ .name = "TF_FLASHNEXT_GREEDY_WIDE", .scope = .flashnext, .kind = .size, .forms = "a whole round width from 0 to the native size maximum (default 4)" },

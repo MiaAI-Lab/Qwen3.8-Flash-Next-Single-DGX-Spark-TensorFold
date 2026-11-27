@@ -58,6 +58,69 @@ if [[ "$ABLIT" == 1 ]]; then
   fi
   QUANT_LABEL+=" + Keys house-qsa ablit"
 fi
+# Serving speed profile (opt-in via ./start.sh --fast / --ultrafast or PROFILE=fast|ultrafast):
+#   - exact (default): 100% exact NVFP4 target outputs, stock MTP draft head, exact speculative acceptance.
+#   - fast (100% lossless target): overlays prestonlogan/Qwen3.8-Flash-Next-MTP-Draft-Head (distilled MTP body +
+#     LoRA-merged experts repacked to NVFP4) + target-guided >65K draft attention (layer 43 QSA reuse).
+#   - ultrafast (opt-in lossy): everything in fast, PLUS verify-time MoE expert-union budgeting (budget=18, keep=4,
+#     Parseval renorm) and lightly relaxed speculative acceptance (top-3 margin 2.0 greedy, accept_soft 0.35 sampled).
+PROFILE="${PROFILE:-exact}"
+_default_mtp_distilled=0
+[[ "$CHECKPOINT" != nvfp4 ]] || _default_mtp_distilled=1
+case "$PROFILE" in
+  exact)
+    MTP_DISTILLED="${MTP_DISTILLED:-0}"
+    PROFILE_LABEL="exact target, stock MTP"
+    ;;
+  fast)
+    MTP_DISTILLED="${MTP_DISTILLED:-$_default_mtp_distilled}"
+    : "${TF_FLASHNEXT_MTP_QSA_GUIDE:=1}"
+    : "${TF_FLASHNEXT_MTP_QSA_MIN_CONTEXT:=65536}"
+    if [[ "$MTP_DISTILLED" == 1 ]]; then
+      PROFILE_LABEL="lossless target: distilled MTP + QSA-guided >65K drafts"
+    else
+      PROFILE_LABEL="lossless target: stock MTP + QSA-guided >65K drafts"
+    fi
+    ;;
+  ultrafast)
+    MTP_DISTILLED="${MTP_DISTILLED:-$_default_mtp_distilled}"
+    : "${TF_FLASHNEXT_MTP_QSA_GUIDE:=1}"
+    : "${TF_FLASHNEXT_MTP_QSA_MIN_CONTEXT:=65536}"
+    : "${TF_FLASHNEXT_VERIFY_MOE_BUDGET:=18}"
+    : "${TF_FLASHNEXT_VERIFY_MOE_BUDGET_MAX:=64}"
+    : "${TF_FLASHNEXT_VERIFY_MOE_KEEP:=4}"
+    : "${TF_FLASHNEXT_VERIFY_MOE_PARSEVAL:=1}"
+    : "${TF_FLASHNEXT_ACCEPT_TOPK:=3}"
+    : "${TF_FLASHNEXT_ACCEPT_MARGIN:=2.0}"
+    : "${TF_FLASHNEXT_ACCEPT_SOFT:=0.35}"
+    : "${TF_FLASHNEXT_DRAFTS:=8}"
+    : "${TF_FLASHNEXT_DRAFTS_GREEDY:=8}"
+    : "${TF_FLASHNEXT_CONFIDENCE:=-0.10}"
+    : "${TF_FLASHNEXT_WINDOW_CHECK:=0}"
+    if [[ "$MTP_DISTILLED" == 1 ]]; then
+      PROFILE_LABEL="lossy verify: distilled MTP + QSA guide + MoE budget 18 + relaxed accept (3:2.0 / soft 0.35)"
+    else
+      PROFILE_LABEL="lossy verify: stock MTP + QSA guide + MoE budget 18 + relaxed accept (3:2.0 / soft 0.35)"
+    fi
+    ;;
+  *) echo "PROFILE must be exact, fast, or ultrafast, not $PROFILE" >&2; exit 1 ;;
+esac
+unset _default_mtp_distilled
+[[ "$MTP_DISTILLED" =~ ^[01]$ ]] || { echo "MTP_DISTILLED must be 0 or 1, not $MTP_DISTILLED" >&2; exit 1; }
+MTP_DISTILLED_REPO="${MTP_DISTILLED_REPO:-prestonlogan/Qwen3.8-Flash-Next-MTP-Draft-Head}"
+MTP_BODY_FILE=mtp-t35-overlap-body.pt
+MTP_BODY_SHA256=964a0756170bd3c7ef8b7b785d761b8dbe0706939ed4ff3d7286108d9dcde0f6
+MTP_W3EXP_FILE=mtp-t35-overlap-w3exp.pt
+MTP_W3EXP_SHA256=b2db323c741517b3d4d244801c20af4a90cd909a09d72d3d550e4b34d5396c50
+MTP_LABEL="MTP"
+if [[ "$MTP_DISTILLED" == 1 ]]; then
+  if [[ "$CHECKPOINT" != nvfp4 || "$_pin" != 1 || "$MODEL_REVISION" != "$ABLIT_STOCK_REVISION" ]]; then
+    echo "MTP_DISTILLED=1 (--fast/--ultrafast) grafts onto nvidia/Qwen3.8-Flash-Next-FP4-Local @ ${ABLIT_STOCK_REVISION:0:8}" >&2
+    exit 1
+  fi
+  QUANT_LABEL+=" + distilled MTP"
+  MTP_LABEL="distilled MTP"
+fi
 unset _pin
 
 # The engine: TensorFold's Zig engine (tensorfold-native), built from TF_REPO at TF_REF (the v1.3.6 release) with patches/*.patch
@@ -167,6 +230,16 @@ export TF_FLASHNEXT_PREFILL_MTP_LEAN="${TF_FLASHNEXT_PREFILL_MTP_LEAN:-1}"
 export TF_FLASHNEXT_ATTN_LANES="${TF_FLASHNEXT_ATTN_LANES:-1}"
 export TF_FLASHNEXT_FUSED_SPLIT="${TF_FLASHNEXT_FUSED_SPLIT:-1}"
 export TF_FLASHNEXT_PDL="${TF_FLASHNEXT_PDL:-1}"
+export TF_FLASHNEXT_MTP_QSA_GUIDE="${TF_FLASHNEXT_MTP_QSA_GUIDE:-0}"
+export TF_FLASHNEXT_MTP_QSA_MIN_CONTEXT="${TF_FLASHNEXT_MTP_QSA_MIN_CONTEXT:-65536}"
+export TF_FLASHNEXT_VERIFY_MOE_BUDGET="${TF_FLASHNEXT_VERIFY_MOE_BUDGET:-0}"
+export TF_FLASHNEXT_VERIFY_MOE_BUDGET_MAX="${TF_FLASHNEXT_VERIFY_MOE_BUDGET_MAX:-64}"
+export TF_FLASHNEXT_VERIFY_MOE_KEEP="${TF_FLASHNEXT_VERIFY_MOE_KEEP:-4}"
+export TF_FLASHNEXT_VERIFY_MOE_PARSEVAL="${TF_FLASHNEXT_VERIFY_MOE_PARSEVAL:-1}"
+export TF_FLASHNEXT_ACCEPT_TOPK="${TF_FLASHNEXT_ACCEPT_TOPK:-0}"
+export TF_FLASHNEXT_ACCEPT_MARGIN="${TF_FLASHNEXT_ACCEPT_MARGIN:-0.0}"
+export TF_FLASHNEXT_ACCEPT_SOFT="${TF_FLASHNEXT_ACCEPT_SOFT:-0.0}"
+export TF_FLASHNEXT_DRAFTS_GREEDY="${TF_FLASHNEXT_DRAFTS_GREEDY:-8}"
 # Prefill (patches 0004 + 0007): prompt passes run MXFP8 projections 640 columns or wider (including shared_expert gate/up/down, with direct
 # strided FP32 down_proj into y's slot and zero sharedScatter) on the 128 x 128 relaxed tile (one fp32 sum over K; calls of 128 rows or fewer
 # take its 64 x 64 form, same bits). Changes prompt numbers within the exact kernels' rounding bound; each row's bits stay independent of chunk,
@@ -268,9 +341,14 @@ snapshot_rev() {
 # The folder under HF_CACHE that holds the checkpoint the engine reads: the snapshot, or with ABLIT=1 the view scripts/ablit_view.py builds
 # (the snapshot's files linked, plus the overlay's sidecar). It stays under HF_CACHE because that is all the container mounts.
 ABLIT_VIEW_SUB="tensorfold-qwen38/ablit-${MODEL_REVISION:0:8}-${ABLIT_REVISION:0:8}"
+MTP_DISTILLED_DIR_SUB="tensorfold-qwen38/mtp-distilled"
+MTP_SIDECAR_SUB="${MTP_DISTILLED_DIR_SUB}/mtp-distilled-nvfp4.safetensors"
+MTP_VIEW_SUB="tensorfold-qwen38/mtp-${MODEL_REVISION:0:8}-t35overlap"
+[[ "$ABLIT" != 1 ]] || MTP_VIEW_SUB+="-ablit-${ABLIT_REVISION:0:8}"
 ablit_cache_dir() { echo "$HF_CACHE/hub/models--${ABLIT_ID//\//--}"; }
 model_sub() {
-  if [[ "$ABLIT" == 1 ]]; then echo "$ABLIT_VIEW_SUB"
+  if [[ "$MTP_DISTILLED" == 1 ]]; then echo "$MTP_VIEW_SUB"
+  elif [[ "$ABLIT" == 1 ]]; then echo "$ABLIT_VIEW_SUB"
   else echo "hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)"; fi
 }
 
@@ -280,6 +358,7 @@ prepared_state() {
   hash=$(image_hash)
   label=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo missing)
   rev=$(snapshot_rev)
-  [[ "$ABLIT" != 1 ]] || extra=" ablit=$ABLIT_ID@$ABLIT_REVISION"
+  [[ "$ABLIT" != 1 ]] || extra+=" ablit=$ABLIT_ID@$ABLIT_REVISION"
+  [[ "$MTP_DISTILLED" != 1 ]] || extra+=" mtp=$MTP_DISTILLED_REPO@${MTP_BODY_SHA256:0:8}"
   echo "model=$MODEL_ID@$rev image=$label patches=$hash$extra"
 }

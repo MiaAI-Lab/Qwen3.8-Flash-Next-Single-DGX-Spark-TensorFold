@@ -3,8 +3,10 @@
 # runs scripts/prepare.sh when the image or the checkpoint is not ready, launches tensorfold-native serve on port
 # 8888, waits until the OpenAI API answers, then runs a smoke test. Stop it with ./stop.sh.
 #
-# Usage: ./start.sh [restart] [extra tensorfold-native serve args]
-#   ./start.sh                         # up to 5 requests at once, a 262,144-token window, fp8 KV, images, MTP drafts
+# Usage: ./start.sh [restart] [--exact | --fast | --ultrafast] [extra tensorfold-native serve args]
+#   ./start.sh                         # exact (default): 5 at once, 262k window, fp8 KV, images, exact NVFP4 + MTP
+#   ./start.sh restart --fast          # 100% lossless speedups: distilled MTP draft head + QSA-guided >65K drafting
+#   ./start.sh restart --ultrafast     # --fast + opt-in lossy Hibana levers (verify MoE budget 18 + relaxed accept 3:2.0 / soft 0.35)
 #   ./start.sh restart                 # stop, then start again; the new arguments are checked before stopping
 #   ./start.sh restart --parallel 2 --context 131072
 #   CONTEXT=131072 ./start.sh restart  # a shorter window leaves more of the KV pool to the other streams
@@ -12,6 +14,7 @@
 #   DRY_RUN=1 ./start.sh               # print the docker command and exit
 # Extra arguments go to tensorfold-native serve after the defaults, so they win.
 # Settings, from the environment or ./.env (scripts/config.sh):
+#   profile  PROFILE (exact | fast | ultrafast), MTP_DISTILLED (0|1)
 #   serving  CONTEXT, PARALLEL, MAX_TOKENS, THINKING, DRAFTS, TEMPERATURE, TOP_P, TOP_K, SERVED_NAME, HOST, PORT
 #   files    CHECKPOINT (nvfp4 | int4), MODEL_ID, MODEL_REVISION, HF_CACHE, KERNEL_CACHE, STATE_DIR
 #   vision   VISION (0|1), VISION_URLS (0|1, public https media), PDF (0|1, PDF document parts through the engine's PDFium),
@@ -23,16 +26,25 @@
 #            (TENSORFOLD_API_KEY by name only). KV_DTYPE is fp8 or bf16. VISION=1 passes --vision (image and video).
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
-source ./scripts/config.sh
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
-WAIT_TIMEOUT="${WAIT_TIMEOUT:-1800}"
 MODE=start
-case "${1:-}" in
-  restart) MODE=restart; shift ;;
-  help) usage; exit 0 ;;
-esac
-for arg in "$@"; do [[ "$arg" == -h || "$arg" == --help ]] && { usage; exit 0; }; done
+FILTERED_ARGS=()
+while (( $# > 0 )); do
+  case "$1" in
+    restart) [[ ${#FILTERED_ARGS[@]} -eq 0 && "$MODE" == start ]] && MODE=restart || FILTERED_ARGS+=("$1") ;;
+    help|-h|--help) usage; exit 0 ;;
+    --exact) export PROFILE=exact ;;
+    --fast) export PROFILE=fast ;;
+    --ultrafast) export PROFILE=ultrafast ;;
+    *) FILTERED_ARGS+=("$1") ;;
+  esac
+  shift
+done
+set -- "${FILTERED_ARGS[@]}"
+
+source ./scripts/config.sh
+WAIT_TIMEOUT="${WAIT_TIMEOUT:-1800}"
 
 [[ "$CONTEXT" =~ ^[1-9][0-9]*$ && "$CONTEXT" -le 1048576 ]] || die "CONTEXT is a token count up to 1048576, not $CONTEXT"
 [[ "$PARALLEL" =~ ^([1-9]|1[0-6])$ ]] || die "PARALLEL is 1 to 16, not $PARALLEL"
@@ -88,10 +100,10 @@ source ./scripts/banner.sh
 echo
 banner
 printf '\n%s  Mia'"'"'s TensorFold Start Script%s\n' "$M" "$R"
-printf '%s  %s · %s at once · %s-token window · %s KV · vision %s · drafts %s · port %s%s\n\n' "$D" "$MODEL_ID$( [[ "$ABLIT" == 1 ]] && echo ' + ablit')" \
-  "$(arg_value --parallel)" "$(arg_value --context)" "$KV_DTYPE" \
+printf '%s  %s · profile %s · %s at once · %s-token window · %s KV · vision %s · drafts %s · port %s%s\n\n' "$D" "$MODEL_ID$( [[ "$ABLIT" == 1 ]] && echo ' + ablit')" \
+  "$PROFILE" "$(arg_value --parallel)" "$(arg_value --context)" "$KV_DTYPE" \
   "$( [[ "$VISION" == 1 ]] && echo on || echo off)" \
-  "$( [[ "$DRAFTS" == 1 ]] && echo MTP || echo off)" "$PORT" "$R"
+  "$( [[ "$DRAFTS" == 1 ]] && echo "${MTP_LABEL:-MTP}" || echo off)" "$PORT" "$R"
 STEPS=5
 step() { printf '%s[%s/%s]%s %s%s%s\n' "$M" "$1" "$STEPS" "$R" "$B" "$2" "$R"; }
 
@@ -264,6 +276,7 @@ IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 printf '\n%s  ✔ %s is now LIVE! on port %s%s\n\n' "$G" "$SERVED" "$PORT" "$R"
 cat <<EOF
     API      http://${IP:-<spark-address>}:$PORT/v1   (model: $SERVED)
+    Profile  $PROFILE ($PROFILE_LABEL)
     Loaded   in ${LOADED_S}s · ${avail_gb} GiB was free
     Model    $MODEL_ID @ ${MODEL_REVISION:0:8} ($QUANT_LABEL)
     Window   $(arg_value --context) tokens · $(arg_value --parallel) at once · $KV_DTYPE KV · drafts $( [[ "$DRAFTS" == 1 ]] && echo MTP || echo off)

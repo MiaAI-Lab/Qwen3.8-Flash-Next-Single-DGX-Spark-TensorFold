@@ -1,0 +1,347 @@
+diff --git a/zig/kernels/cuda/route_rows.cu b/zig/kernels/cuda/route_rows.cu
+index 8190cf709..2e189a6de 100644
+--- a/zig/kernels/cuda/route_rows.cu
++++ b/zig/kernels/cuda/route_rows.cu
+@@ -115,3 +115,177 @@ extern "C" __global__ void __launch_bounds__(NT) tf_route_topk(const float* __re
+         WTS[static_cast<long long>(r) * SLOTS + TOPK] = rbf(tf_sigmoid(rbf(row[NE])));
+     }
+ }
++
++// Opt-in verify-time expert-union budgeting (1 block of 256 threads, M <= 64, NE <= 512, C = 32 candidates/row):
++// Guarantees each row's top `KEEP` experts, fills the union up to `BUDGET` by summed routing probability mass,
++// then picks each row's top-K candidates in the union with optional Parseval (full top-K mass) renormalization.
++// Unfilled slots (rare) receive pick = NE (skip) and weight = 0.0f. Deterministic, zero extra global scratch.
++extern "C" __global__ void __launch_bounds__(256) tf_route_topk_budget(
++    const float* __restrict__ L, int NL, int NE, int TOPK,
++    int* __restrict__ PICK, float* __restrict__ WTS, int SLOTS,
++    int shared, int M, int KEEP, int BUDGET, int PARSEVAL) {
++    constexpr int MAX_M = 64;
++    constexpr int MAX_E = 512;
++    constexpr int CANDS = 32;
++    __shared__ uint32_t in_set[MAX_E / 32];
++    __shared__ float score[MAX_E];
++    __shared__ int cand_id[MAX_M][CANDS];
++    __shared__ float cand_p[MAX_M][CANDS];
++    __shared__ float row_sum_topk[MAX_M];
++    __shared__ float red_v[8];
++    __shared__ int red_i[8];
++
++    const int t = threadIdx.x;
++    const int warp = t >> 5;
++    const int lane = t & 31;
++
++    if (t < MAX_E / 32) in_set[t] = 0u;
++    score[t] = 0.0f;
++    score[t + 256] = 0.0f;
++    __syncthreads();
++
++    // Phase 1: each warp ranks top-32 candidates for its rows, marks mandatory top-KEEP bits, accumulates score[e].
++    for (int r = warp; r < M; r += 8) {
++        const float* row = L + static_cast<long long>(r) * NL;
++        float v[16];
++        float vmax = -INFINITY;
++#pragma unroll
++        for (int j = 0; j < 16; ++j) {
++            const int e = lane + j * 32;
++            const float x = (e < NE) ? row[e] : -INFINITY;
++            v[j] = x;
++            if (x > vmax) vmax = x;
++        }
++#pragma unroll
++        for (int off = 16; off > 0; off >>= 1) vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, off));
++
++        float p[16];
++        float z = 0.0f;
++#pragma unroll
++        for (int j = 0; j < 16; ++j) {
++            const int e = lane + j * 32;
++            const float ex = (e < NE) ? tf_exp(__fsub_rn(v[j], vmax)) : 0.0f;
++            p[j] = ex;
++            z = __fadd_rn(z, ex);
++        }
++#pragma unroll
++        for (int off = 16; off > 0; off >>= 1) z = __fadd_rn(z, __shfl_xor_sync(0xffffffffu, z, off));
++        const float inv_z = (z > 0.0f) ? __fdiv_rn(1.0f, z) : 0.0f;
++#pragma unroll
++        for (int j = 0; j < 16; ++j) p[j] = __fmul_rn(p[j], inv_z);
++
++        float sum_topk = 0.0f;
++        for (int c = 0; c < CANDS; ++c) {
++            float bv = -1.0f;
++            int bi = 0x7fffffff;
++#pragma unroll
++            for (int j = 0; j < 16; ++j) {
++                const int e = lane + j * 32;
++                if (e < NE && (p[j] > bv || (p[j] == bv && e < bi))) {
++                    bv = p[j];
++                    bi = e;
++                }
++            }
++#pragma unroll
++            for (int off = 16; off > 0; off >>= 1) {
++                const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
++                const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
++                if (ov > bv || (ov == bv && oi < bi)) {
++                    bv = ov;
++                    bi = oi;
++                }
++            }
++#pragma unroll
++            for (int j = 0; j < 16; ++j) {
++                if (lane + j * 32 == bi) p[j] = -1.0f;
++            }
++            if (lane == 0) {
++                cand_id[r][c] = bi;
++                cand_p[r][c] = (bv > 0.0f) ? bv : 0.0f;
++                if (c < TOPK && bv > 0.0f) sum_topk = __fadd_rn(sum_topk, bv);
++                if (bi < NE && bv > 0.0f) {
++                    if (c < KEEP) atomicOr(&in_set[bi >> 5], 1u << (bi & 31));
++                    atomicAdd(&score[bi], (c < TOPK) ? bv : __fmul_rn(0.25f, bv));
++                }
++            }
++        }
++        if (lane == 0) row_sum_topk[r] = sum_topk;
++    }
++    __syncthreads();
++
++    // Phase 2: expand expert union `in_set` up to `BUDGET` by picking highest-scoring remaining experts.
++    int cnt = 0;
++#pragma unroll
++    for (int w = 0; w < MAX_E / 32; ++w) cnt += __popc(in_set[w]);
++    const int target_b = min(NE, max(cnt, BUDGET));
++    while (cnt < target_b) {
++        float bv = -1.0f;
++        int bi = 0x7fffffff;
++#pragma unroll
++        for (int j = 0; j < 2; ++j) {
++            const int e = t + j * 256;
++            if (e < NE && ((in_set[e >> 5] >> (e & 31)) & 1u) == 0u) {
++                const float sv = score[e];
++                if (sv > bv || (sv == bv && e < bi)) {
++                    bv = sv;
++                    bi = e;
++                }
++            }
++        }
++#pragma unroll
++        for (int off = 16; off > 0; off >>= 1) {
++            const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
++            const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
++            if (ov > bv || (ov == bv && oi < bi)) {
++                bv = ov;
++                bi = oi;
++            }
++        }
++        if (lane == 0) {
++            red_v[warp] = bv;
++            red_i[warp] = bi;
++        }
++        __syncthreads();
++        float best_v = red_v[0];
++        int best_i = red_i[0];
++#pragma unroll
++        for (int w = 1; w < 8; ++w) {
++            if (red_v[w] > best_v || (red_v[w] == best_v && red_i[w] < best_i)) {
++                best_v = red_v[w];
++                best_i = red_i[w];
++            }
++        }
++        if (best_v <= 0.0f || best_i >= NE) break;
++        if (t == 0) in_set[best_i >> 5] |= (1u << (best_i & 31));
++        __syncthreads();
++        cnt += 1;
++    }
++
++    // Phase 3: each row selects up to TOPK candidates from `in_set` in rank order, with Parseval renormalization.
++    const unsigned below = (1u << lane) - 1u;
++    for (int r = warp; r < M; r += 8) {
++        if (lane < TOPK) {
++            PICK[static_cast<long long>(r) * SLOTS + lane] = NE;
++            WTS[static_cast<long long>(r) * SLOTS + lane] = 0.0f;
++        }
++        const int id = cand_id[r][lane];
++        const float pv = cand_p[r][lane];
++        const bool ok = (id >= 0 && id < NE) && (((in_set[id >> 5] >> (id & 31)) & 1u) != 0u);
++        const unsigned mask = __ballot_sync(0xffffffffu, ok);
++        const int rank = __popc(mask & below);
++        const bool chosen = ok && (rank < TOPK);
++        float sum_kept = chosen ? pv : 0.0f;
++#pragma unroll
++        for (int off = 16; off > 0; off >>= 1) sum_kept = __fadd_rn(sum_kept, __shfl_xor_sync(0xffffffffu, sum_kept, off));
++        float denom = (PARSEVAL && row_sum_topk[r] > 0.0f) ? row_sum_topk[r] : sum_kept;
++        if (denom <= 0.0f) denom = 1.0f;
++        if (chosen) {
++            PICK[static_cast<long long>(r) * SLOTS + rank] = id;
++            WTS[static_cast<long long>(r) * SLOTS + rank] = rbf(__fdiv_rn(pv, denom));
++        }
++        if (shared && lane == 0) {
++            PICK[static_cast<long long>(r) * SLOTS + TOPK] = NE;
++            WTS[static_cast<long long>(r) * SLOTS + TOPK] = rbf(tf_sigmoid(rbf(L[static_cast<long long>(r) * NL + NE])));
++        }
++    }
++}
+diff --git a/zig/src/cuda/route_rows.zig b/zig/src/cuda/route_rows.zig
+index 43cacaeb3..e08a3713b 100644
+--- a/zig/src/cuda/route_rows.zig
++++ b/zig/src/cuda/route_rows.zig
+@@ -26,12 +26,13 @@ pub const RouteRows = struct {
+     few_fn: Function,
+     wide_fn: Function,
+     topk_fn: Function,
++    topk_budget_fn: Function,
+ 
+     pub fn load(d: *const Driver) !RouteRows {
+         if (!kernels.available) return error.BuiltWithoutKernels;
+         var mod = try Module.load(d, kernels.route_rows);
+         errdefer mod.unload();
+-        const r: RouteRows = .{ .mod = mod, .logits_fn = try mod.function("tf_route_logits"), .few_fn = try mod.function("tf_route_logits_few"), .wide_fn = try mod.function("tf_route_logits_wide"), .topk_fn = try mod.function("tf_route_topk") };
++        const r: RouteRows = .{ .mod = mod, .logits_fn = try mod.function("tf_route_logits"), .few_fn = try mod.function("tf_route_logits_few"), .wide_fn = try mod.function("tf_route_logits_wide"), .topk_fn = try mod.function("tf_route_topk"), .topk_budget_fn = try mod.function("tf_route_topk_budget") };
+         try r.few_fn.allowDynamicShared(few_shared);
+         try r.wide_fn.allowDynamicShared(wide_shared);
+         return r;
+@@ -75,6 +76,22 @@ pub const RouteRows = struct {
+         a.add(@as(i32, @intFromBool(shared)));
+         try launch_.launch(g.topk_fn, .{ .grid = .{ .x = @intCast(rows), .y = 1, .z = 1 }, .block = .{ .x = 128 } }, s, &a);
+     }
++
++    /// Verify-time expert-union budgeted top-k across `rows` (2 <= rows <= 64, experts <= 512) with optional Parseval renorm.
++    pub fn topkBudget(g: *const RouteRows, s: Stream, l: u64, ld: usize, experts: usize, top_k: usize, picks: u64, wts: u64, slots: usize, rows: usize, shared: bool, keep: usize, budget: usize, parseval: bool) !void {
++        const need = experts + @intFromBool(shared);
++        if (experts > 512 or rows == 0 or rows > 64 or top_k == 0 or top_k > 16 or top_k > experts or slots < top_k + @intFromBool(shared) or ld < need) return error.RowShape;
++        var a: launch_.Args = .{};
++        a.add(l);
++        for ([_]usize{ ld, experts, top_k }) |v| a.add(@as(i32, @intCast(v)));
++        a.add(picks);
++        a.add(wts);
++        a.add(@as(i32, @intCast(slots)));
++        a.add(@as(i32, @intFromBool(shared)));
++        for ([_]usize{ rows, keep, budget }) |v| a.add(@as(i32, @intCast(v)));
++        a.add(@as(i32, @intFromBool(parseval)));
++        try launch_.launch(g.topk_budget_fn, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &a);
++    }
+ };
+ 
+ test "the top-k scratch holds a 512-expert router's ten picks" {
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+index 011e6f064..d123da287 100644
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -474,7 +474,13 @@ pub fn Pass(comptime Tri: type) type {
+             const pairs = n * s.slots;
+             try self.copy(keep.moe_x, s.mixed, n * dims * 2);
+             try self.tri.routerMany(s.mixed, lw.router.ptr, s.router_l, dims, n);
+-            try self.tri.topkMany(s.router_l, s.picks, s.wts, n, s.slots);
++            const vm = self.k.forms.verify_moe;
++            const eff_budget = if (comptime @hasDecl(Tri, "topkBudgetMany")) (if (!self.hooks.prompt and n >= 2 and n <= 64 and self.m.layers.len > 1 and (self.hooks.keep != null or self.lanes.len > 0)) vm.effectiveFor(n) else 0) else 0;
++            if (eff_budget > 0) {
++                try self.tri.topkBudgetMany(s.router_l, s.picks, s.wts, n, s.slots, vm.keep, eff_budget, vm.parseval);
++            } else {
++                try self.tri.topkMany(s.router_l, s.picks, s.wts, n, s.slots);
++            }
+             try self.copy(keep.moe_ids, s.picks, pairs * 4);
+             try self.copy(keep.moe_wts, s.wts, pairs * 4);
+             const e = experts_n + 1;
+diff --git a/zig/src/families/flashnext/cuda_batch_kernels.zig b/zig/src/families/flashnext/cuda_batch_kernels.zig
+index 64a0f9668..114425e50 100644
+--- a/zig/src/families/flashnext/cuda_batch_kernels.zig
++++ b/zig/src/families/flashnext/cuda_batch_kernels.zig
+@@ -45,6 +45,7 @@ pub const Forms = struct {
+     readout_fused: bool = true, // TF_FLASHNEXT_READOUT_FUSED
+     mx_min_n: usize = 1024, // TF_FLASHNEXT_PROMPT_MX128 (0: the exact kernels in prompt passes too)
+     expert_fast: bool = false, // TF_FLASHNEXT_PROMPT_EXPERT_FAST (1: bf16 scale-folded NVFP4 prompt experts)
++    verify_moe: @import("cuda_prompt_knobs.zig").VerifyMoeBudget = .{}, // TF_FLASHNEXT_VERIFY_MOE_BUDGET (0: off)
+ 
+     pub fn resolve() Forms {
+         return .{
+@@ -57,6 +58,7 @@ pub const Forms = struct {
+             .readout_fused = @import("readout_fused.zig").on(),
+             .mx_min_n = @import("cuda_prompt_knobs.zig").mx128MinN(),
+             .expert_fast = @import("cuda_prompt_knobs.zig").expertFast(),
++            .verify_moe = @import("cuda_prompt_knobs.zig").VerifyMoeBudget.resolve(),
+         };
+     }
+ };
+diff --git a/zig/src/families/flashnext/cuda_glue.zig b/zig/src/families/flashnext/cuda_glue.zig
+index 3f9d9aff8..0c3a913a4 100644
+--- a/zig/src/families/flashnext/cuda_glue.zig
++++ b/zig/src/families/flashnext/cuda_glue.zig
+@@ -619,6 +619,11 @@ pub const Glue = struct {
+     pub fn topkMany(g: *const Glue, s: cuda.Stream, logits: u64, pick: u64, wts: u64, rows: usize, slots: usize) !void {
+         try g.route.topk(s, logits, wt.experts_n + 1, wt.experts_n, slots - 1, pick, wts, slots, rows, true);
+     }
++
++    /// Verify-time budgeted top-k across `rows` rows (opt-in lossy expert sharing).
++    pub fn topkBudgetMany(g: *const Glue, s: cuda.Stream, logits: u64, pick: u64, wts: u64, rows: usize, slots: usize, keep: usize, budget: usize, parseval: bool) !void {
++        try g.route.topkBudget(s, logits, wt.experts_n + 1, wt.experts_n, slots - 1, pick, wts, slots, rows, true, keep, budget, parseval);
++    }
+ };
+ 
+ test "every entry point has its own bit" {
+diff --git a/zig/src/families/flashnext/cuda_launch.zig b/zig/src/families/flashnext/cuda_launch.zig
+index 87170a652..6fa9fc048 100644
+--- a/zig/src/families/flashnext/cuda_launch.zig
++++ b/zig/src/families/flashnext/cuda_launch.zig
+@@ -461,6 +461,12 @@ pub const Tri = struct {
+         }, &.{ ci("NE", 512), ci("NL", 513), ci("TOPK", 10), ci("SLOTS", 11), ci("BLOCK", 1024), ci("SLOTP", 16) });
+     }
+ 
++    /// Opt-in verify-time budgeted top-k across `rows` rows (native glue only; falls back to exact when absent).
++    pub fn topkBudgetMany(t: Tri, logits: u64, pick: u64, wts: u64, rows: usize, slots: usize, keep: usize, budget: usize, parseval: bool) !void {
++        if (t.glue("_topk_rows")) |g| return g.topkBudgetMany(t.s, logits, pick, wts, rows, slots, keep, budget, parseval);
++        return t.topkMany(logits, pick, wts, rows, slots);
++    }
++
+     /// moe.router over `rows` rows at the one-row tiles (BM 16, BLOCK_E 32, BK 256), each row keeping its own bits.
+     pub fn routerMany(t: Tri, x: u64, w: u64, out: u64, x_stride: usize, rows: usize) !void {
+         if (t.glue("_router")) |g| return g.routerMany(t.s, x, w, out, x_stride, rows);
+diff --git a/zig/src/families/flashnext/cuda_prompt_knobs.zig b/zig/src/families/flashnext/cuda_prompt_knobs.zig
+index 2189cb905..bc95a5fd3 100644
+--- a/zig/src/families/flashnext/cuda_prompt_knobs.zig
++++ b/zig/src/families/flashnext/cuda_prompt_knobs.zig
+@@ -27,6 +27,31 @@ pub fn mtpQsaMinContext() usize {
+     return @import("sys").environment.read(usize, "TF_FLASHNEXT_MTP_QSA_MIN_CONTEXT", 65536) catch 65536;
+ }
+ 
++/// Opt-in lossy verify-time MoE expert-union budgeting (0 = off / exact).
++pub const VerifyMoeBudget = struct {
++    budget: usize = 0,
++    budget_max: usize = 64,
++    keep: usize = 4,
++    parseval: bool = true,
++
++    pub fn resolve() VerifyMoeBudget {
++        const env = @import("sys").environment;
++        return .{
++            .budget = env.read(usize, "TF_FLASHNEXT_VERIFY_MOE_BUDGET", 0) catch 0,
++            .budget_max = env.read(usize, "TF_FLASHNEXT_VERIFY_MOE_BUDGET_MAX", 64) catch 64,
++            .keep = @max(@as(usize, 1), @min(@as(usize, 10), env.read(usize, "TF_FLASHNEXT_VERIFY_MOE_KEEP", 4) catch 4)),
++            .parseval = env.read(bool, "TF_FLASHNEXT_VERIFY_MOE_PARSEVAL", true) catch true,
++        };
++    }
++
++    pub fn effectiveFor(b: VerifyMoeBudget, rows: usize) usize {
++        if (b.budget == 0) return 0;
++        const cap = @max(b.budget, b.budget_max);
++        if (rows <= 9) return b.budget;
++        return @min(cap, b.budget + (rows - 9) * 2);
++    }
++};
++
+ test "unset, the MXFP8 projections of 1,024 columns or more take the prompt tile" {
+     if (std.c.getenv("TF_FLASHNEXT_PROMPT_MX128") == null) try std.testing.expectEqual(@as(usize, 1024), mx128MinN());
+ }
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index f1952b759..c5addc4f8 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -331,6 +331,10 @@ const stock_rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_PREFILL_MTP_LEAN", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1 keeps only MTP KV/indexer caches during prefill)" },
+     .{ .name = "TF_FLASHNEXT_MTP_QSA_GUIDE", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; 1 reuses target layer 43 QSA key selection for MTP drafts past TF_FLASHNEXT_MTP_QSA_MIN_CONTEXT)" },
+     .{ .name = "TF_FLASHNEXT_MTP_QSA_MIN_CONTEXT", .scope = .flashnext, .kind = .size, .forms = "a whole token count from 0 to the native size maximum (default 65536)" },
++    .{ .name = "TF_FLASHNEXT_VERIFY_MOE_BUDGET", .scope = .flashnext, .kind = .size, .forms = "a whole expert budget per verify layer, 0 (off) to 512 (default 0)" },
++    .{ .name = "TF_FLASHNEXT_VERIFY_MOE_BUDGET_MAX", .scope = .flashnext, .kind = .size, .forms = "a whole multi-stream verify expert budget cap, 0 to 512 (default 64)" },
++    .{ .name = "TF_FLASHNEXT_VERIFY_MOE_KEEP", .scope = .flashnext, .kind = .size, .forms = "guaranteed top experts per verify row under budgeting, 1 to 10 (default 4)" },
++    .{ .name = "TF_FLASHNEXT_VERIFY_MOE_PARSEVAL", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1; 1 normalizes budgeted verify weights by full top-k mass)" },
+     .{ .name = "TF_FLASHNEXT_DRAFTS", .scope = .flashnext, .kind = .size, .forms = "a whole draft count from 0 to the native size maximum (default 6; clamped to 1 through 15)" },
+     .{ .name = "TF_FLASHNEXT_DRAFTS_GREEDY", .scope = .flashnext, .kind = .size, .forms = "a whole draft count from 0 to the native size maximum (default 8; clamped to 1 through 15)" },
+     .{ .name = "TF_FLASHNEXT_GREEDY_WIDE", .scope = .flashnext, .kind = .size, .forms = "a whole round width from 0 to the native size maximum (default 4)" },

@@ -1,0 +1,237 @@
+diff --git a/zig/src/families/flashnext/cuda_draw_batch.zig b/zig/src/families/flashnext/cuda_draw_batch.zig
+index 7b7a778c4..807401607 100644
+--- a/zig/src/families/flashnext/cuda_draw_batch.zig
++++ b/zig/src/families/flashnext/cuda_draw_batch.zig
+@@ -53,15 +53,20 @@ pub fn matching(sm: ?mtp.Sampling, masks: []const u32, k: usize) bool {
+ 
+ pub fn drawsMany(h: *const mtp.Head, st: cuda.Stream, a: std.mem.Allocator, scores: u64, ds: []const *mtp.Draft, sms: []const ?mtp.Sampling, masks: []const []const u32, outs: []const []u32) !void {
+     if (ds.len != sms.len or ds.len != masks.len or ds.len != outs.len) return error.ProposalScoreShape;
++    const accept = @import("cuda_prompt_knobs.zig").RelaxedAccept.resolve();
+     const b = h.draw_batch;
+     var rows: usize = 0;
+     var k: usize = 0;
+     var greedy = false;
++    var greedy_relaxed = false;
+     for (ds, sms, masks) |d, sm, mask| {
+         rows += d.rows;
+         if (mask.len != 0) continue;
+-        if (!mtp.isSampled(sm)) greedy = true else if (k == 0 and draw.usable(sm.?)) k = sm.?.top_k;
++        if (!mtp.isSampled(sm)) {
++            if (accept.greedyOn() and d.rows > 1) greedy_relaxed = true else greedy = true;
++        } else if (k == 0 and draw.usable(sm.?)) k = sm.?.top_k;
+     }
++    if (greedy_relaxed and k == 0) k = accept.topk;
+     if (rows > rows_max) return error.ProposalScoreShape;
+     // a lone stream has nothing to share: its own draw skips the group's whole-buffer download
+     const group = b.on and ds.len > 1;
+@@ -74,13 +79,19 @@ pub fn drawsMany(h: *const mtp.Head, st: cuda.Stream, a: std.mem.Allocator, scor
+     var row0: usize = 0;
+     for (ds, sms, masks, outs) |d, sm, mask, out| {
+         defer row0 += d.rows;
+-        if (!group or !matching(sm, mask, k)) {
++        const can_greedy_relaxed = !mtp.isSampled(sm) and mask.len == 0 and accept.greedyOn() and d.rows > 1 and k >= accept.topk;
++        if (!group or (!can_greedy_relaxed and (!matching(sm, mask, k) or (!mtp.isSampled(sm) and accept.greedyOn() and d.rows > 1)))) {
+             try draw.draws(h, st, a, d, sm, mask, out);
+             continue;
+         }
+         var pending: [mtp.max_rows]u32 = undefined;
+         if (mtp.isSampled(sm)) {
+-            for (pending[0..d.rows], 0..) |*tok, r| tok.* = draw.drawTopk(a, b.vals(row0 + r, k), b.cols(row0 + r, k), null, d.fed0 + 1 + r, sm.?) catch |err| {
++            for (pending[0..d.rows], 0..) |*tok, r| tok.* = draw.drawTopkRelaxed(a, b.vals(row0 + r, k), b.cols(row0 + r, k), d.fed0 + 1 + r, sm.?, if (r + 1 < d.rows) d.ids[r + 1] else null, accept.soft) catch |err| {
++                if (err == error.ProposalNonfinite) try draw.badCandidates(h, st, d, r);
++                return err;
++            };
++        } else if (can_greedy_relaxed) {
++            for (pending[0..d.rows], 0..) |*tok, r| tok.* = draw.pickGreedyRelaxed(b.vals(row0 + r, k), b.cols(row0 + r, k), if (r + 1 < d.rows) d.ids[r + 1] else null, accept.topk, accept.margin) catch |err| {
+                 if (err == error.ProposalNonfinite) try draw.badCandidates(h, st, d, r);
+                 return err;
+             };
+diff --git a/zig/src/families/flashnext/cuda_mtp_draw.zig b/zig/src/families/flashnext/cuda_mtp_draw.zig
+index 8f7f2e35c..c09f44445 100644
+--- a/zig/src/families/flashnext/cuda_mtp_draw.zig
++++ b/zig/src/families/flashnext/cuda_mtp_draw.zig
+@@ -42,6 +42,92 @@ pub fn drawTopk(gpa: std.mem.Allocator, vals: []const u16, cols: []const i32, id
+     return @intCast(try lanes.sampling.choose(gpa, v[0..vals.len], keys[0..vals.len], position, s));
+ }
+ 
++/// Relaxed greedy verification over `vals`/`cols` (at least `topk_limit` highest candidates, any order):
++/// accepts `draft_opt` if it ranks within the top `topk_limit` and within `margin` of the top logit; else exact argmax.
++pub fn pickGreedyRelaxed(vals: []const u16, cols: []const i32, draft_opt: ?u32, topk_limit: usize, margin: f64) !u32 {
++    if (vals.len == 0 or vals.len > topk_max or vals.len != cols.len) return error.ProposalScoreShape;
++    var order: [topk_max]lanes.sampling.Candidate = undefined;
++    for (vals, cols, 0..) |b, c, i| {
++        const fv: f64 = mtp.promote(b);
++        if (!std.math.isFinite(fv) or c < 0 or c >= vocab) return error.ProposalNonfinite;
++        order[i] = .{ .value = fv, .id = @intCast(c) };
++    }
++    const n = vals.len;
++    std.mem.sort(lanes.sampling.Candidate, order[0..n], {}, struct {
++        fn less(_: void, a: lanes.sampling.Candidate, b: lanes.sampling.Candidate) bool {
++            return if (a.value != b.value) a.value > b.value else a.id < b.id;
++        }
++    }.less);
++    if (draft_opt) |draft| {
++        const limit = @min(n, topk_limit);
++        const top_v = order[0].value;
++        for (order[0..limit]) |cand| {
++            if (cand.id == draft and top_v - cand.value <= margin) return draft;
++        }
++    }
++    return @intCast(order[0].id);
++}
++
++/// Relaxed sampled verification over a row's top_k candidates: accepts `draft_opt` when u < exp(soft) * p(draft)
++/// under the filtered target distribution (temperature, top_p, min_p), otherwise falls back to exact `drawTopk`.
++pub fn drawTopkRelaxed(gpa: std.mem.Allocator, vals: []const u16, cols: []const i32, position: u64, s: Sampling, draft_opt: ?u32, soft: f64) !u32 {
++    if (draft_opt == null or soft <= 0.0) return drawTopk(gpa, vals, cols, null, position, s);
++    if (vals.len == 0 or vals.len > topk_max or vals.len != cols.len) return error.ProposalScoreShape;
++    var order: [topk_max]lanes.sampling.Candidate = undefined;
++    const n = vals.len;
++    for (vals, cols, 0..) |b, c, i| {
++        const fv: f64 = mtp.promote(b);
++        if (!std.math.isFinite(fv) or c < 0 or c >= vocab) return error.ProposalNonfinite;
++        order[i] = .{ .value = fv, .id = @intCast(c) };
++    }
++    std.mem.sort(lanes.sampling.Candidate, order[0..n], {}, struct {
++        fn less(_: void, a: lanes.sampling.Candidate, b: lanes.sampling.Candidate) bool {
++            return if (a.value != b.value) a.value > b.value else a.id < b.id;
++        }
++    }.less);
++    const t = @max(s.temperature, 1e-6);
++    var scaled: [topk_max]f64 = undefined;
++    for (0..n) |i| scaled[i] = order[i].value / t;
++    var keep = n;
++    if (s.top_p > 0.0 and s.top_p < 1.0) {
++        var probs: [topk_max]f64 = undefined;
++        var total: f64 = 0.0;
++        for (0..n) |i| {
++            probs[i] = @exp(scaled[i] - scaled[0]);
++            total += probs[i];
++        }
++        var cum: f64 = 0.0;
++        var below: usize = 0;
++        for (0..n) |i| {
++            cum += probs[i] / total;
++            if (cum < s.top_p) below += 1;
++        }
++        keep = @min(keep, below + 1);
++    }
++    if (s.min_p > 0.0) {
++        const floor = scaled[0] + s.minLog();
++        var cnt: usize = 0;
++        for (scaled[0..keep]) |x| {
++            if (x >= floor) cnt += 1;
++        }
++        keep = @max(@as(usize, 1), cnt);
++    }
++    const draft = draft_opt.?;
++    var kept_total: f64 = 0.0;
++    var draft_mass: f64 = 0.0;
++    for (0..keep) |i| {
++        const w = @exp(scaled[i] - scaled[0]);
++        kept_total += w;
++        if (order[i].id == draft) draft_mass = w;
++    }
++    if (draft_mass > 0.0 and kept_total > 0.0) {
++        const p_draft = draft_mass / kept_total;
++        const u = lanes.sampling.uniform(s.seed ^ 0x517CC1B727220A95, position, draft);
++        if (u < @exp(soft) * p_draft) return draft;
++    }
++    return drawTopk(gpa, vals, cols, null, position, s);
++}
++
+ /// Single and batched heads share validation before either a greedy map or a sampled draw.
+ pub fn pick(h: *const mtp.Head, st: cuda.Stream, gpa: std.mem.Allocator, d: *mtp.Draft, best: [4]f32, position: u64, sm: ?Sampling, batched: bool) !Pick {
+     const tok = h.view().pickBest(best) catch |err| {
+@@ -110,19 +196,32 @@ fn checkBest(st: cuda.Stream, d: *mtp.Draft, rows: ?[]const u16) !void {
+     };
+ }
+ 
+-/// Whether draws reduces the window's rows to their best first: no masks, and greedy or an unusable sampling.
++/// Whether draws reduces the window's rows to their best first: no masks, and greedy (without relaxed top-k) or an unusable sampling.
+ pub fn bestFirst(sm: ?Sampling, masks: []const u32) bool {
+-    return masks.len == 0 and (!mtp.isSampled(sm) or !usable(sm.?));
++    const relaxed_greedy = @import("cuda_prompt_knobs.zig").RelaxedAccept.resolve().greedyOn();
++    return masks.len == 0 and ((!mtp.isSampled(sm) and !relaxed_greedy) or (mtp.isSampled(sm) and !usable(sm.?)));
+ }
+ 
+ /// The window's rows drawn at their keyed positions (fed0 + 1 + r), each within its `masks` row if any.
+ pub fn draws(h: *const mtp.Head, st: cuda.Stream, gpa: std.mem.Allocator, d: *mtp.Draft, sm: ?Sampling, masks: []const u32, out: []u32) !void {
+     const n = d.rows;
++    const accept = @import("cuda_prompt_knobs.zig").RelaxedAccept.resolve();
+     var pending: [max_rows]u32 = undefined;
+     const queued = d.best_queued; // TF_FLASHNEXT_GRAPH_TAIL: the verify's graph queued this best already
+     d.best_queued = false;
+     if (bestFirst(sm, masks) and !queued) try h.best(st, d.logits.ptr, vocab, vocab, n, d.best.ptr);
+     if (!mtp.isSampled(sm) and masks.len == 0) {
++        if (accept.greedyOn() and n > 1) {
++            const k: usize = accept.topk;
++            const c = try candidates(h, st, d, d.logits.ptr, vocab, vocab, n, k);
++            for (pending[0..n], 0..) |*t, r| t.* = pickGreedyRelaxed(c.vals[r * k ..][0..k], c.cols[r * k ..][0..k], if (r + 1 < n) d.ids[r + 1] else null, accept.topk, accept.margin) catch |err| {
++                if (err == error.ProposalNonfinite) try badCandidates(h, st, d, r);
++                return err;
++            };
++            @memcpy(out[0..n], pending[0..n]);
++            return;
++        }
++        if (!bestFirst(sm, masks) and !queued) try h.best(st, d.logits.ptr, vocab, vocab, n, d.best.ptr);
+         try st.synchronize();
+         try checkBest(st, d, null);
+         for (pending[0..n], 0..) |*t, r| t.* = try full.pickBest(d.best_host[r * 4 ..][0..4].*);
+@@ -132,7 +231,7 @@ pub fn draws(h: *const mtp.Head, st: cuda.Stream, gpa: std.mem.Allocator, d: *mt
+     if (masks.len == 0) if (sm) |s| if (usable(s)) {
+         const k: usize = s.top_k;
+         const c = try candidates(h, st, d, d.logits.ptr, vocab, vocab, n, k);
+-        for (pending[0..n], 0..) |*t, r| t.* = drawTopk(gpa, c.vals[r * k ..][0..k], c.cols[r * k ..][0..k], null, d.fed0 + 1 + r, s) catch |err| {
++        for (pending[0..n], 0..) |*t, r| t.* = drawTopkRelaxed(gpa, c.vals[r * k ..][0..k], c.cols[r * k ..][0..k], d.fed0 + 1 + r, s, if (r + 1 < n) d.ids[r + 1] else null, accept.soft) catch |err| {
+             if (err == error.ProposalNonfinite) {
+                 try badCandidates(h, st, d, r);
+             }
+diff --git a/zig/src/families/flashnext/cuda_prompt_knobs.zig b/zig/src/families/flashnext/cuda_prompt_knobs.zig
+index bc95a5fd3..86ff74ef2 100644
+--- a/zig/src/families/flashnext/cuda_prompt_knobs.zig
++++ b/zig/src/families/flashnext/cuda_prompt_knobs.zig
+@@ -52,6 +52,29 @@ pub const VerifyMoeBudget = struct {
+     }
+ };
+ 
++/// Opt-in lossy relaxed speculative verification (0 = exact).
++pub const RelaxedAccept = struct {
++    topk: usize = 0,
++    margin: f64 = 0.0,
++    soft: f64 = 0.0,
++
++    pub fn resolve() RelaxedAccept {
++        const env = @import("sys").environment;
++        const topk = @min(@as(usize, 64), env.read(usize, "TF_FLASHNEXT_ACCEPT_TOPK", 0) catch 0);
++        const margin = env.read(f64, "TF_FLASHNEXT_ACCEPT_MARGIN", 0.0) catch 0.0;
++        const soft = env.read(f64, "TF_FLASHNEXT_ACCEPT_SOFT", 0.0) catch 0.0;
++        return .{ .topk = topk, .margin = margin, .soft = soft };
++    }
++
++    pub fn greedyOn(r: RelaxedAccept) bool {
++        return r.topk > 1;
++    }
++
++    pub fn sampledOn(r: RelaxedAccept) bool {
++        return r.soft > 0.0;
++    }
++};
++
+ test "unset, the MXFP8 projections of 1,024 columns or more take the prompt tile" {
+     if (std.c.getenv("TF_FLASHNEXT_PROMPT_MX128") == null) try std.testing.expectEqual(@as(usize, 1024), mx128MinN());
+ }
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index c5addc4f8..1a1c695ef 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -335,6 +335,9 @@ const stock_rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_VERIFY_MOE_BUDGET_MAX", .scope = .flashnext, .kind = .size, .forms = "a whole multi-stream verify expert budget cap, 0 to 512 (default 64)" },
+     .{ .name = "TF_FLASHNEXT_VERIFY_MOE_KEEP", .scope = .flashnext, .kind = .size, .forms = "guaranteed top experts per verify row under budgeting, 1 to 10 (default 4)" },
+     .{ .name = "TF_FLASHNEXT_VERIFY_MOE_PARSEVAL", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 1; 1 normalizes budgeted verify weights by full top-k mass)" },
++    .{ .name = "TF_FLASHNEXT_ACCEPT_TOPK", .scope = .flashnext, .kind = .size, .forms = "relaxed greedy verify top-k rank limit, 0 (exact) to 64 (default 0)" },
++    .{ .name = "TF_FLASHNEXT_ACCEPT_MARGIN", .scope = .flashnext, .kind = .real, .forms = "relaxed greedy verify logit margin >= 0 (default 0)" },
++    .{ .name = "TF_FLASHNEXT_ACCEPT_SOFT", .scope = .flashnext, .kind = .real, .forms = "relaxed sampled verify exp(s) probability boost >= 0 (default 0; 0.35 recommended)" },
+     .{ .name = "TF_FLASHNEXT_DRAFTS", .scope = .flashnext, .kind = .size, .forms = "a whole draft count from 0 to the native size maximum (default 6; clamped to 1 through 15)" },
+     .{ .name = "TF_FLASHNEXT_DRAFTS_GREEDY", .scope = .flashnext, .kind = .size, .forms = "a whole draft count from 0 to the native size maximum (default 8; clamped to 1 through 15)" },
+     .{ .name = "TF_FLASHNEXT_GREEDY_WIDE", .scope = .flashnext, .kind = .size, .forms = "a whole round width from 0 to the native size maximum (default 4)" },
