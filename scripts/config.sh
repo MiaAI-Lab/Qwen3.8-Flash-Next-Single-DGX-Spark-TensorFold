@@ -155,7 +155,8 @@ export TF_FLASHNEXT_GATHER_EARLY="${TF_FLASHNEXT_GATHER_EARLY:-1}"
 export TF_FLASHNEXT_WINDOW_CHECK="${TF_FLASHNEXT_WINDOW_CHECK:-1}"
 # Left off (upstream opt-ins of v1.3.6, not set here): TF_FLASHNEXT_GRAPH_TAIL=1 (#4544) puts a lone verify's tail copies and greedy pick in its
 # window graph, the same bits; on a Spark level (1s greedy 54.5 against 54.2, copy 392 against 393). TF_FLASHNEXT_PREFILL_MTP_LEAN=1 (#4529) answers
-# CudaFailed (cuMemsetD8Async, invalid argument) on a ~900 to 2,200-token prompt in v1.3.6, with fp8 or bf16 KV, so it stays off.
+# CudaFailed (cuMemsetD8Async, invalid argument) in v1.3.6 on prompts over ~1,400 tokens at 1 stream and ~900 at 5, where the server can also die;
+# it does the same on an unpatched v1.3.6 with no recipe settings, so it is upstream's (ashhart/TensorFold#5332). It stays off until that is fixed.
 # Prefill (patch 0004, the v1.1.4 series' 0006 and 0015 ported): prompt passes run the MXFP8 projections 1,024 columns or wider on a
 # 128 x 128 tile with the block scales folded into the weights (one fp32 sum over K; 1.4-1.65x the exact lane at a 3,072-row chunk,
 # +7-9% prefill; calls of 128 rows or fewer take its 64 x 64 form, same bits, so short prompts are not slower). Unlike the switches above it changes a prompt's numbers (within the exact kernels' rounding bound; each row's bits

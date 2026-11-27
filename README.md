@@ -127,7 +127,9 @@ On the v1.3.6 build with patches `0002` to `0005` (2026-11-27, one Spark, the de
 9,818 passed, 52 skipped) and `compile-cuda-tests`, and `tools/exact.py` on ten fresh servers (v1.3.6 with and without
 `TF_FLASHNEXT_GRAPH_TAIL` and `TF_FLASHNEXT_PREFILL_MTP_LEAN`, and v1.3.5): every run's output byte-identical to v1.3.5's, and the same greedy and
 seeded sampled replies at 1 and 5 streams, and the same copy reply, on every server. Against v1.3.5 decode is within 0.5% and prefill 0 to 0.9%
-faster. `TF_FLASHNEXT_PREFILL_MTP_LEAN=1` (left off) fails a ~900 to 2,200-token prompt with `CudaFailed` on v1.3.6, with fp8 or bf16 KV. Then, on one
+faster. `TF_FLASHNEXT_PREFILL_MTP_LEAN=1` (left off) fails prompts over ~1,400 tokens (1 stream) or ~900 (5 streams) with `CudaFailed` on v1.3.6,
+with fp8 or bf16 KV, and the same on an unpatched v1.3.6 with no recipe settings: an upstream bug,
+[TensorFold#5332](https://github.com/ashhart/TensorFold/issues/5332). Then, on one
 server with the defaults: all passing: `tools/exact.py --pad 3000`,
 `tools/toolcheck.py` 3/3, `tools/visioncheck.py`, `tools/prompt_reuse.py 30000` (worst 99.3%) and the `scripts/harden.sh` boot gate. Not yet re-run on v1.3.6: the needle and `context_boundary.py`.
 

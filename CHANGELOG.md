@@ -15,8 +15,10 @@ Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:
   - `TF_FLASHNEXT_GRAPH_TAIL=1` (opt-in upstream, #4544): a lone drafted window's rollback copies and greedy best-row pick run inside its captured
     graph, the same bits. Level here (1s greedy 54.5 against 54.2 tok/s, copy 392.1 against 393.1), so off.
   - `TF_FLASHNEXT_PREFILL_MTP_LEAN=1` (opt-in upstream, #4529, which still lists device checks as to do): the MTP head's prompt step keeps only its
-    caches. Here it answers `CudaFailed` (`cuMemsetD8Async`: invalid argument) on prompts of about 900 to 2,200 tokens, with fp8 KV and with bf16
-    KV alike, and on a 4,000-token one at the 262,144-token window, so off. `exact.py`'s short prompts pass with it.
+    caches. Here it answers `CudaFailed` (`cuMemsetD8Async`: invalid argument) on prompts over about 1,400 tokens at 1 stream and about 900 at 5
+    (where a later request can also hit an illegal address and end the server), with fp8 KV and with bf16 KV alike, so off. `exact.py`'s short
+    prompts pass with it. An unpatched v1.3.6 build with no `TF_FLASHNEXT_*` settings fails the same way, so it is upstream's: reported as
+    ashhart/TensorFold#5332 (its MTP head's `part` scratch looks sized for 256-row pieces while the lean path runs up to 3,072).
   - TFQ3 (#4986) needs a checkpoint re-quantized to TensorFold's `.tffpw` records; NVIDIA's FP4 export has none, so nothing changes here.
 - A/B on one Spark, one fresh server per arm, interleaved twice (v1.3.6, v1.3.5, + graph tail, + lean prefill, + both), the 2026-11-26 entry's bench:
   - v1.3.6 against v1.3.5, second pass 1s greedy / 1s sampled / 5s greedy / 5s sampled: 54.2 / 57.5 / 156.6 / 154.6 tok/s against 54.2 / 57.4 /
