@@ -299,5 +299,32 @@ if [[ "$ABLIT" == 1 ]]; then
   info=$(python3 -I -c "$CHECK_PY" "$HF_CACHE/$ABLIT_VIEW_SUB" 2>&1) || die "the checkpoint at $HF_CACHE/$ABLIT_VIEW_SUB is not ready: $info"
   log "ABLIT=1 checkpoint OK ($ABLIT_VIEW_SUB): $info"
 fi
+
+if [[ "$MTP_DISTILLED" == 1 ]]; then
+  mtp_dir="$HF_CACHE/$MTP_DISTILLED_DIR_SUB"
+  mkdir -p "$mtp_dir"
+  for pair in "$MTP_BODY_FILE:$MTP_BODY_SHA256" "$MTP_W3EXP_FILE:$MTP_W3EXP_SHA256"; do
+    fname="${pair%%:*}"; want="${pair#*:}"; dest="$mtp_dir/$fname"
+    if [[ ! -f "$dest" ]] || [[ "$(sha256sum "$dest" | awk '{print $1}')" != "$want" ]]; then
+      log "Downloading distilled MTP file $fname from $MTP_DISTILLED_REPO"
+      curl -fsSL -C - "https://huggingface.co/${MTP_DISTILLED_REPO}/resolve/main/${fname}" -o "$dest.part" ||
+        die "failed to download $MTP_DISTILLED_REPO/$fname"
+      got=$(sha256sum "$dest.part" | awk '{print $1}')
+      [[ "$got" == "$want" ]] || { rm -f "$dest.part"; die "$fname SHA-256 mismatch (got $got, expected $want)"; }
+      mv -f "$dest.part" "$dest"
+    fi
+  done
+  base_sub="hub/models--${MODEL_ID//\//--}/snapshots/$rev"
+  [[ "$ABLIT" != 1 ]] || base_sub="$ABLIT_VIEW_SUB"
+  log "Building distilled MTP checkpoint view ($MTP_VIEW_SUB)"
+  docker run --rm --user "$(id -u):$(id -g)" --network none \
+    -v "$HF_CACHE:/hf" -v "$PWD/scripts:/scripts:ro" \
+    --entrypoint python3 "$IMAGE" \
+    /scripts/mtp_view.py "/hf/$base_sub" "/hf/$MTP_DISTILLED_DIR_SUB/$MTP_BODY_FILE" \
+    "/hf/$MTP_DISTILLED_DIR_SUB/$MTP_W3EXP_FILE" "/hf/$MTP_SIDECAR_SUB" "/hf/$MTP_VIEW_SUB" ||
+    die "could not build distilled MTP checkpoint view"
+  info=$(python3 -I -c "$CHECK_PY" "$HF_CACHE/$MTP_VIEW_SUB" 2>&1) || die "the checkpoint at $HF_CACHE/$MTP_VIEW_SUB is not ready: $info"
+  log "Distilled MTP checkpoint OK ($MTP_VIEW_SUB): $info"
+fi
 prepared_state > "$PREPARED_MARKER"
 log "Done. Start the server with ./start.sh (port $PORT)."

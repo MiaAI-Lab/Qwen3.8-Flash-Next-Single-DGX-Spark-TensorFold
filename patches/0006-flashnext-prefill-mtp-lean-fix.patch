@@ -1,0 +1,25 @@
+diff --git a/zig/src/families/flashnext/cuda_mtp_ops.zig b/zig/src/families/flashnext/cuda_mtp_ops.zig
+index 0afb20dc2..1f8dd575c 100644
+--- a/zig/src/families/flashnext/cuda_mtp_ops.zig
++++ b/zig/src/families/flashnext/cuda_mtp_ops.zig
+@@ -9,6 +9,7 @@ const prompt = @import("cuda_prompt.zig");
+ const gdn = @import("cuda_gdn.zig");
+ const mtp = @import("cuda_mtp.zig");
+ const plan = @import("cuda_mtp_plan.zig");
++const scratch_sizes = @import("cuda_scratch_sizes.zig");
+ const roll = @import("cuda_mtp_roll.zig");
+ const pieces = @import("cuda_mtp_pieces.zig");
+ const draw = @import("cuda_mtp_draw.zig");
+@@ -170,9 +171,10 @@ pub fn Ops(comptime Tri: type) type {
+             if (next.len == 0) return;
+             if (d.len + next.len > d.cap) return error.PromptTooLong;
+             const row_limit = if (lean) plan.prefill_piece_rows else piece_rows;
+-            const want = if (lean) plan.reservePrefillRows(next.len) else plan.reserveRows(next.len);
++            const want = if (lean) @max(plan.reserveRows(next.len), @min(next.len, @min(plan.prefill_piece_rows, e.chunk))) else plan.reserveRows(next.len);
+             const s = try e.reserve(want);
+-            const piece = @max(@as(usize, 1), @min(row_limit, s.cap / 2));
++            const part_cap = scratch_sizes.partRows(s.cap) / (2 * streams);
++            const piece = @max(@as(usize, 1), @min(row_limit, @min(s.cap / 2, if (lean) part_cap else row_limit)));
+             // the engine's block scores (the passes share one stream), for rows past 2,048 keys of the head's cache
+             const score_rows = if (lean) 0 else try e.reserveScores(d.cap, piece);
+             var p: batch.Pass(Tri) = .{
