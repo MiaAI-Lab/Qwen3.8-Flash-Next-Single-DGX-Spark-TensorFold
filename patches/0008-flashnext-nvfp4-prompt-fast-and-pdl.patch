@@ -1,0 +1,349 @@
+diff --git a/zig/kernels/cuda/nvfp4_experts_tile.cu b/zig/kernels/cuda/nvfp4_experts_tile.cu
+index 52b9913fa..13bb5715a 100644
+--- a/zig/kernels/cuda/nvfp4_experts_tile.cu
++++ b/zig/kernels/cuda/nvfp4_experts_tile.cu
+@@ -17,6 +17,16 @@ using tf_common::fp4pair;
+ 
+ using tf_common::e4m3f;
+ 
++using tf_common::mul2;
++
++// An e4m3 scale in both bf16 halves (bytes 0 and 2 of x, the others zero), exact.
++__device__ __forceinline__ uint32_t e4m3x2(uint32_t x) {
++  const uint32_t t = ((x & 0x007F007Fu) << 4) | ((x & 0x00800080u) << 8);
++  uint32_t r;
++  asm("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(t), "r"(0x7B807B80u), "r"(0x80008000u));
++  return r;
++}
++
+ __device__ __forceinline__ void mma0(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) { qmm_frag::mma0(d, a0, a1, a2, a3, b0, b1); }
+ 
+ template <int M>
+@@ -25,6 +35,37 @@ struct WStage {
+   uint4 s[M];
+ };
+ 
++template <int M>
++struct WStageFast {
++  uint4 w[M];
++  uint2 sc[M][2];
++};
++
++// Relaxed prompt compute: folds each e4m3 group scale into the bf16 weight pair (exact in bf16: <= 6 sig bits)
++// and accumulates continuously in fp32 mma over K (no per-16 scalar fmaf). Row bits do not depend on cnt/batching.
++template <int M, int RT>
++__device__ __forceinline__ void scompute_fast(float (&acc)[M][RT][NTW][4], const WStageFast<M>& st, const char* xs,
++                                              int lane, const uint32_t (&pick)[2]) {
++  uint4 xf[RT][2];
++#pragma unroll
++  for (int r = 0; r < RT; ++r)
++#pragma unroll
++    for (int h = 0; h < 2; ++h) xf[r][h] = *reinterpret_cast<const uint4*>(xs + (r * XBYTES_PER_TILE) + (h * 32 + lane) * 16);
++#pragma unroll
++  for (int m = 0; m < M; ++m)
++#pragma unroll
++    for (int h = 0; h < 2; ++h)
++#pragma unroll
++      for (int j = 0; j < NTW; ++j) {
++        const uint32_t word = comp(st.w[m], j);
++        const uint32_t sv = e4m3x2(__byte_perm(j < 2 ? st.sc[m][h].x : st.sc[m][h].y, 0u, pick[j & 1]));
++        const uint32_t b0 = mul2(fp4pair(word, 8 * h), sv);
++        const uint32_t b1 = mul2(fp4pair(word, 8 * h + 4), sv);
++#pragma unroll
++        for (int r = 0; r < RT; ++r) mma(acc[m][r][j], xf[r][h].x, xf[r][h].y, xf[r][h].z, xf[r][h].w, b0, b1);
++      }
++}
++
+ template <int M, int RT>
+ __device__ __forceinline__ void scompute(float (&acc)[M][RT][NTW][4], const WStage<M>& st, const char* xs, int lane) {
+   uint4 xf[RT][2];
+@@ -62,7 +103,7 @@ __device__ __forceinline__ void scompute(float (&acc)[M][RT][NTW][4], const WSta
+   }
+ }
+ 
+-template <int M, int EPI, int WARPS, int RT, int S>
++template <int M, int EPI, int WARPS, int RT, int S, bool FACT = true>
+ __device__ __forceinline__ void qchunk(char* smem, const __nv_bfloat16* __restrict__ X, int x_stride, int slots,
+                                        const uint4* blk, bool active, const float* __restrict__ scale, int e, int KG,
+                                        const int* __restrict__ members, int first, int cnt, int r0, void* out, int N,
+@@ -126,13 +167,27 @@ __device__ __forceinline__ void qchunk(char* smem, const __nv_bfloat16* __restri
+     if (active) {
+       const char* base = smem + (g % S) * STRIDE;
+       const char* wsm = base + XBYTES + wp * WSLAB;
+-      WStage<M> st;
++      if constexpr (FACT) {
++        WStage<M> st;
+ #pragma unroll
+-      for (int m = 0; m < M; ++m) {
+-        st.w[m] = *reinterpret_cast<const uint4*>(wsm + (m * BLOCK4 + lane) * 16);
+-        st.s[m] = *reinterpret_cast<const uint4*>(wsm + (m * BLOCK4 + 32 + t) * 16);
++        for (int m = 0; m < M; ++m) {
++          st.w[m] = *reinterpret_cast<const uint4*>(wsm + (m * BLOCK4 + lane) * 16);
++          st.s[m] = *reinterpret_cast<const uint4*>(wsm + (m * BLOCK4 + 32 + t) * 16);
++        }
++        scompute<M, RT>(acc, st, base, lane);
++      } else {
++        const uint32_t b = gq & 1;
++        const uint32_t pick[2] = {b | 0x4040u | (b << 8), (b + 2) | 0x4040u | ((b + 2) << 8)};
++        WStageFast<M> st;
++#pragma unroll
++        for (int m = 0; m < M; ++m) {
++          st.w[m] = *reinterpret_cast<const uint4*>(wsm + (m * BLOCK4 + lane) * 16);
++#pragma unroll
++          for (int h = 0; h < 2; ++h)
++            st.sc[m][h] = reinterpret_cast<const uint2*>(wsm + (m * BLOCK4 + 32) * 16)[(gq >> 1) * 2 + h];
++        }
++        scompute_fast<M, RT>(acc, st, base, lane, pick);
+       }
+-      scompute<M, RT>(acc, st, base, lane);
+     }
+   }
+   cp_wait<0>();
+@@ -152,7 +207,7 @@ __device__ __forceinline__ void qchunk(char* smem, const __nv_bfloat16* __restri
+   for (int r = 0; r < RT; ++r) epilogue<EPI, M, RT>(acc, r, out, N, cb * COLS + 2 * t, pr0[r], pr1[r], v0[r], v1[r], limit);
+ }
+ 
+-template <int M, int EPI, int WARPS, int RTMAX, int S>
++template <int M, int EPI, int WARPS, int RTMAX, int S, bool FACT = true>
+ __device__ __forceinline__ void tile_body(const __nv_bfloat16* __restrict__ X, int x_stride, int slots,
+                                           const uint4* __restrict__ W, const float* __restrict__ scale, int KG, int NB,
+                                           const int* __restrict__ items, const int* __restrict__ counts,
+@@ -173,18 +228,18 @@ __device__ __forceinline__ void tile_body(const __nv_bfloat16* __restrict__ X, i
+       const int rt = (cnt - r0 + 15) >> 4;
+       if (RTMAX >= 4 && rt >= 4) {
+         if constexpr (RTMAX >= 4)
+-          qchunk<M, EPI, WARPS, 4, S>(smem, X, x_stride, slots, blk, active, scale, e, KG, members, first, cnt, r0, out, N, cb, limit, tid, lane, gq, t, wp);
++          qchunk<M, EPI, WARPS, 4, S, FACT>(smem, X, x_stride, slots, blk, active, scale, e, KG, members, first, cnt, r0, out, N, cb, limit, tid, lane, gq, t, wp);
+         r0 += 64;
+       } else if (RTMAX >= 3 && rt == 3) {
+         if constexpr (RTMAX >= 3)
+-          qchunk<M, EPI, WARPS, 3, S>(smem, X, x_stride, slots, blk, active, scale, e, KG, members, first, cnt, r0, out, N, cb, limit, tid, lane, gq, t, wp);
++          qchunk<M, EPI, WARPS, 3, S, FACT>(smem, X, x_stride, slots, blk, active, scale, e, KG, members, first, cnt, r0, out, N, cb, limit, tid, lane, gq, t, wp);
+         r0 += 48;
+       } else if (RTMAX >= 2 && rt >= 2) {
+         if constexpr (RTMAX >= 2)
+-          qchunk<M, EPI, WARPS, 2, S>(smem, X, x_stride, slots, blk, active, scale, e, KG, members, first, cnt, r0, out, N, cb, limit, tid, lane, gq, t, wp);
++          qchunk<M, EPI, WARPS, 2, S, FACT>(smem, X, x_stride, slots, blk, active, scale, e, KG, members, first, cnt, r0, out, N, cb, limit, tid, lane, gq, t, wp);
+         r0 += 32;
+       } else {
+-        qchunk<M, EPI, WARPS, 1, S>(smem, X, x_stride, slots, blk, active, scale, e, KG, members, first, cnt, r0, out, N, cb, limit, tid, lane, gq, t, wp);
++        qchunk<M, EPI, WARPS, 1, S, FACT>(smem, X, x_stride, slots, blk, active, scale, e, KG, members, first, cnt, r0, out, N, cb, limit, tid, lane, gq, t, wp);
+         r0 += 16;
+       }
+     }
+@@ -193,14 +248,16 @@ __device__ __forceinline__ void tile_body(const __nv_bfloat16* __restrict__ X, i
+ 
+ }
+ 
+-#define TF_TILE4(NAME, M, EPI, RT, S)                                                                              \
++#define TF_TILE4(NAME, M, EPI, RT, S, FACT)                                                                        \
+   extern "C" __global__ void __launch_bounds__(128)                                                              \
+       NAME(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,             \
+            const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,                        \
+            const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,         \
+            float limit, int skip) {                                                                              \
+-    tf_nvfp4_tile::tile_body<M, EPI, 4, RT, S>(X, x_stride, slots, W, scale, KG, NB, items, counts, members, \
+-                                                    out, N, limit, skip);                                        \
++    tf_nvfp4_tile::tile_body<M, EPI, 4, RT, S, FACT>(X, x_stride, slots, W, scale, KG, NB, items, counts, members, \
++                                                     out, N, limit, skip);                                        \
+   }
+-TF_TILE4(tf_nvfp4_tile_swiglu, 2, 2, 4, 4)
+-TF_TILE4(tf_nvfp4_tile_down_f32, 1, 0, 2, 3)
++TF_TILE4(tf_nvfp4_tile_swiglu, 2, 2, 4, 4, true)
++TF_TILE4(tf_nvfp4_tile_down_f32, 1, 0, 2, 3, true)
++TF_TILE4(tf_nvfp4_tile_fast_swiglu, 2, 2, 4, 4, false)
++TF_TILE4(tf_nvfp4_tile_fast_down_f32, 1, 0, 4, 4, false)
+diff --git a/zig/src/cuda/experts_tile.zig b/zig/src/cuda/experts_tile.zig
+index 819135776..d1609209b 100644
+--- a/zig/src/cuda/experts_tile.zig
++++ b/zig/src/cuda/experts_tile.zig
+@@ -19,20 +19,28 @@ pub const Tile = struct {
+     mod: Module,
+     fns: [2]Function,
+     resident: [2]usize,
++    fast_fns: [2]Function = undefined,
++    fast_resident: [2]usize = .{ 0, 0 },
+     selection: Mode,
+     pub const symbols = [2][:0]const u8{ "tf_nvfp4_tile_swiglu", "tf_nvfp4_tile_down_f32" };
++    pub const fast_symbols = [2][:0]const u8{ "tf_nvfp4_tile_fast_swiglu", "tf_nvfp4_tile_fast_down_f32" };
+     pub const shared = [2]u32{ 4 * (4096 + 4 * 2 * 576), 3 * (4096 + 4 * 576) };
++    pub const fast_shared = [2]u32{ 4 * (4096 + 4 * 2 * 576), 4 * (4096 + 4 * 576) };
+     pub fn load(d: *const Driver, sms: usize, selection: Mode) !Tile {
+         if (selection == .off) return error.PromptExpertTileDisabled;
+         const kernels = @import("kernels.zig");
+         if (!kernels.available) return error.BuiltWithoutKernels;
+         var m = try Module.load(d, kernels.nvfp4_experts_tile);
+         errdefer m.unload();
+-        var tile: Tile = .{ .mod = m, .fns = undefined, .resident = undefined, .selection = selection };
++        var tile: Tile = .{ .mod = m, .fns = undefined, .resident = undefined, .fast_fns = undefined, .fast_resident = undefined, .selection = selection };
+         for (symbols, shared, &tile.fns, &tile.resident) |name, bytes, *f, *resident| {
+             f.* = try m.function(name);
+             resident.* = @max(1, try f.occupancy(128, bytes)) * sms;
+         }
++        for (fast_symbols, fast_shared, &tile.fast_fns, &tile.fast_resident) |name, bytes, *f, *resident| {
++            f.* = try m.function(name);
++            resident.* = @max(1, try f.occupancy(128, bytes)) * sms;
++        }
+         return tile;
+     }
+     pub fn unload(t: *Tile) void {
+@@ -42,13 +50,17 @@ pub const Tile = struct {
+         return t.selection != .off and (epi == .up or (epi == .down_f32 and t.selection == .both));
+     }
+     pub fn run(t: *const Tile, s: Stream, epi: experts.Epi, in: experts.Rows, l: experts.Layer, p: grouped.Plan, out: u64, items: usize, skip: i32) !void {
++        return t.runFor(false, s, epi, in, l, p, out, items, skip);
++    }
++    pub fn runFor(t: *const Tile, fast: bool, s: Stream, epi: experts.Epi, in: experts.Rows, l: experts.Layer, p: grouped.Plan, out: u64, items: usize, skip: i32) !void {
+         if (!t.takes(epi) or (epi == .up and l.relu2)) return error.EpilogueNotBuilt;
+         const gate = epi == .up;
+         const index: usize = if (gate) 0 else 1;
+         const n = if (gate) l.width else l.dims;
+         const k = if (gate) l.dims else l.width;
+         if (n == 0 or k == 0 or n % 32 != 0 or k % 32 != 0 or in.stride < k) return error.BadExpertShape;
+-        const grid = @min(items * ((n / 32 + 3) / 4), t.resident[index]);
++        const res = if (fast) t.fast_resident[index] else t.resident[index];
++        const grid = @min(items * ((n / 32 + 3) / 4), res);
+         if (grid == 0) return;
+         var a: launch.Args = .{};
+         a.add(in.x);
+@@ -62,7 +74,9 @@ pub const Tile = struct {
+         a.add(@as(i32, @intCast(n)));
+         a.add(if (gate) l.limit else @as(f32, 0));
+         a.add(skip);
+-        try launch.launch(t.fns[index], .{ .grid = .{ .x = @intCast(grid) }, .block = .{ .x = 128 }, .shared = shared[index] }, s, &a);
++        const f = if (fast) t.fast_fns[index] else t.fns[index];
++        const smem = if (fast) fast_shared[index] else shared[index];
++        try launch.launch(f, .{ .grid = .{ .x = @intCast(grid) }, .block = .{ .x = 128 }, .shared = smem }, s, &a);
+     }
+ };
+ test {
+diff --git a/zig/src/families/flashnext/cuda_batch_kernels.zig b/zig/src/families/flashnext/cuda_batch_kernels.zig
+index 81d94b3b6..138bd38d9 100644
+--- a/zig/src/families/flashnext/cuda_batch_kernels.zig
++++ b/zig/src/families/flashnext/cuda_batch_kernels.zig
+@@ -44,6 +44,7 @@ pub const Forms = struct {
+     fact_rows: usize = 64, // TF_FLASHNEXT_FACT_ROWS (maxInt: never)
+     readout_fused: bool = true, // TF_FLASHNEXT_READOUT_FUSED
+     mx_min_n: usize = 1024, // TF_FLASHNEXT_PROMPT_MX128 (0: the exact kernels in prompt passes too)
++    expert_fast: bool = false, // TF_FLASHNEXT_PROMPT_EXPERT_FAST (1: bf16 scale-folded NVFP4 prompt experts)
+ 
+     pub fn resolve() Forms {
+         return .{
+@@ -55,6 +56,7 @@ pub const Forms = struct {
+             .fact_rows = @import("cuda_nvfp4_tile.zig").factRows(),
+             .readout_fused = @import("readout_fused.zig").on(),
+             .mx_min_n = @import("cuda_prompt_knobs.zig").mx128MinN(),
++            .expert_fast = @import("cuda_prompt_knobs.zig").expertFast(),
+         };
+     }
+ };
+@@ -73,6 +75,8 @@ pub const Kernels = struct {
+     tiles: tk.TileKernels,
+     /// qmmf's lane, BF16 projections from qmmf.prompt_rows rows on its 128-row tile (TF_FLASHNEXT_PROMPT_BF16=0: off).
+     native_lane: cuda.qmmf.Lane,
++    /// Same-input decode projections in one qmmf launch (shared_expert gate + up).
++    native_group: cuda.qmmf_group.Group,
+     nvfp4: cuda.experts.Nvfp4Experts,
+     /// Block-FP8 routed experts (the MTP head of NVIDIA's NVFP4 checkpoint; cuda_moe_native.zig).
+     fp8: cuda.experts.Fp8Experts,
+@@ -122,8 +126,12 @@ pub const Kernels = struct {
+         errdefer k.tiles.unload();
+         k.router = try cuda.grouped.Router.resolve(k.experts);
+         k.moe = try cuda.experts.RowsExperts.resolve(k.rows);
+-        k.native_lane = try cuda.qmmf.Lane.load(d, (try d.currentCapability()) / 10); // the current device: its tiles
++        const cap_major = (try d.currentCapability()) / 10;
++        k.native_lane = try cuda.qmmf.Lane.load(d, cap_major); // the current device: its tiles
+         errdefer k.native_lane.unload();
++        const pdl = try @import("sys").environment.read(bool, "TF_FLASHNEXT_PDL", false);
++        k.native_lane.pdl = pdl and cap_major >= 9;
++        k.native_group = try cuda.qmmf_group.Group.load(&k.native_lane);
+         const bf16 = try @import("sys").environment.read(bool, "TF_FLASHNEXT_PROMPT_BF16", true);
+         if (bf16) try k.native_lane.loadPrompt(d); // the shapes qmmf-prompt-bench times
+         try k.native_lane.loadPromptMx(k.forms.mx_min_n); // prompt passes only (nativeMatmulFor)
+diff --git a/zig/src/families/flashnext/cuda_disk.zig b/zig/src/families/flashnext/cuda_disk.zig
+index a25c95979..9be7df292 100644
+--- a/zig/src/families/flashnext/cuda_disk.zig
++++ b/zig/src/families/flashnext/cuda_disk.zig
+@@ -126,6 +126,7 @@ pub fn policyOf(c: anytype) [13]u64 {
+     if (k.expert_tile) |x| grids.update(std.mem.asBytes(&x.resident));
+     grids.update(std.mem.asBytes(&k.native_lane.prompt_sms)); // a BF16 prompt tile runs over half these SMs' worth
+     grids.update(std.mem.asBytes(&f.mx_min_n)); // TF_FLASHNEXT_PROMPT_MX128: the MXFP8 projections on the relaxed prompt tile
++    grids.update(std.mem.asBytes(&f.expert_fast)); // TF_FLASHNEXT_PROMPT_EXPERT_FAST: bf16 scale-folded NVFP4 prompt experts
+     return .{
+         // TF_FLASHNEXT_CHUNK_SOLO and _CHUNK as resolved: a pass's rows alone, and beside a decoding stream
+         e.chunk,
+diff --git a/zig/src/families/flashnext/cuda_moe_native.zig b/zig/src/families/flashnext/cuda_moe_native.zig
+index 50d549782..be2d75b4e 100644
+--- a/zig/src/families/flashnext/cuda_moe_native.zig
++++ b/zig/src/families/flashnext/cuda_moe_native.zig
+@@ -34,11 +34,11 @@ pub fn run(self: anytype, native: *const mixed.Owned, n: usize, pairs: usize, pl
+     const side = try shared.fork(self, native, n);
+     switch (owned.format) {
+         .nvfp4 => {
+-            const pt = nvfp4_tile.size(self.k, n);
++            const pt = nvfp4_tile.sizeFor(self.k, n, self.hooks.prompt);
+             try self.k.router.route(self.stream, picks, pairs, e, pt, plan);
+             const items = cuda.grouped.maxItems(pairs, e, pt);
+-            try nvfp4_tile.run(self.k, pt, self.stream, .up, .{ .x = s.mixed, .stride = dims, .slots = s.slots }, owned.view(), plan, s.moe_act, items, skip);
+-            try nvfp4_tile.run(self.k, pt, self.stream, .down_f32, .{ .x = s.moe_act, .stride = owned.width }, owned.view(), plan, s.y, items, skip);
++            try nvfp4_tile.runFor(self.k, pt, self.hooks.prompt, self.stream, .up, .{ .x = s.mixed, .stride = dims, .slots = s.slots }, owned.view(), plan, s.moe_act, items, skip);
++            try nvfp4_tile.runFor(self.k, pt, self.hooks.prompt, self.stream, .down_f32, .{ .x = s.moe_act, .stride = owned.width }, owned.view(), plan, s.y, items, skip);
+         },
+         .fp8g => try fp8(self.k, self.stream, s.picks, s.mixed, owned.view(), plan, pairs, n, s.y, s.moe_act, s.slots),
+         else => return error.UnsupportedQuantization,
+diff --git a/zig/src/families/flashnext/cuda_nvfp4_tile.zig b/zig/src/families/flashnext/cuda_nvfp4_tile.zig
+index 3c513a81d..4fab15d1a 100644
+--- a/zig/src/families/flashnext/cuda_nvfp4_tile.zig
++++ b/zig/src/families/flashnext/cuda_nvfp4_tile.zig
+@@ -14,9 +14,20 @@ pub fn size(k: anytype, n: usize) usize {
+     return if (n >= k.forms.fact_rows) cuda.experts.promptTile(.nvfp4) else 16;
+ }
+ 
++/// Prompt passes with expert_fast always use the prompt tile so a row's bits never depend on chunk size or resume offset.
++pub fn sizeFor(k: anytype, n: usize, prompt: bool) usize {
++    if (prompt and k.forms.expert_fast and k.expert_tile != null) return cuda.experts.promptTile(.nvfp4);
++    return size(k, n);
++}
++
+ /// Prompt tiles may select the K32 pipeline; decode calls take the decode form in equal waves; same bits.
+ pub fn run(k: anytype, pt: usize, s: cuda.Stream, epi: cuda.experts.Epi, in: cuda.experts.Rows, l: cuda.experts.Layer, p: cuda.grouped.Plan, out: u64, items: usize, skip: i32) !void {
+-    if (pt != 16) if (k.expert_tile) |*tile| if (tile.takes(epi)) return tile.run(s, epi, in, l, p, out, items, skip);
++    return runFor(k, pt, false, s, epi, in, l, p, out, items, skip);
++}
++
++/// Prompt passes (`prompt`) with TF_FLASHNEXT_PROMPT_EXPERT_FAST=1 take the relaxed BF16 scale-folded K32 tiles.
++pub fn runFor(k: anytype, pt: usize, prompt: bool, s: cuda.Stream, epi: cuda.experts.Epi, in: cuda.experts.Rows, l: cuda.experts.Layer, p: cuda.grouped.Plan, out: u64, items: usize, skip: i32) !void {
++    if (pt != 16) if (k.expert_tile) |*tile| if (tile.takes(epi)) return tile.runFor(prompt and k.forms.expert_fast, s, epi, in, l, p, out, items, skip);
+     const launch = if (pt == 16) &cuda.experts_waves.run else &cuda.experts.Nvfp4Experts.runFact;
+     return launch(&k.nvfp4, s, epi, in, l, p, out, items, skip);
+ }
+diff --git a/zig/src/families/flashnext/cuda_prompt_knobs.zig b/zig/src/families/flashnext/cuda_prompt_knobs.zig
+index 672d80bf4..9239ba4bf 100644
+--- a/zig/src/families/flashnext/cuda_prompt_knobs.zig
++++ b/zig/src/families/flashnext/cuda_prompt_knobs.zig
+@@ -8,6 +8,12 @@ pub fn mx128MinN() usize {
+     return std.fmt.parseInt(usize, std.mem.span(v), 10) catch 1024;
+ }
+ 
++/// TF_FLASHNEXT_PROMPT_EXPERT_FAST=1: prompt passes' NVFP4 routed experts fold e4m3 scales into bf16 weights
++/// (one fp32 mma chain over K, 64-row down tiles); 0 keeps the exact factored K32 tiles.
++pub fn expertFast() bool {
++    return @import("sys").environment.read(bool, "TF_FLASHNEXT_PROMPT_EXPERT_FAST", false) catch false;
++}
++
+ test "unset, the MXFP8 projections of 1,024 columns or more take the prompt tile" {
+     if (std.c.getenv("TF_FLASHNEXT_PROMPT_MX128") == null) try std.testing.expectEqual(@as(usize, 1024), mx128MinN());
+ }
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+index c6a43dc95..df674d306 100644
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -321,6 +321,8 @@ const stock_rules = [_]Rule{
+     .{ .name = "TF_FLASHNEXT_SHARD_HEAD", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_FUSED_SPLIT", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_ATTN_LANES", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
++    .{ .name = "TF_FLASHNEXT_PDL", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
++    .{ .name = "TF_FLASHNEXT_PROMPT_EXPERT_FAST", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_WARM_AHEAD", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_TABLE_WARM", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+     .{ .name = "TF_FLASHNEXT_GATHER_EARLY", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (1: one pooled n-gram gather a shared pass; default 0)" },

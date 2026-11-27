@@ -19,7 +19,7 @@ index f3d857b22..1a1bd2dea 100644
  - `TF_FLASHNEXT_READOUT_ROWS` (default 64, `0` never) is the rows from which the hyper-connection read-out takes the prompt
    tiles. Same bits either way; `128` keeps 16-stream decode rounds on the row kernels, up to 7% quicker on a GB10.
 diff --git a/zig/kernels/cuda/flashnext_attn.cu b/zig/kernels/cuda/flashnext_attn.cu
-index 3d9f7bb7f..0a2af2e9f 100644
+index 3d9f7bb7f..2906d14cf 100644
 --- a/zig/kernels/cuda/flashnext_attn.cu
 +++ b/zig/kernels/cuda/flashnext_attn.cu
 @@ -3,6 +3,8 @@
@@ -31,7 +31,7 @@ index 3d9f7bb7f..0a2af2e9f 100644
  #include <math.h>
  #include <stdint.h>
  
-@@ -38,6 +40,63 @@ __device__ __forceinline__ int partner(int d, int half) {
+@@ -38,6 +40,72 @@ __device__ __forceinline__ int partner(int d, int half) {
  }
  
  #include "flashnext_pages.cuh"
@@ -77,9 +77,18 @@ index 3d9f7bb7f..0a2af2e9f 100644
 +    if (d == 0) *reinterpret_cast<uint4*>(KC + slot * KS + HD) = make_uint4(static_cast<unsigned>(ek) << 23, static_cast<unsigned>(ev) << 23, 0u, 0u);
 +}
 +
-+// Eight e4m3 codes (two words of a row) times s as eight bf16 (one 16-byte store): every product is a bf16 value, so the
-+// widening through half and fp32 is exact.
-+__device__ __forceinline__ uint4 kv8_widen8(uint32_t w0, uint32_t w1, float s) {
++// Eight e4m3 codes (two words of a row) times s (fp32 power-of-two scale bits) as eight bf16 (one 16-byte store).
++// For biased scale exponents <= 134 (scale <= 2^7, amax <= 57,344), fp8pair_unit folds 2^(ek - 7) in one bf16x2 FMA;
++// larger exponents fall back to fp32 so every valid exponent in [1, 254] keeps the exact same bits.
++__device__ __forceinline__ uint4 kv8_widen8(uint32_t w0, uint32_t w1, uint32_t s_bits) {
++    const uint32_t ek = s_bits >> 23;
++    if (ek <= 134u) {
++        const uint32_t u = (ek + 120u) << 7;
++        const uint32_t unit = u | (u << 16);
++        return make_uint4(tf_common::fp8pair_unit(w0 & 0xFFFFu, unit), tf_common::fp8pair_unit(w0 >> 16, unit),
++                          tf_common::fp8pair_unit(w1 & 0xFFFFu, unit), tf_common::fp8pair_unit(w1 >> 16, unit));
++    }
++    const float s = __uint_as_float(s_bits);
 +    const __nv_fp8x2_storage_t* p0 = reinterpret_cast<const __nv_fp8x2_storage_t*>(&w0);
 +    const __nv_fp8x2_storage_t* p1 = reinterpret_cast<const __nv_fp8x2_storage_t*>(&w1);
 +    uint4 r;
@@ -95,7 +104,7 @@ index 3d9f7bb7f..0a2af2e9f 100644
  
  }  // namespace fn_attn
  
-@@ -50,7 +109,9 @@ __device__ __forceinline__ int media_pos(int pos, int d, int half, const int* ro
+@@ -50,7 +118,9 @@ __device__ __forceinline__ int media_pos(int pos, int d, int half, const int* ro
  }
  
  // glue._attn_prep (text positions, bf16 cache), program (row, head): heads normed, rounded, roped, rounded, stored.
@@ -106,7 +115,7 @@ index 3d9f7bb7f..0a2af2e9f 100644
  __device__ __forceinline__ void fn_attn_prep_body(const __nv_bfloat16* __restrict__ P, const int* __restrict__ POS0,
                                                                 const float* __restrict__ QW, const float* __restrict__ KW,
                                                                 const float* __restrict__ IW, const float* __restrict__ INV,
-@@ -84,9 +145,15 @@ __device__ __forceinline__ void fn_attn_prep_body(const __nv_bfloat16* __restric
+@@ -84,9 +154,15 @@ __device__ __forceinline__ void fn_attn_prep_body(const __nv_bfloat16* __restric
          Q[(static_cast<long long>(r) * NQ + head) * HD + d] = out;
      } else if (!index) {
          const long long slot = static_cast<long long>(pos) * NKV + head - NQ;
@@ -125,7 +134,7 @@ index 3d9f7bb7f..0a2af2e9f 100644
      } else {
          IQ[(static_cast<long long>(r) * NI + head - NQ - NKV) * IHD + d] = out;
      }
-@@ -136,6 +203,27 @@ extern "C" __global__ void __launch_bounds__(256)
+@@ -136,6 +212,27 @@ extern "C" __global__ void __launch_bounds__(256)
                              delta, pg);
  }
  
@@ -153,7 +162,7 @@ index 3d9f7bb7f..0a2af2e9f 100644
  // glue._attn_gate, program (row, head) of HD threads: bf16(o / (1 + e^-gate)) and its 32-group sums.
  extern "C" __global__ void __launch_bounds__(256) fn_attn_gate(const __nv_bfloat16* __restrict__ O, const __nv_bfloat16* __restrict__ P,
                                                                 __nv_bfloat16* __restrict__ OUT, float* __restrict__ XS, int PW, int NQ) {
-@@ -241,13 +329,16 @@ extern "C" __global__ void __launch_bounds__(256) fn_qsa_scores(const __nv_bfloa
+@@ -241,13 +338,16 @@ extern "C" __global__ void __launch_bounds__(256) fn_qsa_scores(const __nv_bfloa
  }
  
  // A row, KV head and chunk: stage its key addresses once a tile, then retain the online softmax and partials.
@@ -171,7 +180,7 @@ index 3d9f7bb7f..0a2af2e9f 100644
      extern __shared__ __align__(16) unsigned char smem_raw[];
      typedef __nv_bfloat16 Row[HD + 8];
      Row* qs = reinterpret_cast<Row*>(smem_raw);                  // [QR] the row's query heads
-@@ -255,7 +346,7 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+@@ -255,7 +355,7 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
      // ONE: one [TK] buffer, the tile's keys and then, once the scores are taken, its values (fewer bytes, more blocks)
      __nv_bfloat16 (*ps)[TK + 8] = reinterpret_cast<__nv_bfloat16 (*)[TK + 8]>(tiles_kv + (ONE ? TK : NB * 2 * TK));
      __shared__ float red_m[4][QR], red_l[4][QR];
@@ -180,7 +189,7 @@ index 3d9f7bb7f..0a2af2e9f 100644
      __shared__ long long key_at[PAGED ? NB : 1][PAGED ? TK : 1];
      const int r = blockIdx.x, hk = blockIdx.y, c = blockIdx.z;
      const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
-@@ -292,6 +383,44 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+@@ -292,6 +392,55 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
              qmm_frag::commit();
          }
      };
@@ -188,7 +197,7 @@ index 3d9f7bb7f..0a2af2e9f 100644
 +    // scale held in registers: the next tile's loads are issued before this tile's math, so their latency hides behind it. An
 +    // absent key is zero codes, scale 0.
 +    uint4 raw_k[4], raw_v[4];
-+    float raw_sk[4], raw_sv[4];
++    uint32_t raw_sk[4], raw_sv[4], next_sv[4];
 +    auto fetch_kv8 = [&](int ids_buf, int pass) {
 +        const unsigned char* kc = reinterpret_cast<const unsigned char*>(KC);
 +        const unsigned char* vc = reinterpret_cast<const unsigned char*>(VC);
@@ -196,14 +205,25 @@ index 3d9f7bb7f..0a2af2e9f 100644
 +        for (int i = 0; i < TK * (HD / 16) / 128; ++i) {
 +            const int e = threadIdx.x + i * 128, k = e / (HD / 16), cc16 = e % (HD / 16), key = key_ids[ids_buf][k];
 +            uint4 w = make_uint4(0u, 0u, 0u, 0u);
-+            float sc = 0.0f;
-+            if (key >= 0) {
-+                const long long slot = static_cast<long long>(key) * HK + hk;
-+                const unsigned char* krow = kc + slot * KS;
-+                w = *reinterpret_cast<const uint4*>((pass == 0 ? krow : vc + slot * HD) + 16 * cc16);
-+                sc = *reinterpret_cast<const float*>(krow + HD + 4 * pass);
++            if (pass == 0) {
++                uint2 sc2 = make_uint2(0u, 0u);
++                if (key >= 0) {
++                    const long long slot = static_cast<long long>(key) * HK + hk;
++                    const unsigned char* krow = kc + slot * KS;
++                    w = *reinterpret_cast<const uint4*>(krow + 16 * cc16);
++                    sc2 = *reinterpret_cast<const uint2*>(krow + HD);
++                }
++                raw_k[i] = w;
++                raw_sk[i] = sc2.x;
++                next_sv[i] = sc2.y;
++            } else {
++                if (key >= 0) {
++                    const long long slot = static_cast<long long>(key) * HK + hk;
++                    w = *reinterpret_cast<const uint4*>(vc + slot * HD + 16 * cc16);
++                }
++                raw_v[i] = w;
++                raw_sv[i] = next_sv[i];
 +            }
-+            if (pass == 0) { raw_k[i] = w; raw_sk[i] = sc; } else { raw_v[i] = w; raw_sv[i] = sc; }
 +        }
 +    };
 +    // the registers' tile widened into the one shared buffer (keys, pass 0, or values, pass 1)
@@ -212,7 +232,7 @@ index 3d9f7bb7f..0a2af2e9f 100644
 +        for (int i = 0; i < TK * (HD / 16) / 128; ++i) {
 +            const int e = threadIdx.x + i * 128, k = e / (HD / 16), cc16 = e % (HD / 16);
 +            const uint4 w = pass == 0 ? raw_k[i] : raw_v[i];
-+            const float sc = pass == 0 ? raw_sk[i] : raw_sv[i];
++            const uint32_t sc = pass == 0 ? raw_sk[i] : raw_sv[i];
 +            *reinterpret_cast<uint4*>(&tiles_kv[k][16 * cc16]) = kv8_widen8(w.x, w.y, sc);
 +            *reinterpret_cast<uint4*>(&tiles_kv[k][16 * cc16 + 8]) = kv8_widen8(w.z, w.w, sc);
 +        }
@@ -225,7 +245,7 @@ index 3d9f7bb7f..0a2af2e9f 100644
      // ONE: the keys (pass 0) or the values (pass 1) of the tile whose ids are in key_ids[0], into the one buffer
      auto load_one = [&](int pass) {
          const __nv_bfloat16* src = pass == 0 ? KC : VC;
-@@ -308,10 +437,23 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+@@ -308,10 +457,23 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
      float o[8][4] = {};
      const int tiles = min(n - start, CH);
      if (NB == 2) load(0, 0);
@@ -250,7 +270,7 @@ index 3d9f7bb7f..0a2af2e9f 100644
              if (threadIdx.x < TK) {
                  const int ki = start + t0 + threadIdx.x;
                  const int key = ki < n ? (sparse ? IDS[static_cast<long long>(r) * IDW + ki] : ki) : -1;
-@@ -326,10 +468,13 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+@@ -326,10 +488,13 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
          }
          Row* kt = tiles_kv + (ONE ? 0 : buf * 2 * TK);
          Row* vt = ONE ? kt : kt + TK;
@@ -265,7 +285,7 @@ index 3d9f7bb7f..0a2af2e9f 100644
          constexpr int JT = TK / 32;  // a warp's 8-key tiles
          float s[JT][4] = {};
  #pragma unroll 4
-@@ -347,7 +492,12 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
+@@ -347,7 +512,12 @@ __device__ __forceinline__ void attn_chunks(const __nv_bfloat16* __restrict__ Q,
          }
          if constexpr (ONE) {                              // every warp has read the keys: the values take their place
              __syncthreads();
@@ -279,7 +299,7 @@ index 3d9f7bb7f..0a2af2e9f 100644
          }
          float tile_m[2] = {-INFINITY, -INFINITY};
  #pragma unroll
-@@ -493,6 +643,27 @@ extern "C" __global__ void __launch_bounds__(128) fn_attn_chunks_one(const __nv_
+@@ -493,6 +663,27 @@ extern "C" __global__ void __launch_bounds__(128) fn_attn_chunks_one(const __nv_
      attn_chunks<1, true>(Q, KC, VC, POS0, PO, PM, PL, IDS, NKR, SPR, H, HK, G, CH, NCH, SCALE, IDW, QSA);
  }
  
@@ -307,6 +327,46 @@ index 3d9f7bb7f..0a2af2e9f 100644
  // attn_chunks with the next tile's loads in flight (a decode round's few rows): the same sums.
  extern "C" __global__ void __launch_bounds__(128) fn_attn_chunks_ahead(const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ KC,
                                                                         const __nv_bfloat16* __restrict__ VC, const int* __restrict__ POS0,
+diff --git a/zig/kernels/cuda/flashnext_attn_lanes.cuh b/zig/kernels/cuda/flashnext_attn_lanes.cuh
+index fac886996..2d16c1d13 100644
+--- a/zig/kernels/cuda/flashnext_attn_lanes.cuh
++++ b/zig/kernels/cuda/flashnext_attn_lanes.cuh
+@@ -24,6 +24,17 @@ extern "C" __global__ void __launch_bounds__(256)
+                              IQ, fn_lanes::at(LP, l, 2), eps, PW, NQ, NKV, NI, IHD, HALF, nullptr, 0, 0, Pg{});
+ }
+ 
++// fn_attn_prep_kv8 over a shared round's rows: fp8 KV caches per lane.
++extern "C" __global__ void __launch_bounds__(256)
++    fn_attn_prep_lanes_kv8(const __nv_bfloat16* __restrict__ P, const unsigned long long* __restrict__ LP,
++                           const int* __restrict__ LI, const float* __restrict__ QW, const float* __restrict__ KW,
++                           const float* __restrict__ IW, const float* __restrict__ INV, __nv_bfloat16* __restrict__ Q,
++                           __nv_bfloat16* __restrict__ IQ, float eps, int PW, int NQ, int NKV, int NI, int IHD, int HALF) {
++    const int l = fn_lanes::lane(LI, blockIdx.x);
++    fn_attn_prep_body<false, true>(P, fn_lanes::shift(LI, l), QW, KW, IW, INV, Q, fn_lanes::at(LP, l, 0), fn_lanes::at(LP, l, 1),
++                                   IQ, fn_lanes::at(LP, l, 2), eps, PW, NQ, NKV, NI, IHD, HALF, nullptr, 0, 0, Pg{});
++}
++
+ // fn_qsa_pool over a shared round's lanes, lane blockIdx.y: its rows' completed blocks of its own indexer keys.
+ extern "C" __global__ void __launch_bounds__(128)
+     fn_qsa_pool_lanes(const unsigned long long* __restrict__ LP, const int* __restrict__ LI, const float* __restrict__ W,
+@@ -44,6 +55,17 @@ extern "C" __global__ void __launch_bounds__(128)
+                    H, HK, G, CH, NCH, SCALE, IDW, QSA);
+ }
+ 
++// fn_attn_chunks_kv8 over a shared round's rows: fp8 KV caches per lane.
++extern "C" __global__ void __launch_bounds__(128)
++    fn_attn_chunks_lanes_kv8(const __nv_bfloat16* __restrict__ Q, const unsigned long long* __restrict__ LP,
++                             const int* __restrict__ LI, float* __restrict__ PO, float* __restrict__ PM, float* __restrict__ PL,
++                             const int* __restrict__ IDS, const int* __restrict__ NKR, const int* __restrict__ SPR, int H,
++                             int HK, int G, int CH, int NCH, float SCALE, int IDW, int QSA) {
++    const int l = fn_lanes::lane(LI, blockIdx.x);
++    attn_chunks<1, true, false, false, true>(Q, fn_lanes::at(LP, l, 0), fn_lanes::at(LP, l, 1), fn_lanes::shift(LI, l),
++                                             PO, PM, PL, IDS, NKR, SPR, H, HK, G, CH, NCH, SCALE, IDW, QSA);
++}
++
+ // fn_attn_merge over a shared round's rows: each row's position from its lane.
+ extern "C" __global__ void __launch_bounds__(256)
+     fn_attn_merge_lanes(const float* __restrict__ PO, const float* __restrict__ PM, const float* __restrict__ PL,
 diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
 index 761f50acb..8ad60a5df 100644
 --- a/zig/src/families/flashnext/cuda_batch.zig
@@ -359,19 +419,43 @@ index 596af0c45..9f094f5b6 100644
  }
  
 diff --git a/zig/src/families/flashnext/cuda_batch_lanes.zig b/zig/src/families/flashnext/cuda_batch_lanes.zig
-index b5dfb8d74..20d16f1e0 100644
+index b5dfb8d74..316fe3576 100644
 --- a/zig/src/families/flashnext/cuda_batch_lanes.zig
 +++ b/zig/src/families/flashnext/cuda_batch_lanes.zig
-@@ -72,7 +72,8 @@ pub fn useAttn(pass: anytype, n: usize) bool {
+@@ -72,7 +72,7 @@ pub fn useAttn(pass: anytype, n: usize) bool {
      // its launches take the whole layer's heads; a rank's half under the head split goes lane by lane
      if (!pass.m.layers[0].heads.eql(.full)) return false;
      for (pass.lanes) |l| {
 -        if (l.seq.media != null or l.seq.pg.pt != 0 or l.rows == 0 or l.rows > glue.ahead_rows) return false;
-+        // fp8 caches (--kv-cache fp8) go lane by lane: the one-launch kernels read bf16 rows
-+        if (l.seq.media != null or l.seq.pg.pt != 0 or l.seq.kv != .bf16 or l.rows == 0 or l.rows > glue.ahead_rows) return false;
++        if (l.seq.media != null or l.seq.pg.pt != 0 or l.seq.kv != pass.lanes[0].seq.kv or l.rows == 0 or l.rows > glue.ahead_rows) return false;
          if (l.seq.kc.len > wt.layers_n / 4 or l.seq.scores != pass.lanes[0].seq.scores or l.pos + l.rows > l.seq.cap) return false;
      }
      return true;
+@@ -113,13 +113,22 @@ pub fn attn(pass: anytype, lw: anytype, ai: usize, pa: u64) !void {
+     // one stride for every lane's rows of the engine's block scores (reserved for the longest cache)
+     const nb = state.scoreStride(cap);
+     const scores = pass.lanes[0].seq.scores;
+-    try g.attnPrepLanes(pass.stream, pa, lp, li, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, s.q, s.iq, wt.eps, n);
++    const fp8 = pass.lanes[0].seq.kv == .fp8;
++    if (fp8) {
++        try g.attnPrepLanesKv8(pass.stream, pa, lp, li, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, s.q, s.iq, wt.eps, n);
++    } else {
++        try g.attnPrepLanes(pass.stream, pa, lp, li, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, s.q, s.iq, wt.eps, n);
++    }
+     try g.qsaPoolLanes(pass.stream, lp, li, lw.ik_scale.ptr, s.inv, wt.eps, pass.lanes.len, max_rows);
+     if (max_blocks > 0) try g.qsaScoresLanes(pass.stream, s.iq, lp, li, scores, nb, pass.lanes.len, max_rows, max_blocks);
+     var a: cuda.Args = .{};
+     inline for (.{ scores, li, s.qids, s.qnk, s.qspr, cint(nb), cint(wt.index_idw), cint(wt.index_top), cint(wt.index_ratio) }) |v| a.add(v);
+     try cuda.launch.launch(pass.k.select_lanes, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 1024 } }, pass.stream, &a);
+-    try g.attnChunksLanes(pass.stream, s.q, lp, li, s.po, s.pm, s.pl, s.qids, s.qnk, s.qspr, n, wt.kv_heads, chunks);
++    if (fp8) {
++        try g.attnChunksLanesKv8(pass.stream, s.q, lp, li, s.po, s.pm, s.pl, s.qids, s.qnk, s.qspr, n, wt.kv_heads, chunks);
++    } else {
++        try g.attnChunksLanes(pass.stream, s.q, lp, li, s.po, s.pm, s.pl, s.qids, s.qnk, s.qspr, n, wt.kv_heads, chunks);
++    }
+     try g.attnMergeLanes(pass.stream, s.po, s.pm, s.pl, li, s.ao, s.qnk, s.qspr, n, wt.kv_heads);
+ }
+ 
 diff --git a/zig/src/families/flashnext/cuda_batch_marks.zig b/zig/src/families/flashnext/cuda_batch_marks.zig
 index da5f01f2e..b71e6c670 100644
 --- a/zig/src/families/flashnext/cuda_batch_marks.zig
@@ -435,10 +519,10 @@ index 89982c588..b05748d44 100644
  
          /// What else the states depend on: whether the MTP head's rows are part of them.
 diff --git a/zig/src/families/flashnext/cuda_glue.zig b/zig/src/families/flashnext/cuda_glue.zig
-index 764aea34a..3bef62e8d 100644
+index 764aea34a..3f9d9aff8 100644
 --- a/zig/src/families/flashnext/cuda_glue.zig
 +++ b/zig/src/families/flashnext/cuda_glue.zig
-@@ -81,6 +81,11 @@ const Fns = struct {
+@@ -81,6 +81,13 @@ const Fns = struct {
      merge_lanes: cuda.Function,
      chunks_one_paged: cuda.Function,
      fused_paged: cuda.Function,
@@ -447,10 +531,12 @@ index 764aea34a..3bef62e8d 100644
 +    prep_media_kv8: cuda.Function,
 +    chunks_kv8: cuda.Function,
 +    fused_kv8: cuda.Function,
++    prep_lanes_kv8: cuda.Function,
++    chunks_lanes_kv8: cuda.Function,
  };
  
  /// The captured entry points our glue replaces, by Triton name (TF_FLASHNEXT_OWNED lists them).
-@@ -175,6 +180,10 @@ pub const Glue = struct {
+@@ -175,6 +182,12 @@ pub const Glue = struct {
              .merge_lanes = try g.attn.function("fn_attn_merge_lanes"),
              .chunks_one_paged = try g.attn.function("fn_attn_chunks_one_paged"),
              .fused_paged = try g.attn.function("fn_attn_fused_paged"),
@@ -458,19 +544,22 @@ index 764aea34a..3bef62e8d 100644
 +            .prep_media_kv8 = try g.attn.function("fn_attn_prep_media_kv8"),
 +            .chunks_kv8 = try g.attn.function("fn_attn_chunks_kv8"),
 +            .fused_kv8 = try g.attn.function("fn_attn_fused_kv8"),
++            .prep_lanes_kv8 = try g.attn.function("fn_attn_prep_lanes_kv8"),
++            .chunks_lanes_kv8 = try g.attn.function("fn_attn_chunks_lanes_kv8"),
          };
          try g.f.chunks.allowDynamicShared(chunkSmem(1));
          try g.f.chunks_ahead.allowDynamicShared(chunkSmem(2));
-@@ -184,6 +193,8 @@ pub const Glue = struct {
+@@ -184,6 +197,9 @@ pub const Glue = struct {
          try g.f.chunks_lanes.allowDynamicShared(chunkSmem(2));
          try g.f.chunks_one_paged.allowDynamicShared(oneSmem());
          try g.f.fused_paged.allowDynamicShared(oneSmem());
 +        try g.f.chunks_kv8.allowDynamicShared(oneSmem());
 +        try g.f.fused_kv8.allowDynamicShared(oneSmem());
++        try g.f.chunks_lanes_kv8.allowDynamicShared(oneSmem());
          return g;
      }
  
-@@ -282,6 +293,46 @@ pub const Glue = struct {
+@@ -282,6 +298,46 @@ pub const Glue = struct {
          try go(if (pg.pt != 0) g.f.fused_paged else g.f.fused, s, .{ rows, kv, 1 }, 128, oneSmem(), &a);
      }
  
@@ -517,6 +606,42 @@ index 764aea34a..3bef62e8d 100644
      pub fn attnMerge(g: *const Glue, s: cuda.Stream, po: u64, pm: u64, pl: u64, pos: u64, out: u64, nk: u64, sparse: u64, rows: usize, h: Heads, qsa: bool) !void {
          var a: cuda.Args = .{};
          ptrs(&a, &.{ po, pm, pl, pos, out, nk, sparse });
+@@ -327,6 +383,16 @@ pub const Glue = struct {
+         try go(g.f.prep_lanes, s, .{ rows, wt.q_heads + wt.kv_heads + wt.index_heads + 1, 1 }, tile_head_dim, 0, &a);
+     }
+ 
++    /// attnPrepLanes into fp8 KV caches.
++    pub fn attnPrepLanesKv8(g: *const Glue, s: cuda.Stream, proj: u64, lp: u64, li: u64, q_scale: u64, k_scale: u64, i_scale: u64, inv: u64, q: u64, iq: u64, eps: f32, rows: usize) !void {
++        if (wt.head_dim != tile_head_dim) return error.RowShape;
++        var a: cuda.Args = .{};
++        ptrs(&a, &.{ proj, lp, li, q_scale, k_scale, i_scale, inv, q, iq });
++        a.add(eps);
++        ints(&a, &.{ wt.proj_n, wt.q_heads, wt.kv_heads, wt.index_heads, wt.index_dim, wt.half });
++        try go(g.f.prep_lanes_kv8, s, .{ rows, wt.q_heads + wt.kv_heads + wt.index_heads + 1, 1 }, tile_head_dim, 0, &a);
++    }
++
+     /// qsaPool for `lanes` lanes of up to `max_rows` rows each.
+     pub fn qsaPoolLanes(g: *const Glue, s: cuda.Stream, lp: u64, li: u64, k_scale: u64, inv: u64, eps: f32, lanes: usize, max_rows: usize) !void {
+         var a: cuda.Args = .{};
+@@ -357,6 +423,18 @@ pub const Glue = struct {
+         try go(g.f.chunks_lanes, s, .{ rows, kv, chunks }, 128, chunkSmem(2), &a);
+     }
+ 
++    /// attnChunksLanes over fp8 KV caches.
++    pub fn attnChunksLanesKv8(g: *const Glue, s: cuda.Stream, q: u64, lp: u64, li: u64, po: u64, pm: u64, pl: u64, ids: u64, nk: u64, sparse: u64, rows: usize, kv: usize, chunks: usize) !void {
++        const group = wt.q_heads / kv;
++        if (group > tile_heads) return error.RowShape;
++        var a: cuda.Args = .{};
++        ptrs(&a, &.{ q, lp, li, po, pm, pl, ids, nk, sparse });
++        ints(&a, &.{ wt.q_heads, kv, group, 512, wt.nch });
++        a.add(@as(f32, 0.0625));
++        ints(&a, &.{ wt.index_idw, 1 });
++        try go(g.f.chunks_lanes_kv8, s, .{ rows, kv, chunks }, 128, oneSmem(), &a);
++    }
++
+     /// attnMerge (sparse) over the round's rows.
+     pub fn attnMergeLanes(g: *const Glue, s: cuda.Stream, po: u64, pm: u64, pl: u64, li: u64, out: u64, nk: u64, sparse: u64, rows: usize, kv: usize) !void {
+         var a: cuda.Args = .{};
 diff --git a/zig/src/families/flashnext/cuda_images.zig b/zig/src/families/flashnext/cuda_images.zig
 index 4297746bc..19b417156 100644
 --- a/zig/src/families/flashnext/cuda_images.zig

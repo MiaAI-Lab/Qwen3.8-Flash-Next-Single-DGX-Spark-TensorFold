@@ -123,6 +123,9 @@ PARALLEL="${PARALLEL:-5}"
 # Prompt rows a pass (TensorFold's default since v1.3.2 too; it was 1,536 before, and the v1.1.4 build's patch 0006 used 3,072). 3,072 prefills about 4% faster on a Spark
 # (bench_streams.py, 4k to 126k tokens) for 0.8 GiB of the prompt cache; a stream decoding beside a prompt waits up to one pass for its token.
 export TF_FLASHNEXT_CHUNK="${TF_FLASHNEXT_CHUNK:-3072}"
+# Solo prompt chunk when no other stream is decoding (3,072 remains the chunk while another stream decodes): 4,096 fits 4k prompts in a single
+# pass and amortizes routed-expert weight reads for +0.53 GiB scratch (leaving ~27.2 GiB for 5 full 262k fp8 windows + ~2.8 GiB prompt cache).
+export TF_FLASHNEXT_CHUNK_SOLO="${TF_FLASHNEXT_CHUNK_SOLO:-4096}"
 # MTP: up to this many drafts a round (the engine's default is 6; drafts are checked, so replies match serial decoding).
 export TF_FLASHNEXT_DRAFTS="${TF_FLASHNEXT_DRAFTS:-6}"
 # TensorFold (since v1.2.7) carries most of what patches 0004 and 0006 to 0017 of the v1.1.4 series did; these are its settings for them. None of them
@@ -153,15 +156,26 @@ export TF_FLASHNEXT_GATHER_EARLY="${TF_FLASHNEXT_GATHER_EARLY:-1}"
 # ~1,900-token text decodes about 25% faster (314 to 392 tok/s); other decode and prefill are level. It costs about 15 s at load and 0.02 GiB a stream
 # (the prompt cache 4.1 to 3.9 GiB at 5 streams). 0 keeps the 32-row window and skips the check.
 export TF_FLASHNEXT_WINDOW_CHECK="${TF_FLASHNEXT_WINDOW_CHECK:-1}"
-# Left off (upstream opt-ins of v1.3.6, not set here): TF_FLASHNEXT_GRAPH_TAIL=1 (#4544) puts a lone verify's tail copies and greedy pick in its
-# window graph, the same bits; on a Spark level (1s greedy 54.5 against 54.2, copy 392 against 393). TF_FLASHNEXT_PREFILL_MTP_LEAN=1 (#4529) answers
-# CudaFailed (cuMemsetD8Async, invalid argument) in v1.3.6 on prompts over ~1,400 tokens at 1 stream and ~900 at 5, where the server can also die;
-# it does the same on an unpatched v1.3.6 with no recipe settings, so it is upstream's (ashhart/TensorFold#5332). It stays off until that is fixed.
-# Prefill (patch 0004, the v1.1.4 series' 0006 and 0015 ported): prompt passes run the MXFP8 projections 1,024 columns or wider on a
-# 128 x 128 tile with the block scales folded into the weights (one fp32 sum over K; 1.4-1.65x the exact lane at a 3,072-row chunk,
-# +7-9% prefill; calls of 128 rows or fewer take its 64 x 64 form, same bits, so short prompts are not slower). Unlike the switches above it changes a prompt's numbers (within the exact kernels' rounding bound; each row's bits
-# do not depend on its chunk, so replies stay independent of drafting and batching); 0 keeps the exact kernels.
-export TF_FLASHNEXT_PROMPT_MX128="${TF_FLASHNEXT_PROMPT_MX128:-1024}"
+# Left off (upstream opt-in of v1.3.6): TF_FLASHNEXT_GRAPH_TAIL=1 (#4544) is level on a Spark (1s greedy 54.5 against 54.2, copy 392 against 393).
+# Enabled here (all bit-identical to stock v1.3.6):
+#   - TF_FLASHNEXT_PREFILL_MTP_LEAN=1 (#4529, fixed by patch 0006 for ashhart/TensorFold#5332): skips unused MTP attention/MoE during prefill
+#     while bounding lean pieces to fit s.part on native BF16 fc_h without doubling shared scratch.
+#   - TF_FLASHNEXT_ATTN_LANES=1 (extended to fp8 KV by patch 0003, with fast bit-exact kv8_widen8): one-launch shared-round attention.
+#   - TF_FLASHNEXT_FUSED_SPLIT=1 (upstream GB10 win, with patch 0007 keeping grouped MXFP8 shared_expert gate+up below 2,048 + strided shared_down).
+#   - TF_FLASHNEXT_PDL=1 (patch 0008): Blackwell programmatic dependent launch on qmmf decode lanes.
+export TF_FLASHNEXT_PREFILL_MTP_LEAN="${TF_FLASHNEXT_PREFILL_MTP_LEAN:-1}"
+export TF_FLASHNEXT_ATTN_LANES="${TF_FLASHNEXT_ATTN_LANES:-1}"
+export TF_FLASHNEXT_FUSED_SPLIT="${TF_FLASHNEXT_FUSED_SPLIT:-1}"
+export TF_FLASHNEXT_PDL="${TF_FLASHNEXT_PDL:-1}"
+# Prefill (patches 0004 + 0007): prompt passes run MXFP8 projections 640 columns or wider (including shared_expert gate/up/down, with direct
+# strided FP32 down_proj into y's slot and zero sharedScatter) on the 128 x 128 relaxed tile (one fp32 sum over K; calls of 128 rows or fewer
+# take its 64 x 64 form, same bits). Changes prompt numbers within the exact kernels' rounding bound; each row's bits stay independent of chunk,
+# drafting and batching. 0 keeps the exact kernels.
+export TF_FLASHNEXT_PROMPT_MX128="${TF_FLASHNEXT_PROMPT_MX128:-640}"
+# Prefill (patch 0008): prompt passes run NVFP4 routed experts on BF16 scale-folded K32 tiles (FACT=false, 64-row RT=4 down_f32, one fp32 mma
+# chain over K; decode and verify keep the exact factored kernels). Each row's bits stay independent of chunk, drafting and batching; 0 keeps
+# the exact factored K32 tiles.
+export TF_FLASHNEXT_PROMPT_EXPERT_FAST="${TF_FLASHNEXT_PROMPT_EXPERT_FAST:-1}"
 # The draft chain stops on the running product of its draft probabilities: keep draft j while p1*...*pj >= 0.4 (TensorFold's default
 # TF_FLASHNEXT_CONFIDENCE, the rule patch 0017 restored). Beside other open streams TensorFold switches greedy chains to a 0.6 floor a
 # draft; TF_FLASHNEXT_SHARED_DRAFTS=0 keeps the product rule there too, as patch 0017 did up to 5 streams. Only draft rows change.
