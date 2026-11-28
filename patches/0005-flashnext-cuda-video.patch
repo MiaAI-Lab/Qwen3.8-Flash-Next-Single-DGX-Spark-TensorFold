@@ -1,6 +1,8 @@
+diff --git a/zig/src/families/flashnext/cuda_images.zig b/zig/src/families/flashnext/cuda_images.zig
+index 19b4171..df54460 100644
 --- a/zig/src/families/flashnext/cuda_images.zig
 +++ b/zig/src/families/flashnext/cuda_images.zig
-@@ -8,6 +8,10 @@
+@@ -8,6 +8,10 @@ const media = @import("cuda_media.zig");
  pub const Limits = shared.media.Limits;
  pub const Vision = struct {
      pub const template_wraps = true;
@@ -11,7 +13,7 @@
      a: std.mem.Allocator,
      io: std.Io,
      tower: ?*shared.Tower,
-@@ -17,6 +21,7 @@
+@@ -17,6 +21,7 @@ pub const Vision = struct {
      limits: Limits,
      marks: struct { open: u32, image: u32, close: u32 },
      mark_ids: [3]u32,
@@ -19,7 +21,7 @@
      prep: cuda.Function,
      pool: cuda.Function,
      /// prep and pool through a stream's page table (TF_FLASHNEXT_KV_PAGES).
-@@ -47,7 +52,7 @@
+@@ -47,7 +52,7 @@ pub const Vision = struct {
          var module: ?cuda.Module = if (t == null) try cuda.Module.load(d, cuda.kernels.qwen_vision) else null;
          errdefer if (module) |*m| m.unload();
          const splice = try (if (t) |x| &x.mod else &module.?).function("tf_qv_splice");
@@ -28,7 +30,7 @@
          return self;
      }
      fn encode(ptr: *anyopaque, pixels: []const f32, grids: []const shared.Grid, out: u64) anyerror!void {
-@@ -71,6 +76,10 @@
+@@ -71,6 +76,10 @@ pub const Vision = struct {
          const p = try settings.prepare(v.io, a, bytes, max_tokens);
          return .{ .pixels = p.pixels, .gh = p.gh, .gw = p.gw, .tokens = p.tokens, .hash = p.hash };
      }
@@ -36,21 +38,23 @@
 +    pub fn prepareVideo(v: *Vision, a: std.mem.Allocator, s: video.Source, max_tokens: u32, max_frames: u32) anyerror!video.Prepared {
 +        return video.prepare(a, s, v.processor, max_tokens, max_frames);
 +    }
-     pub fn state(v: *Vision, ids: []const u32, images: []const @import("lanes").stream.Image) !media.State {
-         return .{ .image = try shared.media.Media.init(v.a, v.encoder, ids, images, v.limits), .prep = v.prep, .pool = v.pool, .prep_paged = v.prep_paged, .pool_paged = v.pool_paged, .prep8 = v.prep8 };
+     pub fn state(v: *Vision, ids: []const u32, images: []const @import("lanes").stream.Image, from: usize) !media.State {
+         return .{ .image = try shared.media.Media.init(v.a, v.encoder, ids, images, v.limits, from), .prep = v.prep, .pool = v.pool, .prep_paged = v.prep_paged, .pool_paged = v.pool_paged, .prep8 = v.prep8 };
      }
-@@ -83,6 +92,8 @@
-             error.BadImageLimits, error.BadImageCount => "image count or row budget exceeds the configured limits",
+@@ -84,6 +93,8 @@ pub const Vision = struct {
              error.BadImageGrid, error.BadImagePatches, error.BadImagePlaceholders => "image rows do not match the prompt placeholders",
-             error.NoVisionTower, error.BadVisionWidth, error.UnsupportedQwenVision => "unsupported Flash Next Qwen-VL tower configuration",
+             error.NoVisionTower => @import("engine_api").visionWords("this Flash Next checkpoint", error.VisionWithoutTower),
+             error.BadVisionWidth, error.UnsupportedQwenVision => "unsupported Flash Next Qwen-VL tower configuration",
 +            error.VideoTooShort, error.VideoTooLarge, error.BadVideo => "the video could not be sampled into the tower's grid: too short, too large or unreadable",
 +            error.VideoLibraryUnavailable => "video input needs libtfvideo.so (FFmpeg 9.0.2) reachable on the loader path",
              else => core.qwen_vl.geometry.problem(err),
          };
      }
+diff --git a/zig/src/native/cuda_vision_offer.zig b/zig/src/native/cuda_vision_offer.zig
+index 1e42b9e..e79be9e 100644
 --- a/zig/src/native/cuda_vision_offer.zig
 +++ b/zig/src/native/cuda_vision_offer.zig
-@@ -43,7 +43,7 @@
+@@ -43,7 +43,7 @@ pub fn offer(v: anytype, open: ?api.VisionOpen) ?api.Vision {
          return out;
      }
      if (comptime @hasDecl(T, "prepareVideo")) if (x.video_ids) |*vm| {
@@ -59,9 +63,11 @@
      };
      return out;
  }
+diff --git a/zig/src/vision/qwen_cuda_media.zig b/zig/src/vision/qwen_cuda_media.zig
+index 109e958..29090d8 100644
 --- a/zig/src/vision/qwen_cuda_media.zig
 +++ b/zig/src/vision/qwen_cuda_media.zig
-@@ -5,7 +5,7 @@
+@@ -5,7 +5,7 @@ const lanes = @import("lanes");
  const vision = @import("qwen_cuda.zig");
  /// The image rows one request holds in all (each image keeps one tower call's 4,096 at most).
  pub const max_image_tokens = 16384;
@@ -70,7 +76,7 @@
  pub fn checkLimits(l: Limits) !void {
      if (l.image_tokens == 0 or l.image_tokens > max_image_tokens or l.max_images == 0 or l.max_images > 64)
          return error.BadImageLimits;
-@@ -66,16 +66,20 @@
+@@ -66,16 +66,20 @@ pub fn placeholders(a: std.mem.Allocator, c: vision.Config, ids: []const u32, im
      errdefer p.deinit();
      var j: usize = 0;
      for (ids, 0..) |id, at| {

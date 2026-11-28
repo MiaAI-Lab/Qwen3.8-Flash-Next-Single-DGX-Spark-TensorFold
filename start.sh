@@ -19,7 +19,7 @@
 #   ablit    ABLIT=1 serves NVIDIA's FP4 with the Keys house-qsa abliteration overlay (gated; needs an HF token); 0 is stock (default)
 #   image    IMAGE, TF_REPO, TF_REF, ZIG_VERSION, BASE_IMAGE, GHCR_IMAGE, CONTAINER_NAME
 #   setup    PREPARE (auto | 1 | 0), PULL, FOREGROUND=1, WAIT_TIMEOUT, DRY_RUN=1, MEM_NEED_GIB, MEM_CHECK=0
-#   engine   every TENSORFOLD_* and TF_FLASHNEXT_* variable goes into the container
+#   engine   every TENSORFOLD_* and TF_* variable goes into the container (TF_FLASHNEXT_*, TF_CACHE_EVICT, TF_QMMF_HALF_BELOW, ...)
 #            (TENSORFOLD_API_KEY by name only). KV_DTYPE is fp8 or bf16. VISION=1 passes --vision (image and video).
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
@@ -40,7 +40,7 @@ for arg in "$@"; do [[ "$arg" == -h || "$arg" == --help ]] && { usage; exit 0; }
 for v in THINKING DRAFTS VISION VISION_URLS PDF VIDEO; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
 [[ "$PDF" != 1 || "$VISION" == 1 ]] || die "PDF=1 renders pages through the vision path: start it with VISION=1 (the default)"
 [[ "$VIDEO" != 1 || "$VISION" == 1 ]] || die "VIDEO=1 decodes through the vision path: start it with VISION=1 (the default)"
-(( CONTEXT <= 262144 )) || die "CONTEXT=$CONTEXT is past 262,144: TensorFold 1.2.7's Flash Next engine has no YaRN extension"
+(( CONTEXT <= 262144 )) || die "CONTEXT=$CONTEXT is past 262,144: TensorFold 1.3.7's Flash Next engine has no YaRN extension"
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 
 SERVE_ARGS=(--context "$CONTEXT" --parallel "$PARALLEL" --max-tokens "$MAX_TOKENS"
@@ -179,7 +179,7 @@ ENV_ARGS=(-e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}")
 while IFS='=' read -r name _; do
   [[ "$name" == TENSORFOLD_API_KEY ]] && continue
   ENV_ARGS+=(-e "$name=${!name}")
-done < <(env | grep -E '^(TENSORFOLD|TF_FLASHNEXT)_[A-Z0-9_]+=' || true)
+done < <(env | grep -E '^(TENSORFOLD|TF)_[A-Z0-9_]+=' || true)
 KEY_ARGS=(); [[ -z "${TENSORFOLD_API_KEY:-}" ]] || { export TENSORFOLD_API_KEY; KEY_ARGS=(-e TENSORFOLD_API_KEY); }
 
 step 3 "Launch: container $CONTAINER_NAME"
