@@ -1,5 +1,5 @@
 diff --git a/zig/src/families/flashnext/cuda_images.zig b/zig/src/families/flashnext/cuda_images.zig
-index 19b417156..df5446029 100644
+index 19b4171..df54460 100644
 --- a/zig/src/families/flashnext/cuda_images.zig
 +++ b/zig/src/families/flashnext/cuda_images.zig
 @@ -8,6 +8,10 @@ const media = @import("cuda_media.zig");
@@ -51,7 +51,7 @@ index 19b417156..df5446029 100644
          };
      }
 diff --git a/zig/src/native/cuda_vision_offer.zig b/zig/src/native/cuda_vision_offer.zig
-index 1e42b9e6d..e79be9e13 100644
+index 1e42b9e..e79be9e 100644
 --- a/zig/src/native/cuda_vision_offer.zig
 +++ b/zig/src/native/cuda_vision_offer.zig
 @@ -43,7 +43,7 @@ pub fn offer(v: anytype, open: ?api.VisionOpen) ?api.Vision {
@@ -64,7 +64,7 @@ index 1e42b9e6d..e79be9e13 100644
      return out;
  }
 diff --git a/zig/src/vision/qwen_cuda_media.zig b/zig/src/vision/qwen_cuda_media.zig
-index 109e9588a..29090d841 100644
+index 109e958..29090d8 100644
 --- a/zig/src/vision/qwen_cuda_media.zig
 +++ b/zig/src/vision/qwen_cuda_media.zig
 @@ -5,7 +5,7 @@ const lanes = @import("lanes");

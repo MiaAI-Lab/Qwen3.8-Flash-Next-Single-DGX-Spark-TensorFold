@@ -1,22 +1,22 @@
 diff --git a/zig/kernels/cuda/qmmf.cu b/zig/kernels/cuda/qmmf.cu
-index 28ca07bb8..abf5ea77f 100644
+index 37c4212..008bb37 100644
 --- a/zig/kernels/cuda/qmmf.cu
 +++ b/zig/kernels/cuda/qmmf.cu
-@@ -71,7 +71,7 @@ __global__ void __launch_bounds__(WM * WN * 32) qmmf_kernel(
- #undef TF_QMMF_WFIRST
- }
+@@ -118,7 +118,7 @@ TF_QMMF_MANY(tf_qmmf_many64, 64, false)
+ TF_QMMF_MANY(tf_qmmf_many64c, 64, true)
+ #undef TF_QMMF_MANY
  
 -// The shared down has one K slice; only the output address changes from the existing BF16-weight product.
 +// The shared down has one K slice; only the output address changes from the existing BF16/MXFP8-weight product.
  #define TF_SHARED_DOWN(NAME, BM, BN) \
  extern "C" __global__ void __launch_bounds__(128) NAME( \
          const __nv_bfloat16* x, const unsigned char* w, float scale, float* out, \
-@@ -84,6 +84,18 @@ TF_SHARED_DOWN(tf_qmmf_shared16, 16, 64)
+@@ -131,6 +131,18 @@ TF_SHARED_DOWN(tf_qmmf_shared16, 16, 64)
  TF_SHARED_DOWN(tf_qmmf_shared32, 32, 64)
  TF_SHARED_DOWN(tf_qmmf_shared64, 64, 64)
  #undef TF_SHARED_DOWN
-+#define TF_SHARED_DOWN_MXFP8(NAME, BM, BN) \
-+extern "C" __global__ void __launch_bounds__(128) NAME( \
++#define TF_SHARED_DOWN_MXFP8(FN, BM, BN) \
++extern "C" __global__ void __launch_bounds__(128) FN( \
 +        const __nv_bfloat16* x, const unsigned char* w, const uint8_t* bs, float scale, float* out, \
 +        int M, int N, int K, int npad, int ldx, int group, int ldy) { \
 +    qmmf_body<MXFP8, BM, BN, 1, 4, 4, true, false, false>( \
@@ -30,7 +30,7 @@ index 28ca07bb8..abf5ea77f 100644
  
  template <bool F32>
  __global__ void reduce_kernel(const float* __restrict__ part, void* __restrict__ out, long long total, int SK,
-@@ -327,6 +339,10 @@ TF_QMMF_GROUP_ENTRY(tf_qmmf_group_fp4, FP4, 64, false)
+@@ -374,6 +386,10 @@ TF_QMMF_GROUP_ENTRY(tf_qmmf_group_fp4, FP4, 64, false)
  TF_QMMF_GROUP_ENTRY(tf_qmmf_group_fp4_c, FP4, 64, true)
  TF_QMMF_GROUP_ENTRY(tf_qmmf_group_fp8, FP8, 64, false)
  TF_QMMF_GROUP_ENTRY(tf_qmmf_group_fp8_c, FP8, 64, true)
@@ -41,7 +41,7 @@ index 28ca07bb8..abf5ea77f 100644
  TF_QMMF_GROUP_ENTRY(tf_qmmf_group_bf16, BF16, 64, false)
  TF_QMMF_GROUP_ENTRY(tf_qmmf_group_bf16_c, BF16, 64, true)
  TF_QMMF_GROUP_ENTRY(tf_qmmf_group_bf16_half, BF16, 32, false)
-@@ -346,7 +362,7 @@ template __global__ void reduce_kernel<false>(const float* __restrict__, void* _
+@@ -393,7 +409,7 @@ template __global__ void reduce_kernel<false>(const float* __restrict__, void* _
  template <int BM, int BN, int WM, int WN, int STAGES, bool F32>
  __device__ __forceinline__ void prompt_mx_body(
          const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,
@@ -50,7 +50,7 @@ index 28ca07bb8..abf5ea77f 100644
      using T = Tile<MXFP8, BM, BN, WM, WN, STAGES>;
      extern __shared__ __align__(128) unsigned char buf[];
      const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-@@ -444,12 +460,12 @@ __device__ __forceinline__ void prompt_mx_body(
+@@ -491,12 +507,12 @@ __device__ __forceinline__ void prompt_mx_body(
                  if (row >= M) continue;
                  const float v0 = acc[i][j][2 * h] * scale, v1 = acc[i][j][2 * h + 1] * scale;
                  if (F32) {
@@ -66,9 +66,9 @@ index 28ca07bb8..abf5ea77f 100644
                          *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v0, v1);
                      else {
                          if (col < N) dst[0] = __float2bfloat16_rn(v0);
-@@ -465,8 +481,8 @@ __device__ __forceinline__ void prompt_mx_body(
- #define TF_PROMPT_MX(NAME, BM, BN, WM, WN, ST, F32, MINB)                                                              \
-     extern "C" __global__ void __launch_bounds__(WM * WN * 32, MINB) NAME(                                             \
+@@ -512,8 +528,8 @@ __device__ __forceinline__ void prompt_mx_body(
+ #define TF_PROMPT_MX(FN, BM, BN, WM, WN, ST, F32, MINB)                                                                \
+     extern "C" __global__ void __launch_bounds__(WM * WN * 32, MINB) FN(                                             \
          const __nv_bfloat16* __restrict__ x, const unsigned char* __restrict__ w, const uint8_t* __restrict__ bs,     \
 -        float scale, void* __restrict__ out, int M, int N, int K, int npad, int ldx, int group) {                      \
 -        tf_qmmf::prompt_mx_body<BM, BN, WM, WN, ST, F32>(x, w, bs, scale, out, M, N, K, npad, ldx, group);            \
@@ -78,10 +78,10 @@ index 28ca07bb8..abf5ea77f 100644
  
  // Names the Zig launcher loads (qmmf.zig Lane.prompt_mx): block rows x columns, warps, stages, bf16 or fp32 out, blocks an SM.
 diff --git a/zig/src/cuda/qmmf.zig b/zig/src/cuda/qmmf.zig
-index 1f24514fa..e2eac96ce 100644
+index bd71fd2..4160ad2 100644
 --- a/zig/src/cuda/qmmf.zig
 +++ b/zig/src/cuda/qmmf.zig
-@@ -192,6 +192,7 @@ pub const Lane = struct {
+@@ -194,6 +194,7 @@ pub const Lane = struct {
      half_n: ?@import("qmmf_half.zig").Set = null, // TF_QMMF_HALF_BN: FP4, FP8 and FP8G half tiles too
      half_below: usize = half_below_default,
      shared_down: [4]Function = undefined,
@@ -89,7 +89,7 @@ index 1f24514fa..e2eac96ce 100644
      /// Output columns from which this lane fuses a split-K cluster call; 0 keeps its original schedule.
      fuse_split_n: usize = 0,
      fuse_s: [2][2][2]Function = undefined, // by halfModeIndex, Out, row tile 16 then 32: the fused form at decode rows
-@@ -230,6 +231,10 @@ pub const Lane = struct {
+@@ -233,6 +234,10 @@ pub const Lane = struct {
              f.* = try mod.function(name);
              try f.allowDynamicShared(sharedBytes(.bf16, 64));
          }
@@ -100,7 +100,7 @@ index 1f24514fa..e2eac96ce 100644
          inline for (.{ Mode.mxfp8, Mode.bf16 }, 0..) |mode, mi| inline for (.{ false, true }, 0..) |wide, oi| inline for (.{ 16, 32 }, 0..) |bm, bi| {
              const f = try mod.function(symbol(mode, bm, false, true, wide));
              try f.allowDynamicShared(sharedBytes(mode, bm));
-@@ -315,13 +320,22 @@ pub const Lane = struct {
+@@ -323,13 +328,22 @@ pub const Lane = struct {
      /// y [m, n] = x times an MXFP8 weight on the 128 x 128 prompt tile whose block scales ride in the B fragment: one fp32
      /// chain over K, no K slices, written as `out` says. Not the exact kernels' bits (takesPromptMx gates it).
      pub fn matmulPromptMx(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out) !void {
@@ -125,7 +125,7 @@ index 1f24514fa..e2eac96ce 100644
          const tile: usize = if (small) 64 else 128;
          const rows_t = (m + tile - 1) / tile;
          const band = @max(1, @min(rows_t, (12 << 20) / (tile * w.k * 2)));
-@@ -337,6 +351,7 @@ pub const Lane = struct {
+@@ -345,6 +359,7 @@ pub const Lane = struct {
          args.add(@as(i32, @intCast(w.npad)));
          args.add(@as(i32, @intCast(if (m == 1) w.k else ldx)));
          args.add(@as(i32, @intCast(band)));
@@ -134,28 +134,29 @@ index 1f24514fa..e2eac96ce 100644
              .grid = .{ .x = @intCast(rows_t * ((w.n + tile - 1) / tile)), .y = 1, .z = 1 },
              .block = .{ .x = if (small) 128 else 256, .y = 1, .z = 1 },
 diff --git a/zig/src/cuda/qmmf_group.zig b/zig/src/cuda/qmmf_group.zig
-index 65cc9a460..b36a88bfa 100644
+index 65cc9a4..17bc4a4 100644
 --- a/zig/src/cuda/qmmf_group.zig
 +++ b/zig/src/cuda/qmmf_group.zig
-@@ -18,12 +18,14 @@ comptime {
+@@ -18,20 +18,24 @@ comptime {
  }
  
  /// The instance a group takes: its mode and column tile (64, or the 32-column half tile).
 -pub const Kind = enum { fp4, fp8, bf16, bf16_half };
 -const kinds = [4]Kind{ .fp4, .fp8, .bf16, .bf16_half };
-+pub const Kind = enum { fp4, fp8, mxfp8, mxfp8_half, bf16, bf16_half };
-+const kinds = [6]Kind{ .fp4, .fp8, .mxfp8, .mxfp8_half, .bf16, .bf16_half };
++pub const Kind = enum { fp4, fp8, bf16, bf16_half, mxfp8, mxfp8_half };
++const kinds = [6]Kind{ .fp4, .fp8, .bf16, .bf16_half, .mxfp8, .mxfp8_half };
  
 -const symbols = [4][2][:0]const u8{
 +const symbols = [6][2][:0]const u8{
      .{ "tf_qmmf_group_fp4", "tf_qmmf_group_fp4_c" },
      .{ "tf_qmmf_group_fp8", "tf_qmmf_group_fp8_c" },
-+    .{ "tf_qmmf_group_mxfp8", "tf_qmmf_group_mxfp8_c" },
-+    .{ "tf_qmmf_group_mxfp8_half", "tf_qmmf_group_mxfp8_half_c" },
      .{ "tf_qmmf_group_bf16", "tf_qmmf_group_bf16_c" },
      .{ "tf_qmmf_group_bf16_half", "tf_qmmf_group_bf16_half_c" },
++    .{ "tf_qmmf_group_mxfp8", "tf_qmmf_group_mxfp8_c" },
++    .{ "tf_qmmf_group_mxfp8_half", "tf_qmmf_group_mxfp8_half_c" },
  };
-@@ -32,6 +34,8 @@ fn shared(kind: Kind) u32 {
+ 
+ fn shared(kind: Kind) u32 {
      return switch (kind) {
          .fp4 => q.sharedBytes(.fp4, 16),
          .fp8 => q.sharedBytes(.fp8, 16),
@@ -201,7 +202,7 @@ index 65cc9a460..b36a88bfa 100644
      pub fn load(l: *const q.Lane) !Group {
          var g: Group = undefined;
 diff --git a/zig/src/cuda/qmmf_shared.zig b/zig/src/cuda/qmmf_shared.zig
-index c8812213d..ac522ba54 100644
+index c881221..ac522ba 100644
 --- a/zig/src/cuda/qmmf_shared.zig
 +++ b/zig/src/cuda/qmmf_shared.zig
 @@ -1,14 +1,15 @@
@@ -251,10 +252,10 @@ index c8812213d..ac522ba54 100644
      other = w;
      other.k = 6144;
 diff --git a/zig/src/families/flashnext/cuda_batch_side.zig b/zig/src/families/flashnext/cuda_batch_side.zig
-index 7043f96c4..2892a13bb 100644
+index 7043f96..6299f9f 100644
 --- a/zig/src/families/flashnext/cuda_batch_side.zig
 +++ b/zig/src/families/flashnext/cuda_batch_side.zig
-@@ -36,8 +36,14 @@ pub const Side = struct {
+@@ -36,20 +36,34 @@ pub const Side = struct {
  pub fn run(pass: anytype, st: cuda.Stream, native: anytype, n: usize) !void {
      const s = pass.s;
      const glue = pass.tri.own orelse return error.NativeGlueRequired;
@@ -271,41 +272,60 @@ index 7043f96c4..2892a13bb 100644
      try glue.sharedSwiGLU(st, s.shared_gate, s.shared_up, s.shared_act, n, native.shared_width);
      try down(pass, st, s.shared_act, native, n);
  }
-@@ -46,10 +52,12 @@ pub fn run(pass: anytype, st: cuda.Stream, native: anytype, n: usize) !void {
+ 
+ /// The whole shared down into y's slot at any eligible rows (faster than the prompt tile and scatter); else scatter.
++fn isPrompt(pass: anytype) bool {
++    const T = @TypeOf(pass);
++    const S = if (@typeInfo(T) == .pointer) @typeInfo(T).pointer.child else T;
++    return if (@hasField(S, "hooks")) pass.hooks.prompt else false;
++}
++
  pub fn down(pass: anytype, st: cuda.Stream, input: u64, native: anytype, n: usize) !void {
      const s = pass.s;
      const w = native.shared[2].native.?;
-+    if (pass.hooks.prompt and w.n == dims and pass.k.native_lane.takesPromptMx(w))
++    if (isPrompt(pass) and w.n == dims and pass.k.native_lane.takesPromptMx(w))
 +        return pass.k.native_lane.matmulPromptMxStrided(st, input, native.shared_width, n, w, s.y + (s.slots - 1) * dims * 4, s.slots * dims, .f32);
      if (w.n == dims and cuda.qmmf_shared.eligible(pass.k.native_lane, n, w, native.shared_width, s.slots * dims))
          return pass.k.native_lane.matmulF32Strided(st, input, native.shared_width, n, w, s.y + (s.slots - 1) * dims * 4, s.slots * dims);
      const glue = pass.tri.own orelse return error.NativeGlueRequired;
 -    try pass.k.nativeMatmul(st, input, native.shared_width, n, w, s.shared_out, s.native_part, .f32);
-+    try pass.k.nativeMatmulFor(pass.hooks.prompt, st, input, native.shared_width, n, w, s.shared_out, s.native_part, .f32);
++    try pass.k.nativeMatmulFor(isPrompt(pass), st, input, native.shared_width, n, w, s.shared_out, s.native_part, .f32);
      try glue.sharedScatter(st, s.shared_out, s.y, n, dims, s.slots);
  }
  
 diff --git a/zig/src/families/flashnext/cuda_shared_split.zig b/zig/src/families/flashnext/cuda_shared_split.zig
-index ca16ae2ac..5499dd5f6 100644
+index ca16ae2..d9f606b 100644
 --- a/zig/src/families/flashnext/cuda_shared_split.zig
 +++ b/zig/src/families/flashnext/cuda_shared_split.zig
-@@ -9,8 +9,8 @@ pub fn run(self: anytype, native: *const mixed.Owned, n: usize) !void {
+@@ -3,14 +3,20 @@ const wt = @import("cuda_prompt_wt.zig");
+ const ops = @import("cuda_batch_ops.zig");
+ const mixed = @import("cuda_mixed_experts.zig");
+ 
++fn isPrompt(pass: anytype) bool {
++    const T = @TypeOf(pass);
++    const S = if (@typeInfo(T) == .pointer) @typeInfo(T).pointer.child else T;
++    return if (@hasField(S, "hooks")) pass.hooks.prompt else false;
++}
++
+ pub fn run(self: anytype, native: *const mixed.Owned, n: usize) !void {
+     if (!native.split_shared and native.rank != 0) return;
+     const s = self.s;
      const dims = wt.dims;
      const glue = self.tri.own orelse return error.NativeGlueRequired;
      const width = if (native.split_shared) native.shared_width / 2 else native.shared_width;
 -    try self.k.native_lane.matmul(self.stream, s.mixed, dims, n, native.shared[0].native.?, s.shared_gate, s.native_part);
 -    try self.k.native_lane.matmul(self.stream, s.mixed, dims, n, native.shared[1].native.?, s.shared_up, s.native_part);
-+    try self.k.nativeMatmulFor(self.hooks.prompt, self.stream, s.mixed, dims, n, native.shared[0].native.?, s.shared_gate, s.native_part, .bf16);
-+    try self.k.nativeMatmulFor(self.hooks.prompt, self.stream, s.mixed, dims, n, native.shared[1].native.?, s.shared_up, s.native_part, .bf16);
++    try self.k.nativeMatmulFor(isPrompt(self), self.stream, s.mixed, dims, n, native.shared[0].native.?, s.shared_gate, s.native_part, .bf16);
++    try self.k.nativeMatmulFor(isPrompt(self), self.stream, s.mixed, dims, n, native.shared[1].native.?, s.shared_up, s.native_part, .bf16);
      try glue.sharedSwiGLU(self.stream, s.shared_gate, s.shared_up, s.shared_act, n, width);
      var input = s.shared_act;
      if (native.split_shared) {
-@@ -22,7 +22,7 @@ pub fn run(self: anytype, native: *const mixed.Owned, n: usize) !void {
+@@ -22,7 +28,7 @@ pub fn run(self: anytype, native: *const mixed.Owned, n: usize) !void {
      }
      // the whole expert's down goes straight into its slot (cuda_batch_side.down), as on the side stream
      if (!native.split_shared) return @import("cuda_batch_side.zig").down(self, self.stream, input, native, n);
 -    try self.k.native_lane.matmulF32(self.stream, input, native.shared_width, n, native.shared[2].native.?, s.shared_out, s.native_part);
-+    try self.k.nativeMatmulFor(self.hooks.prompt, self.stream, input, native.shared_width, n, native.shared[2].native.?, s.shared_out, s.native_part, .f32);
++    try self.k.nativeMatmulFor(isPrompt(self), self.stream, input, native.shared_width, n, native.shared[2].native.?, s.shared_out, s.native_part, .f32);
      // Every routed slot and the peer's output columns stay at the zeros set before the expert launches.
      try ops.copyCols(self.k, self.stream, s.shared_out, dims, s.y + (s.slots - 1) * dims * 4 + native.rank * dims * 2, s.slots * dims * 2, dims, n);
  }

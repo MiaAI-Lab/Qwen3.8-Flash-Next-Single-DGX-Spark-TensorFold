@@ -1,9 +1,24 @@
 # Changelog
 
-Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:v1.3.6-f56b142`, built by
-`scripts/prepare.sh` from TensorFold v1.3.6 (`f56b1420`) plus `patches/` (0002 to 0005).
+Newest first. This recipe serves one DGX Spark. The image is `tensorfold-qwen38:v1.3.7-b336654`, built by
+`scripts/prepare.sh` from TensorFold v1.3.7 (`b3366549`) plus `patches/` (0002 to 0005, 0007 and 0008).
 
 ## Unreleased
+
+**2026-11-28: TensorFold v1.3.6 to v1.3.7 (`b3366549`, 355 commits): upstream fixes `TF_FLASHNEXT_PREFILL_MTP_LEAN` (#5358 / #5332), patch `0006` retired.**
+- `TF_REF`, the release archive (`libtfgrammar.so`, SHA-256 `9487e83d…`, the release's own `.sha256`) and the image tag (`tensorfold-qwen38:v1.3.7-b336654`)
+  move to v1.3.7. Zig 0.17.0 and FFmpeg 9.0.2 are unchanged. Flash Next on CUDA still has no YaRN.
+- `0006-flashnext-prefill-mtp-lean-fix` is retired: TensorFold v1.3.7 fixes `TF_FLASHNEXT_PREFILL_MTP_LEAN=1` upstream (#5358, closing
+  ashhart/TensorFold#5332) via `plan.prefillPiece(s.cap)`, so lean prefill pieces fit the MTP scratch without a local patch.
+- `TF_FLASHNEXT_SHARED_DRAFTS` is removed from `scripts/config.sh`: v1.3.7 (#5265) makes greedy drafts beside another open stream use
+  `TF_FLASHNEXT_CONFIDENCE` directly and retired the switch upstream.
+- `0002`, `0003` and `0005` apply as they were (`0003` refreshed to zero offset). `0004` rebases its `loadPromptMx` call beside v1.3.7's
+  `currentSmCount(d)` (#5221) and renames `TF_PROMPT_MX`'s macro parameter so it does not collide with v1.3.7's PDL launch scanner (#5381).
+  `0007` rebases onto `tf_qmmf_many*` (#3131), keeps `qmmf_group.Kind`'s existing indices intact (putting `.mxfp8`/`.mxfp8_half` at the end),
+  and guards `hooks.prompt` for host-test mocks. `0008` guards `forms.expert_fast` for host-test mocks and updates `environment_flashnext_test.zig`'s
+  switch count for `TF_FLASHNEXT_PDL` and `TF_FLASHNEXT_PROMPT_EXPERT_FAST`.
+- Checked on v1.3.7: `zig build test-cuda-host` (524/524 steps, 0 failed), `compile-cuda-tests`, full `scripts/prepare.sh` image build (`fatbins native video`),
+  `scripts/harden.sh` boot gate, and offline recipe checks. Live GPU A/B and serving checks not yet run on v1.3.7 (another server was occupying the Spark's GPU).
 
 **2026-11-27: TensorFold v1.3.5 to v1.3.6 (`f56b1420`, 511 commits): the same speed and the same replies; its two new Flash Next opt-ins stay off.**
 - `TF_REF`, the release archive (`libtfgrammar.so`, SHA-256 `7f979048…`, the release's own `.sha256`) and the image tag (`tensorfold-qwen38:v1.3.6-f56b142`)

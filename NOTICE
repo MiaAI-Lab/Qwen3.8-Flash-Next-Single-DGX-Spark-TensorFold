@@ -6,7 +6,7 @@ This project's own code, scripts and documentation are licensed under the MIT Li
 This project builds on third-party work that keeps its own license:
 
 TensorFold
-  https://github.com/ashhart/TensorFold (release v1.3.6, commit f56b1420)
+  https://github.com/ashhart/TensorFold (release v1.3.7, commit b3366549)
   Copyright 2026 TensorFold contributors. Apache License, Version 2.0 from 0.6.0; code written before 0.6.0 keeps its
   MIT notice (below). TensorFold's NOTICE reads: "TensorFold / Copyright 2026 TensorFold contributors /
   https://github.com/ashhart/TensorFold".
@@ -53,7 +53,7 @@ Zig
 
 xgrammar and dlpack (inside libtfgrammar.so)
   https://github.com/mlc-ai/xgrammar (MLC-AI team), https://github.com/dmlc/dlpack (DLPack contributors). Apache License, Version 2.0.
-  scripts/prepare.sh copies the prebuilt lib/libtfgrammar.so out of TensorFold's v1.3.6 release archive (aarch64, checked against its
+  scripts/prepare.sh copies the prebuilt lib/libtfgrammar.so out of TensorFold's v1.3.7 release archive (aarch64, checked against its
   SHA-256 in scripts/config.sh) into /opt/tensorfold/native/lib, with the archive's xgrammar and dlpack license and notice files in
   /opt/tensorfold/share/doc/tensorfold/LICENSES-grammar. The library serves structured output and required tool calls; nothing of it is
   modified or compiled here.

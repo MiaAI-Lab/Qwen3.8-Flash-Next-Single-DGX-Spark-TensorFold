@@ -1,5 +1,5 @@
 diff --git a/zig/kernels/cuda/nvfp4_experts_tile.cu b/zig/kernels/cuda/nvfp4_experts_tile.cu
-index 52b9913fa..13bb5715a 100644
+index 52b9913..13bb571 100644
 --- a/zig/kernels/cuda/nvfp4_experts_tile.cu
 +++ b/zig/kernels/cuda/nvfp4_experts_tile.cu
 @@ -17,6 +17,16 @@ using tf_common::fp4pair;
@@ -154,7 +154,7 @@ index 52b9913fa..13bb5715a 100644
 +TF_TILE4(tf_nvfp4_tile_fast_swiglu, 2, 2, 4, 4, false)
 +TF_TILE4(tf_nvfp4_tile_fast_down_f32, 1, 0, 4, 4, false)
 diff --git a/zig/src/cuda/experts_tile.zig b/zig/src/cuda/experts_tile.zig
-index 819135776..d1609209b 100644
+index 8191357..d160920 100644
 --- a/zig/src/cuda/experts_tile.zig
 +++ b/zig/src/cuda/experts_tile.zig
 @@ -19,20 +19,28 @@ pub const Tile = struct {
@@ -218,7 +218,7 @@ index 819135776..d1609209b 100644
  };
  test {
 diff --git a/zig/src/families/flashnext/cuda_batch_kernels.zig b/zig/src/families/flashnext/cuda_batch_kernels.zig
-index 81d94b3b6..138bd38d9 100644
+index 0a096ab..6baf0d6 100644
 --- a/zig/src/families/flashnext/cuda_batch_kernels.zig
 +++ b/zig/src/families/flashnext/cuda_batch_kernels.zig
 @@ -44,6 +44,7 @@ pub const Forms = struct {
@@ -237,7 +237,7 @@ index 81d94b3b6..138bd38d9 100644
          };
      }
  };
-@@ -73,6 +75,8 @@ pub const Kernels = struct {
+@@ -81,6 +83,8 @@ pub const Kernels = struct {
      tiles: tk.TileKernels,
      /// qmmf's lane, BF16 projections from qmmf.prompt_rows rows on its 128-row tile (TF_FLASHNEXT_PROMPT_BF16=0: off).
      native_lane: cuda.qmmf.Lane,
@@ -246,7 +246,7 @@ index 81d94b3b6..138bd38d9 100644
      nvfp4: cuda.experts.Nvfp4Experts,
      /// Block-FP8 routed experts (the MTP head of NVIDIA's NVFP4 checkpoint; cuda_moe_native.zig).
      fp8: cuda.experts.Fp8Experts,
-@@ -122,8 +126,12 @@ pub const Kernels = struct {
+@@ -131,8 +135,12 @@ pub const Kernels = struct {
          errdefer k.tiles.unload();
          k.router = try cuda.grouped.Router.resolve(k.experts);
          k.moe = try cuda.experts.RowsExperts.resolve(k.rows);
@@ -261,7 +261,7 @@ index 81d94b3b6..138bd38d9 100644
          if (bf16) try k.native_lane.loadPrompt(d); // the shapes qmmf-prompt-bench times
          try k.native_lane.loadPromptMx(k.forms.mx_min_n); // prompt passes only (nativeMatmulFor)
 diff --git a/zig/src/families/flashnext/cuda_disk.zig b/zig/src/families/flashnext/cuda_disk.zig
-index a25c95979..9be7df292 100644
+index a25c959..9be7df2 100644
 --- a/zig/src/families/flashnext/cuda_disk.zig
 +++ b/zig/src/families/flashnext/cuda_disk.zig
 @@ -126,6 +126,7 @@ pub fn policyOf(c: anytype) [13]u64 {
@@ -273,7 +273,7 @@ index a25c95979..9be7df292 100644
          // TF_FLASHNEXT_CHUNK_SOLO and _CHUNK as resolved: a pass's rows alone, and beside a decoding stream
          e.chunk,
 diff --git a/zig/src/families/flashnext/cuda_moe_native.zig b/zig/src/families/flashnext/cuda_moe_native.zig
-index 50d549782..be2d75b4e 100644
+index 50d5497..be2d75b 100644
 --- a/zig/src/families/flashnext/cuda_moe_native.zig
 +++ b/zig/src/families/flashnext/cuda_moe_native.zig
 @@ -34,11 +34,11 @@ pub fn run(self: anytype, native: *const mixed.Owned, n: usize, pairs: usize, pl
@@ -292,16 +292,22 @@ index 50d549782..be2d75b4e 100644
          .fp8g => try fp8(self.k, self.stream, s.picks, s.mixed, owned.view(), plan, pairs, n, s.y, s.moe_act, s.slots),
          else => return error.UnsupportedQuantization,
 diff --git a/zig/src/families/flashnext/cuda_nvfp4_tile.zig b/zig/src/families/flashnext/cuda_nvfp4_tile.zig
-index 3c513a81d..4fab15d1a 100644
+index 3c513a8..804b437 100644
 --- a/zig/src/families/flashnext/cuda_nvfp4_tile.zig
 +++ b/zig/src/families/flashnext/cuda_nvfp4_tile.zig
-@@ -14,9 +14,20 @@ pub fn size(k: anytype, n: usize) usize {
+@@ -14,9 +14,26 @@ pub fn size(k: anytype, n: usize) usize {
      return if (n >= k.forms.fact_rows) cuda.experts.promptTile(.nvfp4) else 16;
  }
  
++fn isExpertFast(k: anytype) bool {
++    const T = @TypeOf(k);
++    const S = if (@typeInfo(T) == .pointer) @typeInfo(T).pointer.child else T;
++    return if (@hasField(S, "forms")) isExpertFast(k) else false;
++}
++
 +/// Prompt passes with expert_fast always use the prompt tile so a row's bits never depend on chunk size or resume offset.
 +pub fn sizeFor(k: anytype, n: usize, prompt: bool) usize {
-+    if (prompt and k.forms.expert_fast and k.expert_tile != null) return cuda.experts.promptTile(.nvfp4);
++    if (prompt and isExpertFast(k) and k.expert_tile != null) return cuda.experts.promptTile(.nvfp4);
 +    return size(k, n);
 +}
 +
@@ -313,12 +319,12 @@ index 3c513a81d..4fab15d1a 100644
 +
 +/// Prompt passes (`prompt`) with TF_FLASHNEXT_PROMPT_EXPERT_FAST=1 take the relaxed BF16 scale-folded K32 tiles.
 +pub fn runFor(k: anytype, pt: usize, prompt: bool, s: cuda.Stream, epi: cuda.experts.Epi, in: cuda.experts.Rows, l: cuda.experts.Layer, p: cuda.grouped.Plan, out: u64, items: usize, skip: i32) !void {
-+    if (pt != 16) if (k.expert_tile) |*tile| if (tile.takes(epi)) return tile.runFor(prompt and k.forms.expert_fast, s, epi, in, l, p, out, items, skip);
++    if (pt != 16) if (k.expert_tile) |*tile| if (tile.takes(epi)) return tile.runFor(prompt and isExpertFast(k), s, epi, in, l, p, out, items, skip);
      const launch = if (pt == 16) &cuda.experts_waves.run else &cuda.experts.Nvfp4Experts.runFact;
      return launch(&k.nvfp4, s, epi, in, l, p, out, items, skip);
  }
 diff --git a/zig/src/families/flashnext/cuda_prompt_knobs.zig b/zig/src/families/flashnext/cuda_prompt_knobs.zig
-index 672d80bf4..9239ba4bf 100644
+index 672d80b..9239ba4 100644
 --- a/zig/src/families/flashnext/cuda_prompt_knobs.zig
 +++ b/zig/src/families/flashnext/cuda_prompt_knobs.zig
 @@ -8,6 +8,12 @@ pub fn mx128MinN() usize {
@@ -335,10 +341,10 @@ index 672d80bf4..9239ba4bf 100644
      if (std.c.getenv("TF_FLASHNEXT_PROMPT_MX128") == null) try std.testing.expectEqual(@as(usize, 1024), mx128MinN());
  }
 diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
-index c6a43dc95..df674d306 100644
+index f44a4c7..6e361c4 100644
 --- a/zig/src/platform/environment.zig
 +++ b/zig/src/platform/environment.zig
-@@ -321,6 +321,8 @@ const stock_rules = [_]Rule{
+@@ -324,6 +324,8 @@ const stock_rules = [_]Rule{
      .{ .name = "TF_FLASHNEXT_SHARD_HEAD", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
      .{ .name = "TF_FLASHNEXT_FUSED_SPLIT", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
      .{ .name = "TF_FLASHNEXT_ATTN_LANES", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
@@ -347,3 +353,23 @@ index c6a43dc95..df674d306 100644
      .{ .name = "TF_FLASHNEXT_WARM_AHEAD", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
      .{ .name = "TF_FLASHNEXT_TABLE_WARM", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
      .{ .name = "TF_FLASHNEXT_GATHER_EARLY", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (1: one pooled n-gram gather a shared pass; default 0)" },
+diff --git a/zig/src/platform/environment_flashnext_test.zig b/zig/src/platform/environment_flashnext_test.zig
+index 49bcea7..8959d51 100644
+--- a/zig/src/platform/environment_flashnext_test.zig
++++ b/zig/src/platform/environment_flashnext_test.zig
+@@ -33,13 +33,13 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
+     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
+ }
+ 
+-test "Flash Next strict env: the table holds all 46 settings: 30 switches, 10 integers, 1 real, 5 structured" {
++test "Flash Next strict env: the table holds all 48 settings: 32 switches, 10 integers, 1 real, 5 structured" {
+     var counts: [4]usize = @splat(0);
+     for (e.rules) |r| if (r.scope == .flashnext) {
+         try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_") or std.mem.eql(u8, r.name, "TENSORFOLD_CHECKPOINT_SHA256"));
+         counts[@backingInt(group(r))] += 1;
+     };
+-    try t.expectEqual([4]usize{ 30, 10, 1, 5 }, counts);
++    try t.expectEqual([4]usize{ 32, 10, 1, 5 }, counts);
+ }
+ 
+ test "Flash Next strict env: unset reads the caller default and every row keeps its blank contract" {

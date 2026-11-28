@@ -24,7 +24,7 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || die "image $IMAGE missing, run 
 [[ "$(docker image inspect -f '{{index .Config.Labels "tf.kernels"}}' "$IMAGE")" == embedded ]] ||
   die "$IMAGE has no kernel set: it cannot serve, so it is not worth hardening"
 
-# What goes. Every name here was checked against the images TensorFold v1.2.7, v1.2.10, v1.3.0, v1.3.2, v1.3.4, v1.3.5 and v1.3.6 build: they are there, and nothing in
+# What goes. Every name here was checked against the images TensorFold v1.2.7, v1.2.10, v1.3.0, v1.3.2, v1.3.4, v1.3.5, v1.3.6 and v1.3.7 build: they are there, and nothing in
 # /opt/tensorfold, the engine's dlopen list or the container-side `hf download` path reads them.
 APT_PURGE="${APT_PURGE:-linux-libc-dev nsight-compute-* nsight-systems-cli-* python3-pip python3-setuptools python3-pip-whl python3-setuptools-whl}"
 APT_UPGRADE="${APT_UPGRADE:-0}"           # 1: apt-get upgrade (unspecified updates: fewer CVEs, less reproducible image)

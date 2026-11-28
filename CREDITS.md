@@ -47,7 +47,7 @@ license files from the pinned checkout.
   The Flash Next CUDA engine in this recipe is ported from TensorFold's Python Flash Next CUDA engine, written by
   Ash Hart and the TensorFold contributors ([contributors](https://github.com/ashhart/TensorFold/graphs/contributors));
   their authorship is recorded in TensorFold's history.
-- **The 3 patches `0002` to `0004` in `patches/` on TensorFold v1.3.6 are written by MiaAI-Lab** (Mia's AI Lab,
+- **The 3 patches `0002` to `0004` in `patches/` on TensorFold v1.3.7 are written by MiaAI-Lab** (Mia's AI Lab,
   [MiaAI-Lab](https://github.com/MiaAI-Lab)), under this
   repository's MIT License. They modify TensorFold's own Flash Next CUDA engine, which is by Ash Hart and the TensorFold
   contributors; that code keeps TensorFold's licenses (see `NOTICE`). Patch by patch:
@@ -61,6 +61,12 @@ license files from the pinned checkout.
   - `0004-prompt-mxfp8-tile`: prompt passes run the wide MXFP8 projections on a 128 x 128 tile (64 x 64 for short calls) with the block scales folded
     into the weights (the v1.1.4 series' 0006 and 0015, ported to v1.2.7's qmmf lane; the 64 x 64 form is new). MiaAI-Lab, built on TensorFold's qmmf
     kernels and fragment helpers by Ash Hart and the TensorFold contributors.
+  - `0006-flashnext-prefill-mtp-lean-fix` (retired with the move to v1.3.7): bounded lean MTP prefill pieces to fit `s.part` on v1.3.6; fixed upstream in
+    TensorFold v1.3.7 (`#5358`, closing `#5332`).
+  - `0007-flashnext-mxfp8-shared-and-group`: MXFP8 strided shared-expert down projections, strided MXFP8 prompt tiles and grouped MXFP8 `qmmf` decode
+    launches for shared-expert gate+up.
+  - `0008-flashnext-nvfp4-prompt-fast-and-pdl`: BF16 scale-folded NVFP4 prompt expert K32 tiles (`TF_FLASHNEXT_PROMPT_EXPERT_FAST`) and Blackwell
+    programmatic dependent launch (`TF_FLASHNEXT_PDL`) on Flash Next `qmmf` decode lanes.
 - **The v1.1.4 series** (patches 0001 to 0017 on TensorFold v1.1.4, written by MiaAI-Lab, retired with the move to v1.2.7): v1.2.7 carries most of
   what 0004 and 0006 to 0017 did in TensorFold's own code, written by Ash Hart and the TensorFold contributors; TensorFold's K32 prompt expert staging
   is adapted from patch 0014 (credited in TensorFold's `THIRD_PARTY_NOTICES.md`). The series as it was: the prompt expert tile (0004), prefill kernels
@@ -142,7 +148,7 @@ This recipe no longer applies those patches (the serving path is the Zig engine)
 - **[chai-md](https://github.com/chai-md)** wrote
   [#90](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/pull/90), the video patch for the CUDA
   engine: `patches/0005` is theirs, re-based onto TensorFold v1.2.7 by MiaAI-Lab (the field layout had moved and the patch
-  had to be re-split) and carried to v1.3.6 unchanged, with `VIDEO=1`, the pinned FFmpeg build and the tests MiaAI-Lab's.
+  had to be re-split) and carried to v1.3.7 unchanged, with `VIDEO=1`, the pinned FFmpeg build and the tests MiaAI-Lab's.
 - The scripts (`start.sh`, `stop.sh`, `scripts/`) and the checks in `tools/` are MiaAI-Lab's. `client.py`,
   `needle.py`, `toolcheck.py` and `prompt_reuse.py` are adapted from MiaAI-Lab's two-Spark recipe
   [GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold);
